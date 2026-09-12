@@ -57,6 +57,7 @@ impl Report {
 pub struct Tunnel {
     config: Config,
     control: Arc<Control>,
+    harpoon: Arc<crate::harpoon::Harpoon>,
     bindings: BTreeMap<String, Arc<dyn Transport>>,
     children: JoinSet<Result<()>>,
     stop: CancellationToken,
@@ -66,6 +67,7 @@ pub struct Tunnel {
 impl Tunnel {
     pub fn new(config: Config) -> Result<Self> {
         let control = Arc::new(Control::new(&config)?);
+        let harpoon = Arc::new(crate::harpoon::Harpoon::new(&config)?);
         let (state, _) = watch::channel(Snapshot {
             started_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)?
@@ -75,6 +77,7 @@ impl Tunnel {
         Ok(Self {
             config,
             control,
+            harpoon,
             bindings: BTreeMap::new(),
             children: JoinSet::new(),
             stop: CancellationToken::new(),
@@ -128,7 +131,9 @@ impl Tunnel {
                 );
                 self.bindings.insert(
                     server.channel.clone(),
-                    Arc::new(HttpTransport::new(server, &self.config)?),
+                    Arc::new(
+                        HttpTransport::new(server, &self.config)?.harpoon(self.harpoon.clone()),
+                    ),
                 );
             }
         }
@@ -145,14 +150,10 @@ impl Tunnel {
             .with_context(|| format!("channel {channel} initialization timed out"))??;
             self.bindings.insert(channel, Arc::new(pipe));
         }
-        anyhow::ensure!(!self.bindings.is_empty(), "no MCP channels configured");
-        for channel in &self.config.control_plane.poll_channels {
-            anyhow::ensure!(
-                self.bindings.contains_key(channel),
-                "channel {channel} has no binding"
-            );
-        }
         for (name, transport) in &self.bindings {
+            if !transport.available() {
+                continue;
+            }
             let deadline = Instant::now() + self.config.mcp.startup_wait_timeout.0;
             let probe = async {
                 loop {
@@ -166,27 +167,58 @@ impl Tunnel {
                     }
                 }
             };
-            let result = tokio::select! {
+            let mut result = tokio::select! {
                 result = timeout_at(deadline, probe) => result.with_context(|| format!("channel {name} startup timed out"))?,
                 result = self.children.join_next(), if !self.children.is_empty() => {
                     result.context("child supervisor stopped")???;
                     bail!("MCP child stopped during startup");
                 }
             }.with_context(|| format!("probe channel {name}"))?;
+            let discovery = timeout_at(deadline, transport.discover())
+                .await
+                .context("OAuth discovery timed out")
+                .and_then(|result| result);
+            match discovery {
+                Ok(reply) => {
+                    result.oauth_status = Some(reply.status);
+                    anyhow::ensure!(
+                        !result.authentication_required || (200..300).contains(&reply.status),
+                        "channel {name} requires authentication but OAuth discovery returned HTTP {}",
+                        reply.status
+                    );
+                }
+                Err(error) => {
+                    if result.authentication_required {
+                        return Err(error.context(format!("OAuth discovery for channel {name}")));
+                    }
+                    tracing::debug!(channel = %name, %error, "optional OAuth discovery unavailable");
+                    result.oauth_error = Some(format!("{error:#}"));
+                }
+            }
             self.state.send_modify(|state| {
                 state.channels.insert(name.clone(), result);
             });
         }
-        self.control.set_channels(
-            self.bindings
-                .iter()
-                .map(|(name, transport)| Channel {
-                    name: name.clone(),
-                    stateless: transport.stateless(),
-                    proc_affinity: transport.process_affinity(),
-                })
-                .collect(),
-        )?;
+        if self.config.enabled("harpoon") && !self.bindings.contains_key("harpoon") {
+            self.bindings.insert("harpoon".into(), self.harpoon.clone());
+            if !self.harpoon.is_empty() {
+                let probe = transport::probe(self.harpoon.as_ref()).await?;
+                self.state.send_modify(|state| {
+                    state.channels.insert("harpoon".into(), probe);
+                });
+            }
+        }
+        anyhow::ensure!(
+            self.bindings.values().any(|binding| binding.available()),
+            "no MCP channels configured"
+        );
+        for channel in &self.config.control_plane.poll_channels {
+            anyhow::ensure!(
+                self.bindings.contains_key(channel),
+                "channel {channel} has no binding"
+            );
+        }
+        self.control.set_channels(channels(&self.bindings))?;
         Ok(())
     }
 
@@ -293,6 +325,7 @@ impl Tunnel {
         let result = async {
             loop {
                 if poll.is_none() && requests.len() < concurrency {
+                    self.control.set_channels(channels(&bindings))?;
                     let control = self.control.clone();
                     let limit = concurrency - requests.len();
                     poll = Some(Box::pin(async move { control.poll(limit, initial).await }));
@@ -452,9 +485,22 @@ async fn execute(
                 Some(binding) => binding.discover().await?,
                 None => Reply::ack(404, "oauth_discovery_response"),
             };
+            control.set_channels(channels(bindings))?;
             delivery.send(reply).await?;
         }
         _ => unreachable!(),
     }
     Ok(())
+}
+
+fn channels(bindings: &BTreeMap<String, Arc<dyn Transport>>) -> Vec<Channel> {
+    bindings
+        .iter()
+        .filter(|(_, transport)| transport.available())
+        .map(|(name, transport)| Channel {
+            name: name.clone(),
+            stateless: transport.stateless(),
+            proc_affinity: transport.process_affinity(),
+        })
+        .collect()
 }

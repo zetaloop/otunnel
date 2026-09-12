@@ -40,6 +40,9 @@ pub trait Transport: Send + Sync {
     fn stateless(&self) -> bool {
         false
     }
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Default)]
@@ -70,6 +73,8 @@ pub struct Probe {
     pub authentication_required: bool,
     pub server: Option<Value>,
     pub tools: Option<usize>,
+    pub oauth_status: Option<u16>,
+    pub oauth_error: Option<String>,
 }
 
 pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
@@ -79,6 +84,8 @@ pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
         authentication_required: reply.status == 401,
         server: None,
         tools: None,
+        oauth_status: None,
+        oauth_error: None,
     };
     if probe.authentication_required {
         return Ok(probe);

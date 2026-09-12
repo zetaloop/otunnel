@@ -214,6 +214,7 @@ pub struct Harpoon {
     pub hosts_include_loopback: bool,
     pub hosts_include_private: bool,
     pub hosts_include_suffix: Vec<String>,
+    pub hosts_include_regex: Vec<String>,
 }
 
 impl Default for Harpoon {
@@ -226,6 +227,7 @@ impl Default for Harpoon {
             hosts_include_loopback: true,
             hosts_include_private: true,
             hosts_include_suffix: Vec::new(),
+            hosts_include_regex: Vec::new(),
         }
     }
 }

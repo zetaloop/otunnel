@@ -20,10 +20,12 @@ hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
 process-wrap = { version = "10.0.0", features = ["tokio1"] }
 rand = "0.10.2"
+regex = "1.13.1"
 reqwest = { version = "0.13.5", features = ["json", "query", "stream"] }
 rustls = "0.23.44"
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
+schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = "1.2.0"
 serde_json = { version = "1.0.151", features = ["raw_value"] }

@@ -2,7 +2,9 @@
 
 pub mod config;
 pub mod control;
+pub mod harpoon;
 mod net;
+mod oauth;
 mod process;
 pub mod protocol;
 pub mod runtime;

@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -18,10 +21,13 @@ use crate::{
 
 #[derive(Clone)]
 pub struct HttpTransport {
+    pub(crate) channel: String,
     pub(crate) client: Http,
     pub(crate) url: Url,
     headers: HeaderMap,
     pub(crate) discovery_headers: HeaderMap,
+    pub(crate) harpoon: Option<Arc<crate::harpoon::Harpoon>>,
+    pub(crate) challenge: Arc<RwLock<Option<HeaderMap>>>,
 }
 impl HttpTransport {
     pub fn new(server: &config::Server, config: &config::Config) -> Result<Self> {
@@ -41,12 +47,22 @@ impl HttpTransport {
                 client_key: server.client_key.as_deref().or(mcp.client_key.as_deref()),
             },
         )?;
+        let mut discovery_headers = config::headers(&mcp.extra_headers)?;
+        discovery_headers.extend(config::headers(&mcp.discovery_extra_headers)?);
         Ok(Self {
+            channel: server.channel.clone(),
             client,
             url,
             headers: config::headers(&mcp.extra_headers)?,
-            discovery_headers: config::headers(&mcp.discovery_extra_headers)?,
+            discovery_headers,
+            harpoon: None,
+            challenge: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub fn harpoon(mut self, registry: Arc<crate::harpoon::Harpoon>) -> Self {
+        self.harpoon = Some(registry);
+        self
     }
 
     fn headers(&self, incoming: HeaderMap) -> Result<HeaderMap> {
@@ -81,6 +97,9 @@ impl HttpTransport {
 
 #[async_trait]
 impl Transport for HttpTransport {
+    async fn discover(&self) -> Result<Reply> {
+        crate::oauth::discover(self).await
+    }
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
         let id = view(&request.message)?.id.map(RawValue::to_owned);
         let mut headers = self.headers(request.headers.clone())?;
@@ -94,6 +113,14 @@ impl Transport for HttpTransport {
                 10,
             )
             .await?;
+        if response.status == http::StatusCode::UNAUTHORIZED
+            || view(&request.message)?.method == Some("initialize")
+        {
+            *self
+                .challenge
+                .write()
+                .expect("authentication lock poisoned") = Some(response.headers.clone());
+        }
         let Some(id) = id else {
             let mut reply = Reply::ack(response.status.as_u16(), "notify_ack");
             reply.headers = wire_headers(&response.headers, true);
