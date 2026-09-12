@@ -26,6 +26,21 @@ pub struct Definition {
     pub follow_redirects: bool,
 }
 
+impl Definition {
+    /// Validate a profile without reading its credential references.
+    pub fn validate(&self) -> Result<()> {
+        let mut definition = self.clone();
+        for value in definition.headers.values_mut() {
+            if value.to_ascii_lowercase().starts_with("env:")
+                || value.to_ascii_lowercase().starts_with("file:")
+            {
+                *value = "x".into();
+            }
+        }
+        Template::new(&definition).map(|_| ())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Parameter {
     #[serde(rename = "type")]

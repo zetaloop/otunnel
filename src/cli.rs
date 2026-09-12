@@ -1,4 +1,5 @@
 mod health;
+mod profiles;
 
 use std::{
     env, fs,
@@ -423,6 +424,8 @@ pub fn command() -> Command {
             ),
         )
         .subcommand(health::command())
+        .subcommand(profiles::command())
+        .subcommand(profiles::init_command())
         .subcommand(
             Command::new("completion")
                 .about("Generate shell completions")
@@ -457,56 +460,57 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
         };
         anyhow::ensure!(!value.is_empty(), "--{name} requires a value");
         return match name {
-            "profile" => {
+            "profile" => Ok(Some(otunnel::config::profile_path(
+                &value,
+                matches.get_one::<String>("profile-dir").map(String::as_str),
+            )?)),
+            "profile-file" => {
+                let file = otunnel::config::expand_home(&value)?;
                 anyhow::ensure!(
-                    value != "." && value != ".." && !value.contains(['/', '\\']),
-                    "profile names cannot contain path components; use --profile-file for paths"
+                    file.extension()
+                        .is_some_and(|extension| extension == "yaml"),
+                    "profile file must end with .yaml"
                 );
-                let directory = if let Some(directory) = matches
-                    .get_one::<String>("profile-dir")
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    expand_home(directory)?
-                } else if let Some(directory) =
-                    env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
-                {
-                    PathBuf::from(directory).join("tunnel-client")
-                } else if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
-                    PathBuf::from(home).join(".config/tunnel-client")
-                } else {
-                    #[cfg(windows)]
-                    let directory = env::var_os("APPDATA").map(PathBuf::from);
-                    #[cfg(target_os = "macos")]
-                    let directory =
-                        env::home_dir().map(|home| home.join("Library/Application Support"));
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    let directory = env::home_dir().map(|home| home.join(".config"));
-                    directory
-                        .context("profile directory is unavailable; use --profile-dir")?
-                        .join("tunnel-client")
-                };
-                Ok(Some(directory.join(format!("{value}.yaml"))))
+                otunnel::config::profile_name(
+                    file.file_stem()
+                        .and_then(|name| name.to_str())
+                        .context("invalid profile filename")?,
+                )?;
+                Ok(Some(file))
             }
-            _ => Ok(Some(expand_home(&value)?)),
+            _ => Ok(Some(PathBuf::from(value))),
         };
     }
     Ok(None)
 }
 
-fn expand_home(value: &str) -> Result<PathBuf> {
-    let value = value.trim();
-    if value == "~" || value.starts_with("~/") {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .or_else(env::home_dir)
-            .context("home directory is unavailable")?;
-        Ok(home.join(value.strip_prefix("~/").unwrap_or("")))
-    } else {
-        Ok(PathBuf::from(value))
+fn boolean(value: &str) -> std::result::Result<bool, String> {
+    match value {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
+        _ => Err(format!("invalid boolean {value:?}")),
     }
 }
 
+fn flag(name: &'static str) -> Arg {
+    Arg::new(name)
+        .long(name)
+        .num_args(0..=1)
+        .require_equals(true)
+        .default_missing_value("true")
+        .default_value("false")
+        .value_parser(boolean)
+}
+
 fn load(matches: &ArgMatches) -> Result<Config> {
+    if matches.value_source("profile-dir") == Some(clap::parser::ValueSource::CommandLine) {
+        anyhow::ensure!(
+            matches
+                .get_one::<String>("profile-dir")
+                .is_some_and(|directory| !directory.trim().is_empty()),
+            "profile directory is required when --profile-dir is set"
+        );
+    }
     let source = source(matches)?;
     let config = source.map(Config::read).transpose()?.unwrap_or_default();
     let mut value = serde_json::to_value(config)?;
@@ -655,8 +659,11 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
         clap_complete::generate(shell, &mut command(), "otunnel", &mut io::stdout());
         return Ok(0);
     }
-    if name == "health" {
-        return health::execute(matches).await;
+    match name {
+        "health" => return health::execute(matches).await,
+        "profiles" => return profiles::execute(matches),
+        "init" => return profiles::init(matches),
+        _ => {}
     }
     let config = load(matches)?;
     logger(&config.log)?;
