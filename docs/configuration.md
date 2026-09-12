@@ -205,7 +205,7 @@ cloudflared:
   managed: true
 ```
 
-Select one token source. `cloudflared.path` defaults to `cloudflared`, and `cloudflared.ready_timeout` defaults to `30s`. The token is supplied through the child environment. The companion binds its metrics listener to an ephemeral loopback port, and readiness comes from its native `/ready` endpoint. Its state contributes to the main readiness result. The process shares the client's shutdown lifecycle.
+An explicit `cloudflared.token` takes precedence over managed discovery. `cloudflared.path` defaults to `cloudflared`, and `cloudflared.ready_timeout` defaults to `30s`. The token is supplied through the child environment. The companion binds its metrics listener to an ephemeral loopback port, and readiness comes from its native `/ready` endpoint. Its state contributes to the main readiness result. The process shares the client's shutdown lifecycle.
 
 ## TLS and proxies
 

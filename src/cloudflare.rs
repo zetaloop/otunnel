@@ -28,11 +28,9 @@ pub(crate) struct Companion {
 }
 impl Companion {
     pub async fn new(config: &Cloudflared, control: &Control) -> Result<Self> {
-        anyhow::ensure!(
-            !config.managed || config.token.is_none(),
-            "cloudflared selects either a managed token or an explicit token"
-        );
-        let token = if config.managed {
+        let token = if let Some(token) = &config.token {
+            resolve(token)?
+        } else if config.managed {
             control
                 .cloudflare()
                 .await?
@@ -41,12 +39,7 @@ impl Companion {
                 .context("Cloudflare runtime response has no token")?
                 .to_owned()
         } else {
-            resolve(
-                config
-                    .token
-                    .as_deref()
-                    .context("Cloudflare token is missing")?,
-            )?
+            bail!("Cloudflare token is missing");
         };
         anyhow::ensure!(!token.is_empty(), "Cloudflare token is empty");
         let mut command = Command::new(&config.path);
