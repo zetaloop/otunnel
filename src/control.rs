@@ -12,7 +12,10 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::time::{Instant, timeout};
+use tokio::{
+    sync::watch,
+    time::{Instant, timeout},
+};
 use url::Url;
 
 use crate::{
@@ -57,6 +60,7 @@ pub struct Control {
     poll_timeout: Duration,
     initial_poll_timeout: Duration,
     guard: Duration,
+    connected: watch::Sender<bool>,
 }
 
 impl Control {
@@ -122,7 +126,12 @@ impl Control {
             poll_timeout: cp.poll_timeout.0,
             initial_poll_timeout: cp.initial_poll_timeout.0,
             guard: cp.poll_deadline_guardrail.0,
+            connected: watch::channel(false).0,
         })
+    }
+
+    pub(crate) fn connection(&self) -> watch::Receiver<bool> {
+        self.connected.subscribe()
     }
 
     pub fn set_channels(&self, mut channels: Vec<Channel>) -> Result<()> {
@@ -192,7 +201,9 @@ impl Control {
     }
 
     pub async fn metadata(&self) -> Result<Value> {
-        self.fetch("").await
+        let metadata = self.fetch("").await?;
+        self.connected.send_replace(true);
+        Ok(metadata)
     }
 
     pub async fn cloudflare(&self) -> Result<Value> {
@@ -254,6 +265,14 @@ impl Control {
                 Ok(Ok(Batch { received, commands }))
             })
             .await;
+            let connected = matches!(&result, Ok(Ok(Ok(_))));
+            self.connected.send_if_modified(|current| {
+                if *current == connected {
+                    return false;
+                }
+                *current = connected;
+                true
+            });
             let retry_headers = match result {
                 Ok(Ok(Ok(batch))) => return Ok(batch),
                 Ok(Ok(Err((status, headers)))) if status == 429 || status >= 500 => headers,

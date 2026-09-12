@@ -336,6 +336,7 @@ impl Tunnel {
             .collect();
         let local = Arc::new(local);
         let mut requests: JoinSet<Result<bool>> = JoinSet::new();
+        let mut connection = self.control.connection();
         let mut connections = JoinSet::new();
         for (name, binding) in bindings.iter() {
             let binding = binding.clone();
@@ -360,6 +361,14 @@ impl Tunnel {
                 }
                 tokio::select! {
                     () = shutdown.cancelled() => return Ok(()),
+                    changed = connection.changed() => {
+                        changed?;
+                        let connected = *connection.borrow_and_update();
+                        self.state.send_modify(|state| {
+                            state.connected = connected;
+                            state.ready = connected && state.cloudflare_ready.unwrap_or(true);
+                        });
+                    }
                     child = self.children.join_next(), if !self.children.is_empty() => {
                         child.context("child supervisor stopped")???;
                         bail!("MCP child stopped");
