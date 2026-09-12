@@ -25,6 +25,9 @@ pub trait Transport: Send + Sync {
     async fn terminate(&self, _headers: HeaderMap) -> Result<Reply> {
         Ok(Reply::ack(405, "session_termination_response"))
     }
+    async fn discover(&self) -> Result<Reply> {
+        Ok(Reply::ack(404, "oauth_discovery_response"))
+    }
     async fn close(&self) -> Result<()> {
         Ok(())
     }

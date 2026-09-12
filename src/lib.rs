@@ -5,4 +5,7 @@ pub mod control;
 mod net;
 mod process;
 pub mod protocol;
+pub mod runtime;
+pub use runtime::{Report, Snapshot, Tunnel};
+pub use tokio_util::sync::CancellationToken;
 pub mod transport;

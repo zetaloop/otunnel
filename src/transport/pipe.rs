@@ -71,6 +71,13 @@ impl Pipe {
                     frame = receiver.recv() => match frame { Some(frame) => frame, None => break },
                     () = output.stop.cancelled() => break,
                 };
+                if frame
+                    .written
+                    .as_ref()
+                    .is_some_and(oneshot::Sender::is_closed)
+                {
+                    continue;
+                }
                 let written = async {
                     writer.write_all(frame.message.get().as_bytes()).await?;
                     writer.write_all(b"\n").await?;

@@ -67,11 +67,6 @@ impl Config {
                 bail!("channel {name} has multiple bindings");
             }
         }
-        for name in &self.control_plane.poll_channels {
-            if name != "harpoon" && !channels.contains(name) {
-                bail!("channel {name} has no binding");
-            }
-        }
         Ok(())
     }
 
