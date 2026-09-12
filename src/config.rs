@@ -23,8 +23,10 @@ impl<'de> Deserialize<'de> for Span {
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<u8>,
     pub control_plane: ControlPlane,
     pub mcp: Mcp,
     pub harpoon: Harpoon,
@@ -46,6 +48,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.config_version
+                .is_none_or(|version| matches!(version, 1 | 2)),
+            "unsupported config_version"
+        );
         if self.control_plane.tunnel_id.is_empty() {
             bail!("control_plane.tunnel_id is required");
         }
@@ -81,7 +88,7 @@ impl Config {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ControlPlane {
     pub base_url: String,
     pub url_path: String,
@@ -121,7 +128,7 @@ impl Default for ControlPlane {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Mcp {
     pub server_urls: Vec<Server>,
     pub commands: Vec<Command>,
@@ -153,6 +160,7 @@ impl Default for Mcp {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Server {
     #[serde(default = "main_channel")]
     pub channel: String,
@@ -174,6 +182,7 @@ pub struct Server {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Command {
     #[serde(default = "main_channel")]
     pub channel: String,
@@ -194,7 +203,7 @@ pub enum Invocation {
 impl Invocation {
     pub fn args(&self) -> Result<Vec<String>> {
         let args = match self {
-            Self::Text(value) => shell_words::split(value)?,
+            Self::Text(value) => shell_words::split(&resolve(value)?)?,
             Self::Args(args) => args.clone(),
         };
         if args.is_empty() {
@@ -205,7 +214,7 @@ impl Invocation {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Harpoon {
     pub targets: Vec<Target>,
     pub http_proxy: Option<String>,
@@ -233,6 +242,7 @@ impl Default for Harpoon {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Target {
     pub label: String,
     #[serde(default)]
@@ -246,7 +256,7 @@ pub struct Target {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Health {
     pub listen_addr: String,
     pub unix_socket: Option<String>,
@@ -265,7 +275,7 @@ impl Default for Health {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Log {
     pub level: String,
     pub format: String,
@@ -282,13 +292,13 @@ impl Default for Log {
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Process {
     pub pid_file: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Cloudflared {
     pub managed: bool,
     pub token: Option<String>,

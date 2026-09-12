@@ -35,14 +35,15 @@ pub struct Server {
 impl Server {
     pub async fn bind(config: &Health, status: watch::Receiver<Snapshot>) -> Result<Self> {
         let (listener, url) = if let Some(socket) = &config.unix_socket {
-            let path = std::path::absolute(socket)?;
+            let path = std::path::absolute(crate::config::resolve(socket)?)?;
             let local = Local::bind(path)?;
             (Listener::Local(local), Url::parse("http://localhost")?)
         } else {
-            let address = if config.listen_addr.starts_with(':') {
-                format!("0.0.0.0{}", config.listen_addr)
+            let address = crate::config::resolve(&config.listen_addr)?;
+            let address = if address.starts_with(':') {
+                format!("0.0.0.0{address}")
             } else {
-                config.listen_addr.clone()
+                address
             };
             let listener = TcpListener::bind(&address)
                 .await

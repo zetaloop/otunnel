@@ -146,7 +146,7 @@ impl Harpoon {
         );
         let url = match &template {
             Some(template) => template.origin().clone(),
-            None => Url::parse(&target.url)?,
+            None => Url::parse(&config::resolve(&target.url)?)?,
         };
         let client = Http::new(
             url.clone(),

@@ -35,7 +35,7 @@ pub struct HttpTransport {
 }
 impl HttpTransport {
     pub fn new(server: &config::Server, config: &config::Config) -> Result<Self> {
-        let url = Url::parse(&server.url)?;
+        let url = Url::parse(&config::resolve(&server.url)?)?;
         let mcp = &config.mcp;
         let client = Http::new(
             url.clone(),

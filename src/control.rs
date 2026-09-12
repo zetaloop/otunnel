@@ -66,13 +66,13 @@ pub struct Control {
 impl Control {
     pub fn new(config: &Config) -> Result<Self> {
         let cp = &config.control_plane;
-        let mut url = Url::parse(&cp.base_url)?;
+        let mut url = Url::parse(&config::resolve(&cp.base_url)?)?;
         if cp.client_cert.is_some() && url.host_str() == Some("api.openai.com") {
             url.set_host(Some("mtls.api.openai.com"))?;
         }
         url.set_path(&format!(
             "{}/v1/tunnels/",
-            cp.url_path.trim_end_matches('/')
+            config::resolve(&cp.url_path)?.trim_end_matches('/')
         ));
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("control plane URL cannot contain path segments"))?

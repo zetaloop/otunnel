@@ -441,36 +441,93 @@ pub fn command() -> Command {
         )
 }
 
-fn load(matches: &ArgMatches) -> Result<Config> {
-    let source = matches
-        .get_one::<String>("config")
-        .cloned()
-        .or_else(|| env::var("TUNNEL_CLIENT_CONFIG").ok())
-        .or_else(|| matches.get_one::<String>("profile-file").cloned())
-        .map(PathBuf::from);
-    let source = match source {
-        Some(source) => Some(source),
-        None => match matches.get_one::<String>("profile") {
-            Some(profile) => {
-                let directory = matches
+fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
+    use clap::parser::ValueSource;
+
+    for layer in [ValueSource::CommandLine, ValueSource::EnvVariable] {
+        let mut selected: Vec<_> = ["config", "profile", "profile-file"]
+            .into_iter()
+            .filter(|name| matches.value_source(name) == Some(layer))
+            .filter_map(|name| {
+                matches
+                    .get_one::<String>(name)
+                    .map(|value| (name, value.trim().to_owned()))
+            })
+            .filter(|(_, value)| layer == ValueSource::CommandLine || !value.is_empty())
+            .collect();
+        if layer == ValueSource::EnvVariable
+            && !selected.iter().any(|(name, _)| *name == "config")
+            && let Ok(value) = env::var("TUNNEL_CLIENT_CONFIG")
+            && !value.trim().is_empty()
+        {
+            selected.push(("config", value.trim().to_owned()));
+        }
+        anyhow::ensure!(
+            selected.len() <= 1,
+            "config, profile, and profile-file select alternative configuration sources"
+        );
+        let Some((name, value)) = selected.pop() else {
+            continue;
+        };
+        anyhow::ensure!(!value.is_empty(), "--{name} requires a value");
+        return match name {
+            "profile" => {
+                anyhow::ensure!(
+                    value != "." && value != ".." && !value.contains(['/', '\\']),
+                    "profile names cannot contain path components; use --profile-file for paths"
+                );
+                let directory = if let Some(directory) = matches
                     .get_one::<String>("profile-dir")
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        env::var_os("XDG_CONFIG_HOME")
-                            .map(|path| PathBuf::from(path).join("otunnel"))
-                    })
-                    .or_else(|| {
-                        env::var_os("HOME")
-                            .or_else(|| env::var_os("USERPROFILE"))
-                            .map(|home| PathBuf::from(home).join(".config/otunnel"))
-                    })
-                    .context("profile directory is unavailable; use --profile-dir")?;
-                Some(directory.join(format!("{profile}.yaml")))
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    expand_home(directory)?
+                } else if let Some(directory) =
+                    env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+                {
+                    PathBuf::from(directory).join("otunnel")
+                } else if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+                    PathBuf::from(home).join(".config/otunnel")
+                } else {
+                    #[cfg(windows)]
+                    let directory = env::var_os("APPDATA").map(PathBuf::from);
+                    #[cfg(target_os = "macos")]
+                    let directory =
+                        env::home_dir().map(|home| home.join("Library/Application Support"));
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    let directory = env::home_dir().map(|home| home.join(".config"));
+                    directory
+                        .context("profile directory is unavailable; use --profile-dir")?
+                        .join("otunnel")
+                };
+                Ok(Some(directory.join(format!("{value}.yaml"))))
             }
-            None => None,
-        },
-    };
-    let config = source.map(Config::read).transpose()?.unwrap_or_default();
+            _ => Ok(Some(expand_home(&value)?)),
+        };
+    }
+    Ok(None)
+}
+
+fn expand_home(value: &str) -> Result<PathBuf> {
+    let value = value.trim();
+    if value == "~" || value.starts_with("~/") {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(env::home_dir)
+            .context("home directory is unavailable")?;
+        Ok(home.join(value.strip_prefix("~/").unwrap_or("")))
+    } else {
+        Ok(PathBuf::from(value))
+    }
+}
+
+fn load(matches: &ArgMatches) -> Result<Config> {
+    let source = source(matches)?;
+    let mut config = source.map(Config::read).transpose()?.unwrap_or_default();
+    if matches.value_source("http-proxy").is_none()
+        && let Ok(proxy) = env::var("TUNNEL_CLIENT_HTTP_PROXY")
+    {
+        config.http_proxy = Some(proxy);
+    }
     let mut value = serde_json::to_value(config)?;
     for (name, _, pointer, kind, _) in SETTINGS {
         let Some(arguments) = matches.get_many::<String>(name) else {
@@ -483,6 +540,40 @@ fn load(matches: &ArgMatches) -> Result<Config> {
         {
             arguments =
                 serde_json::from_str(&arguments[0]).with_context(|| format!("parse --{name}"))?;
+        }
+        if matches.value_source(name) == Some(clap::parser::ValueSource::EnvVariable) {
+            match kind {
+                Servers | Commands | Targets => {
+                    arguments = arguments
+                        .iter()
+                        .flat_map(|value| value.lines())
+                        .map(str::to_owned)
+                        .collect()
+                }
+                List if *name != "control-plane.poll-channel" => {
+                    arguments = arguments
+                        .iter()
+                        .flat_map(|value| value.split(';'))
+                        .map(str::to_owned)
+                        .collect()
+                }
+                Headers if arguments.len() == 1 && arguments[0].trim_start().starts_with('{') => {
+                    let headers: std::collections::BTreeMap<String, String> =
+                        serde_json::from_str(&arguments[0])?;
+                    arguments = headers
+                        .into_iter()
+                        .map(|(name, value)| format!("{name}: {value}"))
+                        .collect();
+                }
+                Headers => {
+                    arguments = arguments
+                        .iter()
+                        .flat_map(|value| value.lines())
+                        .map(str::to_owned)
+                        .collect()
+                }
+                _ => {}
+            }
         }
         let parsed = match kind {
             Text => json!(arguments[0]),
@@ -501,11 +592,7 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                     .collect::<Vec<_>>()
             ),
             Headers => {
-                let mut headers = value
-                    .pointer(pointer)
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut headers = serde_json::Map::new();
                 for argument in arguments {
                     let (name, value) = argument
                         .split_once(':')
@@ -549,11 +636,15 @@ fn mapping(value: &str, primary: &str) -> Result<Value> {
     if value.trim_start().starts_with('{') {
         return Ok(serde_json::from_str(value)?);
     }
-    if !value.starts_with("channel=")
-        && !value.starts_with("label=")
-        && !value.starts_with(&format!("{primary}="))
-        && !value.starts_with('"')
-    {
+    let structured = value
+        .trim_start_matches('"')
+        .split_once('=')
+        .is_some_and(|(name, _)| {
+            name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        });
+    if !structured {
         return Ok(json!({primary:value}));
     }
     let mut result = serde_json::Map::new();
@@ -688,7 +779,10 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
                     !config.health.listen_addr.ends_with(":0"),
                     "ephemeral health addresses require --url or health.url_file"
                 );
-                format!("http://{}", config.health.listen_addr)
+                format!(
+                    "http://{}",
+                    otunnel::config::resolve(&config.health.listen_addr)?
+                )
             };
             let status = health::probe(&config.health, &base).await?;
             let ready = status

@@ -2,13 +2,13 @@
 
 `otunnel` reads YAML with the same runtime sections used by the official tunnel client. The CLI applies explicit arguments, then their environment variables, then YAML values, then defaults. `otunnel run --help` lists flag names and environment variables. Library callers construct `Config` directly or use `Config::read`; environment lookup occurs for explicit `env:` references.
 
-`--config` selects a YAML file. `OTUNNEL_CONFIG` and `TUNNEL_CLIENT_CONFIG` can supply its path. Named profiles use `--profile NAME` and `--profile-dir DIRECTORY`; the default directory is `$XDG_CONFIG_HOME/otunnel` or `~/.config/otunnel`. A named profile is `NAME.yaml`. `--profile-file` selects a profile by path. The corresponding `TUNNEL_CLIENT_PROFILE`, `TUNNEL_CLIENT_PROFILE_DIR`, and `TUNNEL_CLIENT_PROFILE_FILE` variables are accepted.
+`--config`, `--profile`, and `--profile-file` select alternative configuration sources. An explicit selection takes precedence over environment selections. `OTUNNEL_CONFIG` and `TUNNEL_CLIENT_CONFIG` can supply the config path. Named profiles use `--profile NAME` and `--profile-dir DIRECTORY`; the default directory is `$XDG_CONFIG_HOME/otunnel`, then `$HOME/.config/otunnel`. Without those variables, Windows uses `%APPDATA%/otunnel` and macOS uses the user's `Library/Application Support/otunnel`. A named profile is `NAME.yaml`. The corresponding `TUNNEL_CLIENT_PROFILE`, `TUNNEL_CLIENT_PROFILE_DIR`, and `TUNNEL_CLIENT_PROFILE_FILE` variables are accepted.
 
 Paths are relative to the working directory, including paths in a configuration file. Durations use strings such as `250ms`, `30s`, and `10m`.
 
 ## Credentials and headers
 
-API keys, configured header values, child environment values, socket paths, and proxy settings accept literal values, `env:NAME`, and `file:PATH`. File and environment references are evaluated by the client. Certificate settings accept a PEM file path or PEM content.
+API keys, configured header values, child environment values, command strings, endpoint URLs, socket paths, and proxy settings accept literal values, `env:NAME`, and `file:PATH`. File and environment references are evaluated by the client. Certificate settings select PEM files: a plain path, `file:PATH`, or `env:NAME` containing the path.
 
 ```yaml
 control_plane:
@@ -211,7 +211,7 @@ Select one token source. `cloudflared.path` defaults to `cloudflared`, and `clou
 
 `ca_bundle` adds PEM roots to the platform trust store. `client_cert` and `client_key` are configured together. Setting the control-plane client identity with the default OpenAI API host selects `mtls.api.openai.com`.
 
-`http_proxy` provides the common proxy, with overrides under `control_plane`, `mcp`, individual HTTP bindings, and `harpoon`. Ordinary `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` behavior is supplied by the HTTP client when an explicit proxy is absent. The CLI's explicit global proxy variable is `OTUNNEL_HTTP_PROXY`.
+`http_proxy` provides the common proxy, with overrides under `control_plane`, `mcp`, individual HTTP bindings, and `harpoon`. Ordinary `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` behavior is supplied by the HTTP client when an explicit proxy is absent. `OTUNNEL_HTTP_PROXY` and `TUNNEL_CLIENT_HTTP_PROXY` select the explicit global proxy.
 
 ## Command-line bindings
 
@@ -222,4 +222,6 @@ otunnel run --control-plane.tunnel-id tunnel_... --control-plane.api-key file:tu
 otunnel run --config tunnel.yaml --mcp.server-url 'channel=main,url=http://localhost/mcp,unix-socket=/tmp/mcp.sock'
 ```
 
-Binding values accept CSV-style `name=value` fields or JSON objects. Repeated binding options replace the corresponding YAML list; repeated header options merge by header name. List-valued environment variables can be JSON arrays of strings. `otunnel completion` generates Bash, Elvish, Fish, PowerShell, or Zsh completion scripts.
+Binding values accept CSV-style `name=value` fields or JSON objects. Repeated binding or header options replace the corresponding YAML collection. Header environment values also accept JSON objects. Binding environment variables support newline-separated entries, host lists support semicolon-separated values, and list-valued variables can be JSON arrays of strings. `otunnel completion` generates Bash, Elvish, Fish, PowerShell, or Zsh completion scripts.
+
+Configuration fields are checked while loading. An unsupported field reports its name instead of silently discarding its value. The supported runtime fields are listed in this reference; the original client's administrative surfaces have their own configuration.
