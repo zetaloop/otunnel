@@ -749,9 +749,10 @@ async fn signal() -> Result<()> {
     }
     #[cfg(windows)]
     {
+        let mut interrupt = tokio::signal::windows::ctrl_break()?;
         let mut close = tokio::signal::windows::ctrl_close()?;
         let mut shutdown = tokio::signal::windows::ctrl_shutdown()?;
-        tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = close.recv() => {}, _ = shutdown.recv() => {} }
+        tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = interrupt.recv() => {}, _ = close.recv() => {}, _ = shutdown.recv() => {} }
     }
     Ok(())
 }
