@@ -261,14 +261,13 @@ impl Local {
     }
     #[cfg(windows)]
     async fn accept(&self) -> io::Result<Box<dyn Io>> {
-        use tokio_util::compat::FuturesAsyncReadCompatExt;
         let (socket, _) = self
             .listener
             .as_ref()
             .expect("bound socket")
             .read_with(|listener| listener.accept())
             .await?;
-        Ok(Box::new(async_io::Async::new(socket)?.compat()))
+        Ok(Box::new(crate::net::Socket(async_io::Async::new(socket)?)))
     }
 }
 impl Drop for Local {

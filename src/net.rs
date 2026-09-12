@@ -302,12 +302,45 @@ pub async fn connect(path: &Path) -> io::Result<Box<dyn Io>> {
 }
 
 #[cfg(windows)]
+pub(crate) struct Socket(pub async_io::Async<socket2::Socket>);
+
+#[cfg(windows)]
+impl AsyncRead for Socket {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        use tokio_util::compat::FuturesAsyncReadCompatExt;
+        Pin::new(&mut (&self.0).compat()).poll_read(cx, buffer)
+    }
+}
+
+#[cfg(windows)]
+impl AsyncWrite for Socket {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        use tokio_util::compat::FuturesAsyncWriteCompatExt;
+        Pin::new(&mut (&self.0).compat_write()).poll_write(cx, buffer)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        use tokio_util::compat::FuturesAsyncWriteCompatExt;
+        Pin::new(&mut (&self.0).compat_write()).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.0.get_ref().shutdown(std::net::Shutdown::Write))
+    }
+}
+
+#[cfg(windows)]
 pub async fn connect(path: &Path) -> io::Result<Box<dyn Io>> {
     use async_io::Async;
-    use socket2::{Domain, SockAddr, Socket, Type};
-    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    use socket2::{Domain, SockAddr, Type};
 
-    let socket = Async::new(Socket::new(Domain::UNIX, Type::STREAM, None)?)?;
+    let socket = Async::new(socket2::Socket::new(Domain::UNIX, Type::STREAM, None)?)?;
     match socket.get_ref().connect(&SockAddr::unix(path)?) {
         Ok(()) => (),
         Err(error)
@@ -321,7 +354,7 @@ pub async fn connect(path: &Path) -> io::Result<Box<dyn Io>> {
         }
         Err(error) => return Err(error),
     }
-    Ok(Box::new(socket.compat()))
+    Ok(Box::new(Socket(socket)))
 }
 
 pub fn connecting(error: &anyhow::Error) -> bool {
