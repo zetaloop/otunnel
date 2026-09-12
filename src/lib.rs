@@ -1,4 +1,8 @@
 //! Secure MCP Tunnel transport for applications sharing a Tokio runtime.
+//!
+//! [`Tunnel`] owns configured services and forwards commands until its
+//! [`CancellationToken`] is cancelled. [`transport::Transport`] allows a host
+//! application to provide its own asynchronous MCP implementation.
 
 mod cloudflare;
 pub mod config;
@@ -12,6 +16,7 @@ mod process;
 pub mod protocol;
 pub mod runtime;
 pub mod template;
+pub use anyhow::{Error, Result};
 pub use runtime::{Report, Snapshot, Tunnel};
 pub use tokio_util::sync::CancellationToken;
 pub mod transport;
