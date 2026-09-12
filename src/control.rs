@@ -114,7 +114,11 @@ impl Control {
                 config::resolve(organization)?.parse()?,
             );
         }
-        let mut subscriptions = cp.poll_channels.clone();
+        let mut subscriptions = cp
+            .poll_channels
+            .iter()
+            .map(|name| config::channel(name))
+            .collect::<Result<Vec<_>>>()?;
         subscriptions.sort();
         subscriptions.dedup();
         Ok(Self {
@@ -142,11 +146,7 @@ impl Control {
         );
         for (i, channel) in channels.iter().enumerate() {
             anyhow::ensure!(
-                !channel.name.is_empty()
-                    && channel.name.bytes().all(|c| c.is_ascii_lowercase()
-                        || c.is_ascii_digit()
-                        || c == b'_'
-                        || c == b'-'),
+                config::channel(&channel.name).is_ok_and(|name| name == channel.name),
                 "invalid tunnel channel name: {}",
                 channel.name
             );
@@ -258,7 +258,7 @@ impl Control {
                 let commands = if status == 204 {
                     Vec::new()
                 } else if status == 200 {
-                    serde_json::from_slice::<Poll>(&response.bytes().await?)?.commands
+                    serde_json::from_slice::<Poll>(&response.bytes().await?)?.commands()
                 } else {
                     return Ok::<_, anyhow::Error>(Err((status, headers)));
                 };

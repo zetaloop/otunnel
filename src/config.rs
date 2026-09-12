@@ -320,6 +320,21 @@ pub fn main_channel() -> String {
     "main".into()
 }
 
+pub fn channel(name: &str) -> Result<String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return Ok(main_channel());
+    }
+    anyhow::ensure!(
+        name.len() <= 64
+            && name.bytes().all(|value| value.is_ascii_lowercase()
+                || value.is_ascii_digit()
+                || matches!(value, b'_' | b'-')),
+        "invalid channel name {name}"
+    );
+    Ok(name)
+}
+
 pub fn resolve(value: &str) -> Result<String> {
     if let Some(name) = value.strip_prefix("env:") {
         env::var(name).with_context(|| format!("read environment variable {name}"))

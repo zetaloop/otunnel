@@ -30,7 +30,33 @@ pub struct Command {
 
 #[derive(Deserialize)]
 pub struct Poll {
-    pub commands: Vec<Command>,
+    pub commands: Vec<Json>,
+}
+
+impl Poll {
+    pub fn commands(self) -> Vec<Command> {
+        self.commands
+            .into_iter()
+            .filter_map(|raw| {
+                let parsed = (|| -> Result<Command> {
+                    let mut command: Command = serde_json::from_str(raw.get())?;
+                    anyhow::ensure!(
+                        !command.request_id.is_empty() && !command.shard_token.is_empty(),
+                        "command is missing its request ID or shard token"
+                    );
+                    command.channel = crate::config::channel(&command.channel)?;
+                    Ok(command)
+                })();
+                match parsed {
+                    Ok(command) => Some(command),
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid tunnel command skipped");
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
