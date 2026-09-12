@@ -345,7 +345,7 @@ pub async fn connect(path: &Path) -> io::Result<Box<dyn Io>> {
         Ok(()) => (),
         Err(error)
             if error.kind() == io::ErrorKind::WouldBlock
-                || matches!(error.raw_os_error(), Some(10035 | 10036 | 10037)) =>
+                || matches!(error.raw_os_error(), Some(10035..=10037)) =>
         {
             socket.writable().await?;
             if let Some(error) = socket.get_ref().take_error()? {
