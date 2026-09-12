@@ -39,7 +39,7 @@ otunnel health --config tunnel.yaml
 
 `doctor` starts the configured services and checks their actual MCP connections. `run` serves tunnel requests until stopped. The activity page is at `/ui` on the address written to `otunnel.url`.
 
-[Configuration](docs/configuration.md) covers HTTP bindings, profiles, credentials, OAuth, and logging. Relative paths use the working directory.
+[Configuration](docs/configuration.md) covers HTTP bindings, profiles, credentials, OAuth, and logging. Relative paths use the working directory. [Compatibility](docs/compatibility.md) describes behavior shared with the original client and differences in its operator and authentication interfaces.
 
 ## Library
 
