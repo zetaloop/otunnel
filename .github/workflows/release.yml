@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to do with the built artifacts
+        type: choice
+        options: [dryrun, draft]
+        default: dryrun
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update --no-self-update stable
+      - id: matrix
+        run: echo "matrix=$(cargo xtask matrix)" >> "$GITHUB_OUTPUT"
+
+  dist:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup component add rustfmt clippy
+      - name: Check
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo check --package otunnel --all-targets --no-default-features --locked
+          cargo test --workspace --locked
+      - name: Package
+        run: cargo dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  draft:
+    needs: dist
+    if: github.event_name == 'push' || inputs.mode == 'draft'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Create release draft
+        run: |
+          tag=$(git tag --points-at HEAD --list 'v*' | head -1)
+          if [ -z "$tag" ]; then
+            echo "::notice::No version tag at HEAD; artifacts are available in this workflow run"
+            exit 0
+          fi
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "otunnel") | .version')
+          test "$tag" = "v$version"
+          gh release create "$tag" dist/* --verify-tag --draft --title "$tag" --generate-notes

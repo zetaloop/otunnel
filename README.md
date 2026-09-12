@@ -116,17 +116,6 @@ The `cli` feature enables the executable and optional health service. The librar
 
 ## Build and release
 
-The repository uses Cargo formatting and Clippy:
-
-```sh
-cargo fmt
-cargo fix --allow-dirty
-cargo clippy --fix --allow-dirty
-cargo build --release
-```
-
-The release workflow builds x86-64 and ARM64 binaries on native Windows, macOS, and Linux runners. Each archive contains the binary, license, configuration reference, and shell completions. A `v<VERSION>` tag identifies the Cargo package version for release assets; publishing the corresponding crate enables registry-based `cargo binstall` discovery.
-
-`python scripts/package.py` performs the release build and writes the native archive to `target/dist`. The workflow calls the same script with its runner's target. After the release assets are available, `cargo publish` publishes the library and CLI package to the registry.
+`cargo dist` builds and packages the native executable into `dist/`. Tagged releases and manual workflow runs perform the platform checks and prepare artifacts. Publishing a release draft publishes the crate through Trusted Publishing. See [development](docs/development.md) for the complete workflow.
 
 The implementation follows the public [Secure MCP Tunnel protocol](https://github.com/openai/tunnel-client/blob/master/docs/protocol.md) and [MCP specification](https://modelcontextprotocol.io/specification/2026-07-28). It is distributed under the [MIT license](LICENSE).

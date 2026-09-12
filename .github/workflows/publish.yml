@@ -1,0 +1,42 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - run: rustup update --no-self-update stable
+      - name: Read package version
+        id: package
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "otunnel") | .version')
+          test "$RELEASE_TAG" = "v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if curl --fail --silent --show-error https://index.crates.io/ot/un/otunnel | jq -se --arg version "$version" 'any(.[]; .vers == $version)' >/dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.package.outputs.published != 'true'
+        id: auth
+      - name: Publish
+        if: steps.package.outputs.published != 'true'
+        run: cargo publish --package otunnel --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

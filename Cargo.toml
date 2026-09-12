@@ -1,3 +1,8 @@
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "otunnel"
 version = "0.1.0"
