@@ -3,13 +3,17 @@ name = "otunnel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["cli"]
+cli = ["dep:axum", "dep:clap", "dep:tracing-subscriber"]
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-axum = "0.8.9"
+axum = { version = "0.8.9", optional = true }
 base64 = "0.23.1"
 bytes = "1.12.1"
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.6", features = ["env"], optional = true }
 eventsource-stream = "0.2.3"
 futures-util = "0.3.34"
 http = "1.5.0"
@@ -35,7 +39,7 @@ tokio-rustls = "0.26.5"
 tokio-util = { version = "0.7.19", features = ["compat", "rt"] }
 tower-service = "0.3.3"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"], optional = true }
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 

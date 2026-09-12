@@ -3,6 +3,8 @@
 pub mod config;
 pub mod control;
 pub mod harpoon;
+#[cfg(feature = "cli")]
+pub mod health;
 mod net;
 mod oauth;
 mod process;
