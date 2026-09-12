@@ -517,6 +517,12 @@ async fn execute(
                 )),
             };
             if let Err(error) = outcome {
+                if error
+                    .downcast_ref::<StatusError>()
+                    .is_some_and(|error| error.status == 404)
+                {
+                    return Ok(());
+                }
                 if delivery.terminal_started()
                     || error
                         .downcast_ref::<StatusError>()

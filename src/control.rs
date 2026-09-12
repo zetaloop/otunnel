@@ -335,7 +335,7 @@ impl Control {
             let retry_headers = match response {
                 Ok(Ok((status, headers))) => {
                     let code = status.as_u16();
-                    if status.is_success() || code == 404 {
+                    if status.is_success() || (code == 404 && reply.terminal()) {
                         return Ok(());
                     }
                     if code == 429 || (reply.terminal() && matches!(code, 408 | 502 | 503 | 504)) {
@@ -435,7 +435,7 @@ impl Sink for Delivery {
         {
             if error
                 .downcast_ref::<StatusError>()
-                .is_some_and(|e| matches!(e.status, 401 | 403))
+                .is_some_and(|e| matches!(e.status, 401 | 403 | 404))
             {
                 return Err(error);
             }
