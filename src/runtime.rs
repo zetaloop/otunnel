@@ -130,6 +130,12 @@ impl Tunnel {
             self.children
                 .spawn(companion.supervise(self.stop.clone(), self.state.clone()));
         }
+        let wait = self.config.mcp.startup_wait_timeout.0;
+        let probe_timeout = if wait.is_zero() {
+            Duration::from_secs(2)
+        } else {
+            wait
+        };
         let mut pipes = Vec::new();
         for command in &self.config.mcp.commands {
             let enabled = self.config.enabled(&command.channel);
@@ -168,24 +174,21 @@ impl Tunnel {
                 !self.bindings.contains_key(&channel),
                 "duplicate channel {channel}"
             );
-            let pipe = timeout(
-                self.config.mcp.startup_wait_timeout.0,
-                Pipe::new(reader, writer),
-            )
-            .await
-            .with_context(|| format!("channel {channel} initialization timed out"))??;
+            let pipe = timeout(probe_timeout, Pipe::new(reader, writer))
+                .await
+                .with_context(|| format!("channel {channel} initialization timed out"))??;
             self.bindings.insert(channel, Arc::new(pipe));
         }
         for (name, transport) in &self.bindings {
             if !transport.available() {
                 continue;
             }
-            let deadline = Instant::now() + self.config.mcp.startup_wait_timeout.0;
+            let deadline = Instant::now() + probe_timeout;
             let probe = async {
                 loop {
                     match transport::probe(transport.as_ref()).await {
                         Ok(probe) => return Ok(probe),
-                        Err(error) if crate::net::connecting(&error) => {
+                        Err(error) if !wait.is_zero() && crate::net::connecting(&error) => {
                             tracing::debug!(channel = %name, %error, "MCP service is starting");
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }

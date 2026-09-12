@@ -149,9 +149,9 @@ impl Default for Mcp {
             commands: Vec::new(),
             extra_headers: BTreeMap::new(),
             discovery_extra_headers: BTreeMap::new(),
-            startup_wait_timeout: Span(Duration::from_secs(30)),
-            connection_max_ttl: None,
-            max_concurrent_requests: 32,
+            startup_wait_timeout: Span(Duration::ZERO),
+            connection_max_ttl: Some(Span(Duration::from_secs(600))),
+            max_concurrent_requests: 10,
             http_proxy: None,
             client_cert: None,
             client_key: None,
@@ -231,8 +231,8 @@ impl Default for Harpoon {
         Self {
             targets: Vec::new(),
             http_proxy: None,
-            max_response_bytes: None,
-            max_redirects: 10,
+            max_response_bytes: Some(100 * 1024),
+            max_redirects: 5,
             hosts_include_loopback: true,
             hosts_include_private: true,
             hosts_include_suffix: Vec::new(),
@@ -266,7 +266,7 @@ pub struct Health {
 impl Default for Health {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:0".into(),
+            listen_addr: "127.0.0.1:8080".into(),
             unix_socket: None,
             url_file: None,
             show_details: false,
@@ -285,7 +285,7 @@ impl Default for Log {
     fn default() -> Self {
         Self {
             level: "info".into(),
-            format: "text".into(),
+            format: String::new(),
             file: None,
         }
     }

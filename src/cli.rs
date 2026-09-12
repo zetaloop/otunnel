@@ -348,7 +348,7 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
     ),
     (
         "http-proxy",
-        "OTUNNEL_HTTP_PROXY",
+        "TUNNEL_CLIENT_HTTP_PROXY",
         "/http_proxy",
         Text,
         "Global outbound HTTP proxy",
@@ -360,7 +360,7 @@ pub fn command() -> Command {
         [
             Arg::new("config")
                 .long("config")
-                .env("OTUNNEL_CONFIG")
+                .env("TUNNEL_CLIENT_CONFIG")
                 .help("YAML configuration file"),
             Arg::new("profile")
                 .long("profile")
@@ -369,7 +369,7 @@ pub fn command() -> Command {
             Arg::new("profile-dir")
                 .long("profile-dir")
                 .env("TUNNEL_CLIENT_PROFILE_DIR")
-                .help("Profile directory; defaults to $XDG_CONFIG_HOME/otunnel"),
+                .help("Profile directory; defaults to $XDG_CONFIG_HOME/tunnel-client"),
             Arg::new("profile-file")
                 .long("profile-file")
                 .env("TUNNEL_CLIENT_PROFILE_FILE")
@@ -445,7 +445,7 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
     use clap::parser::ValueSource;
 
     for layer in [ValueSource::CommandLine, ValueSource::EnvVariable] {
-        let mut selected: Vec<_> = ["config", "profile", "profile-file"]
+        let selected: Vec<_> = ["config", "profile", "profile-file"]
             .into_iter()
             .filter(|name| matches.value_source(name) == Some(layer))
             .filter_map(|name| {
@@ -455,18 +455,11 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
             })
             .filter(|(_, value)| layer == ValueSource::CommandLine || !value.is_empty())
             .collect();
-        if layer == ValueSource::EnvVariable
-            && !selected.iter().any(|(name, _)| *name == "config")
-            && let Ok(value) = env::var("TUNNEL_CLIENT_CONFIG")
-            && !value.trim().is_empty()
-        {
-            selected.push(("config", value.trim().to_owned()));
-        }
         anyhow::ensure!(
             selected.len() <= 1,
             "config, profile, and profile-file select alternative configuration sources"
         );
-        let Some((name, value)) = selected.pop() else {
+        let Some((name, value)) = selected.into_iter().next() else {
             continue;
         };
         anyhow::ensure!(!value.is_empty(), "--{name} requires a value");
@@ -484,9 +477,9 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
                 } else if let Some(directory) =
                     env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
                 {
-                    PathBuf::from(directory).join("otunnel")
+                    PathBuf::from(directory).join("tunnel-client")
                 } else if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
-                    PathBuf::from(home).join(".config/otunnel")
+                    PathBuf::from(home).join(".config/tunnel-client")
                 } else {
                     #[cfg(windows)]
                     let directory = env::var_os("APPDATA").map(PathBuf::from);
@@ -497,7 +490,7 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
                     let directory = env::home_dir().map(|home| home.join(".config"));
                     directory
                         .context("profile directory is unavailable; use --profile-dir")?
-                        .join("otunnel")
+                        .join("tunnel-client")
                 };
                 Ok(Some(directory.join(format!("{value}.yaml"))))
             }
@@ -522,12 +515,7 @@ fn expand_home(value: &str) -> Result<PathBuf> {
 
 fn load(matches: &ArgMatches) -> Result<Config> {
     let source = source(matches)?;
-    let mut config = source.map(Config::read).transpose()?.unwrap_or_default();
-    if matches.value_source("http-proxy").is_none()
-        && let Ok(proxy) = env::var("TUNNEL_CLIENT_HTTP_PROXY")
-    {
-        config.http_proxy = Some(proxy);
-    }
+    let config = source.map(Config::read).transpose()?.unwrap_or_default();
     let mut value = serde_json::to_value(config)?;
     for (name, _, pointer, kind, _) in SETTINGS {
         let Some(arguments) = matches.get_many::<String>(name) else {
@@ -547,6 +535,8 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                     arguments = arguments
                         .iter()
                         .flat_map(|value| value.lines())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
                         .map(str::to_owned)
                         .collect()
                 }
@@ -568,9 +558,11 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                 Headers => {
                     arguments = arguments
                         .iter()
-                        .flat_map(|value| value.lines())
+                        .flat_map(|value| value.split([',', ';']))
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
                         .map(str::to_owned)
-                        .collect()
+                        .collect();
                 }
                 _ => {}
             }
@@ -801,27 +793,34 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
 }
 
 fn logger(config: &Log) -> Result<()> {
-    let (writer, terminal): (Box<dyn Write + Send>, bool) =
-        match config.file.as_deref().filter(|value| !value.is_empty()) {
-            None | Some("stderr") => (Box::new(io::stderr()), io::stderr().is_terminal()),
-            Some("stdout") => (Box::new(io::stdout()), io::stdout().is_terminal()),
-            Some(path) => (
-                Box::new(
-                    fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                        .with_context(|| format!("open log {path}"))?,
-                ),
-                false,
+    let file = config.file.as_deref().filter(|value| !value.is_empty());
+    let format = if config.format.is_empty() && file.is_some() {
+        "struct-text"
+    } else {
+        &config.format
+    };
+    let (writer, terminal): (Box<dyn Write + Send>, bool) = if let Some(path) = file {
+        (
+            Box::new(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .with_context(|| format!("open log {path}"))?,
             ),
-        };
+            false,
+        )
+    } else if format.is_empty() {
+        (Box::new(io::stderr()), io::stderr().is_terminal())
+    } else {
+        (Box::new(io::stdout()), io::stdout().is_terminal())
+    };
     let writer = BoxMakeWriter::new(Mutex::new(writer));
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_new(&config.level)?)
         .with_writer(writer)
         .with_ansi(terminal);
-    match config.format.as_str() {
+    match format {
         "json" => subscriber
             .json()
             .try_init()
