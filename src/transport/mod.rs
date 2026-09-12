@@ -22,6 +22,9 @@ pub trait Sink: Send + Sync {
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()>;
+    fn discovery_headers(&self) -> HeaderMap {
+        HeaderMap::new()
+    }
     async fn terminate(&self, _headers: HeaderMap) -> Result<Reply> {
         Ok(Reply::ack(405, "session_termination_response"))
     }
@@ -78,11 +81,9 @@ pub struct Probe {
 }
 
 pub(crate) async fn negotiate(transport: &dyn Transport) -> Result<(Reply, bool)> {
-    let reply = exchange(
-        transport,
-        protocol::request("server/discover", json!({}), true)?,
-    )
-    .await?;
+    let mut request = protocol::request("server/discover", json!({}), true)?;
+    request.headers = transport.discovery_headers();
+    let reply = exchange(transport, request).await?;
     if reply.status == 401 || reply.status == 403 {
         return Ok((reply, false));
     }
@@ -112,7 +113,9 @@ pub(crate) async fn negotiate(transport: &dyn Transport) -> Result<(Reply, bool)
             }
         }
     }
-    Ok((exchange(transport, protocol::initialize()?).await?, false))
+    let mut request = protocol::initialize()?;
+    request.headers = transport.discovery_headers();
+    Ok((exchange(transport, request).await?, false))
 }
 
 pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
@@ -152,7 +155,7 @@ pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
     } else {
         value.get("serverInfo").cloned()
     };
-    let mut headers = HeaderMap::new();
+    let mut headers = transport.discovery_headers();
     if stateless {
         headers.insert("mcp-protocol-version", protocol::MCP_VERSION.parse()?);
     } else {

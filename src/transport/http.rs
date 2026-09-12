@@ -120,6 +120,9 @@ impl HttpTransport {
 
 #[async_trait]
 impl Transport for HttpTransport {
+    fn discovery_headers(&self) -> HeaderMap {
+        self.discovery_headers.clone()
+    }
     async fn discover(&self) -> Result<Reply> {
         crate::oauth::discover(self).await
     }
