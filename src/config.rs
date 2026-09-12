@@ -235,11 +235,14 @@ impl Default for Harpoon {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Target {
     pub label: String,
+    #[serde(default)]
     pub url: String,
     #[serde(default, alias = "desc")]
     pub description: String,
     #[serde(default)]
     pub unix_socket: Option<String>,
+    #[serde(default)]
+    pub template: Option<crate::template::Definition>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

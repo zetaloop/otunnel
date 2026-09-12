@@ -8,6 +8,7 @@ mod oauth;
 mod process;
 pub mod protocol;
 pub mod runtime;
+pub mod template;
 pub use runtime::{Report, Snapshot, Tunnel};
 pub use tokio_util::sync::CancellationToken;
 pub mod transport;

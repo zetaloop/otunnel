@@ -197,10 +197,14 @@ fn register(
             source: "oauth".into(),
             tags,
             allowed_methods: vec!["GET".into(), "POST".into(), "PUT".into()],
+            template_version: None,
+            parameters_schema: None,
+            invocation: None,
         },
         url,
         original_url: raw.into(),
         client: transport.client.clone(),
+        template: None,
     })
 }
 

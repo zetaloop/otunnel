@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     net::IpAddr,
-    sync::{LazyLock, RwLock},
+    sync::{Arc, LazyLock, RwLock},
     time::Duration,
 };
 
@@ -32,6 +32,12 @@ pub struct TargetInfo {
     pub source: String,
     pub tags: Vec<String>,
     pub allowed_methods: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -40,6 +46,7 @@ pub(crate) struct Target {
     pub url: Url,
     pub original_url: String,
     pub client: Http,
+    pub template: Option<Arc<crate::template::Template>>,
 }
 
 pub struct Harpoon {
@@ -75,6 +82,15 @@ struct CallTarget {
     max_response_bytes: Option<usize>,
     follow_redirects: Option<bool>,
     max_redirects: Option<usize>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CallTemplate {
+    label: String,
+    parameters: BTreeMap<String, String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    timeout_ms: Option<u64>,
+    max_response_bytes: Option<usize>,
 }
 #[derive(Serialize, JsonSchema)]
 struct CallResponse {
@@ -118,7 +134,20 @@ impl Harpoon {
     }
 
     pub fn register(&self, target: &config::Target) -> Result<()> {
-        let url = Url::parse(&target.url)?;
+        let template = target
+            .template
+            .as_ref()
+            .map(crate::template::Template::new)
+            .transpose()?
+            .map(Arc::new);
+        anyhow::ensure!(
+            template.is_none() || target.url.is_empty(),
+            "Harpoon target selects either a URL or a template"
+        );
+        let url = match &template {
+            Some(template) => template.origin().clone(),
+            None => Url::parse(&target.url)?,
+        };
         let client = Http::new(
             url.clone(),
             Options {
@@ -135,11 +164,21 @@ impl Harpoon {
                 category: "manual".into(),
                 source: "config".into(),
                 tags: Vec::new(),
-                allowed_methods: vec!["GET".into(), "POST".into(), "PUT".into()],
+                allowed_methods: if template.is_some() {
+                    vec!["GET".into()]
+                } else {
+                    vec!["GET".into(), "POST".into(), "PUT".into()]
+                },
+                template_version: template.as_ref().map(|_| 1),
+                parameters_schema: template.as_ref().map(|template| template.schema()),
+                invocation: template.as_ref().map(|template| {
+                    template.invocation(&target.label, json!(schemars::schema_for!(CallTemplate)))
+                }),
             },
             original_url: target.url.clone(),
             url,
             client,
+            template,
         })
     }
 
@@ -222,7 +261,7 @@ impl Harpoon {
             .read()
             .expect("target registry lock poisoned")
             .values()
-            .find(|target| target.url == *url)
+            .find(|target| target.template.is_none() && target.url == *url)
             .cloned()
             .context("redirect destination is not a registered Harpoon target")
     }
@@ -253,11 +292,37 @@ impl Harpoon {
     }
 
     fn tools(&self) -> Result<Value> {
-        Ok(json!({"tools":[
-            tool::<ListTargets, TargetList>("list_targets", "List available HTTP targets by label and OAuth role.", true)?,
-            tool::<CallTarget, CallResponse>("call_target", "Send an HTTP request to a configured target. Response bytes are returned as base64.", false)?,
-            tool::<AudienceQuery, Audience>("get_oauth_target_audience", "Resolve the original token endpoint URL for a private_key_jwt audience.", true)?,
-        ]}))
+        let mut tools = vec![
+            tool::<ListTargets, TargetList>(
+                "list_targets",
+                "List available HTTP targets by label and OAuth role.",
+                true,
+            )?,
+            tool::<CallTarget, CallResponse>(
+                "call_target",
+                "Send an HTTP request to a configured target. Response bytes are returned as base64.",
+                false,
+            )?,
+            tool::<AudienceQuery, Audience>(
+                "get_oauth_target_audience",
+                "Resolve the original token endpoint URL for a private_key_jwt audience.",
+                true,
+            )?,
+        ];
+        if self
+            .targets
+            .read()
+            .expect("target registry lock poisoned")
+            .values()
+            .any(|target| target.template.is_some())
+        {
+            tools.push(tool::<CallTemplate, CallResponse>(
+                "call_target_template",
+                "Invoke a configured GET operation using its declared parameters and headers.",
+                true,
+            )?);
+        }
+        Ok(json!({"tools":tools}))
     }
 
     async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
@@ -300,11 +365,28 @@ impl Harpoon {
                     audience: target.original_url,
                 })?)
             }
-            "call_target" => {
-                let call: CallTarget = serde_json::from_value(arguments)?;
+            "call_target" | "call_target_template" => {
+                let (call, parameters) = if name == "call_target_template" {
+                    let call: CallTemplate = serde_json::from_value(arguments)?;
+                    (
+                        CallTarget {
+                            label: call.label,
+                            method: "GET".into(),
+                            headers: call.headers,
+                            body: String::new(),
+                            timeout_ms: call.timeout_ms,
+                            max_response_bytes: call.max_response_bytes,
+                            follow_redirects: Some(false),
+                            max_redirects: Some(0),
+                        },
+                        Some(call.parameters),
+                    )
+                } else {
+                    (serde_json::from_value::<CallTarget>(arguments)?, None)
+                };
                 let duration = Duration::from_millis(call.timeout_ms.unwrap_or(30_000));
                 Ok(serde_json::to_value(
-                    tokio::time::timeout(duration, self.request(call))
+                    tokio::time::timeout(duration, self.request(call, parameters))
                         .await
                         .context("Harpoon request timed out")??,
                 )?)
@@ -313,7 +395,11 @@ impl Harpoon {
         }
     }
 
-    async fn request(&self, call: CallTarget) -> Result<CallResponse> {
+    async fn request(
+        &self,
+        call: CallTarget,
+        parameters: Option<BTreeMap<String, String>>,
+    ) -> Result<CallResponse> {
         let mut target = self.target(&call.label)?;
         let mut method = Method::from_bytes(call.method.to_ascii_uppercase().as_bytes())?;
         anyhow::ensure!(
@@ -323,6 +409,13 @@ impl Harpoon {
         let mut headers = HeaderMap::new();
         for (name, value) in &call.headers {
             headers.insert(HeaderName::try_from(name)?, HeaderValue::try_from(value)?);
+        }
+        match (&target.template, parameters) {
+            (Some(template), Some(parameters)) => {
+                (target.url, headers) = template.render(&parameters, headers)?;
+            }
+            (None, None) => {}
+            _ => bail!("template targets use call_target_template with declared parameters"),
         }
         let nominated: Vec<_> = headers
             .get_all("connection")
@@ -434,7 +527,7 @@ fn rewrite_url(value: &str, key: &str, targets: &BTreeMap<String, Target>) -> Op
     let url = Url::parse(value).ok()?;
     let matches: Vec<_> = targets
         .values()
-        .filter(|target| target.url == url)
+        .filter(|target| target.template.is_none() && target.url == url)
         .collect();
     if key == "resource"
         && matches.iter().any(|target| {
