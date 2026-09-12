@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Result, bail};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
-use http::{HeaderMap, Method, StatusCode, Uri};
+use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::{
@@ -72,8 +72,7 @@ impl Http {
         let certificates = options.ca_bundle.map(pem).transpose()?;
         let mut base = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .user_agent(concat!("otunnel/", env!("CARGO_PKG_VERSION")));
+            .retry(reqwest::retry::never());
         if let Some(proxy) = options.proxy {
             base = base.proxy(reqwest::Proxy::all(resolve(proxy)?)?);
         }
@@ -85,8 +84,7 @@ impl Http {
         let public = base.build()?;
         let mut scoped = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .user_agent(concat!("otunnel/", env!("CARGO_PKG_VERSION")));
+            .retry(reqwest::retry::never());
         if let Some(proxy) = options.proxy {
             scoped = scoped.proxy(reqwest::Proxy::all(resolve(proxy)?)?);
         }
@@ -150,9 +148,15 @@ impl Http {
         &self,
         method: Method,
         url: &Url,
-        headers: HeaderMap,
+        mut headers: HeaderMap,
         body: Bytes,
     ) -> Result<Response> {
+        headers
+            .entry("user-agent")
+            .or_insert(HeaderValue::from_static(concat!(
+                "otunnel/",
+                env!("CARGO_PKG_VERSION")
+            )));
         if url.origin() == self.origin.origin()
             && let Some(client) = &self.local
         {
