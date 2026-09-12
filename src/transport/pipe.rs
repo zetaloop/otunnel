@@ -132,10 +132,16 @@ impl Pipe {
             stateless: false,
         };
         let (reply, stateless) = super::negotiate(&pipe).await?;
-        let message = reply.message.context("MCP initialize response is empty")?;
-        let result = view(&message)?
+        let message = reply.message.context("MCP discovery response is empty")?;
+        let envelope = view(&message)?;
+        let result = envelope
             .result
-            .context("MCP initialize returned an error")?
+            .with_context(|| {
+                format!(
+                    "MCP discovery failed: {}",
+                    envelope.error.map_or("missing result", |error| error.get())
+                )
+            })?
             .to_owned();
         pipe.stateless = stateless;
         if !stateless {

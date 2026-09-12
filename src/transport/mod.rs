@@ -102,15 +102,6 @@ pub(crate) async fn negotiate(transport: &dyn Transport) -> Result<(Reply, bool)
             {
                 return Ok((reply, true));
             }
-        } else if let Some(error) = envelope.error {
-            let value: Value = serde_json::from_str(error.get())?;
-            if !matches!(
-                value.get("code").and_then(Value::as_i64),
-                Some(-32601 | -32600 | -32022)
-            ) && !matches!(reply.status, 400 | 404 | 405)
-            {
-                return Ok((reply, false));
-            }
         }
     }
     let mut request = protocol::initialize()?;
