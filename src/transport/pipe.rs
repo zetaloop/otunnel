@@ -158,7 +158,7 @@ impl Pipe {
     async fn relay(&self, mut request: Request, sink: &dyn Sink) -> Result<()> {
         let id = view(&request.message)?.id.map(RawValue::to_owned);
         let Some(id) = id else {
-            if view(&request.message)?.method == Some("notifications/cancelled") {
+            if view(&request.message)?.method.as_deref() == Some("notifications/cancelled") {
                 let request_id = field(&request.message, "params")
                     .and_then(|v| field(&v, "requestId"))
                     .context("cancellation has no requestId")?;
@@ -250,7 +250,7 @@ impl State {
     }
     fn receive(&self, message: Json) -> Result<()> {
         let envelope = view(&message)?;
-        if let Some(method) = envelope.method {
+        if let Some(method) = envelope.method.as_deref() {
             if let Some(id) = envelope.id {
                 let response = if method == "ping" {
                     to_raw_value(&json!({"jsonrpc":"2.0","id":id,"result":{}}))?
@@ -365,7 +365,7 @@ impl Drop for Pipe {
 impl Transport for Pipe {
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
         if let Some(initialization) = &self.initialization {
-            match view(&request.message)?.method {
+            match view(&request.message)?.method.as_deref() {
                 Some("initialize") => {
                     let mut reply = protocol::result(&request, initialization)?;
                     reply.headers.insert(

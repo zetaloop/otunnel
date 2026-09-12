@@ -71,7 +71,7 @@ impl HttpTransport {
     }
 
     fn observe(&self, request: &Request, response: &RawValue) -> Result<()> {
-        if view(&request.message)?.method == Some("server/discover") {
+        if view(&request.message)?.method.as_deref() == Some("server/discover") {
             let value: serde_json::Value = serde_json::from_str(response.get())?;
             if let Some(versions) = value
                 .pointer("/result/supportedVersions")
@@ -134,7 +134,7 @@ impl Transport for HttpTransport {
         if let Some(version) = &version {
             headers.insert("mcp-protocol-version", version.parse()?);
         }
-        if let Some(method) = view(&request.message)?.method {
+        if let Some(method) = view(&request.message)?.method.as_deref() {
             headers.insert("mcp-method", method.parse()?);
         }
         if let Some(name) = protocol::field(&request.message, "params")
@@ -155,7 +155,7 @@ impl Transport for HttpTransport {
             .await?;
         if response.status == http::StatusCode::UNAUTHORIZED
             || matches!(
-                view(&request.message)?.method,
+                view(&request.message)?.method.as_deref(),
                 Some("initialize" | "server/discover")
             )
         {

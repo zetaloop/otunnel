@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{borrow::Cow, collections::BTreeMap, time::Duration};
 
 use anyhow::{Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -139,7 +139,8 @@ impl Reply {
 pub struct View<'a> {
     #[serde(borrow)]
     pub id: Option<&'a RawValue>,
-    pub method: Option<&'a str>,
+    #[serde(borrow)]
+    pub method: Option<Cow<'a, str>>,
     #[serde(borrow)]
     pub result: Option<&'a RawValue>,
     #[serde(borrow)]
@@ -150,7 +151,7 @@ pub fn view(value: &RawValue) -> Result<View<'_>> {
 }
 
 pub fn field(value: &RawValue, key: &str) -> Option<Json> {
-    let object: BTreeMap<&str, &RawValue> = serde_json::from_str(value.get()).ok()?;
+    let object: BTreeMap<String, &RawValue> = serde_json::from_str(value.get()).ok()?;
     object.get(key).map(|value| (*value).to_owned())
 }
 

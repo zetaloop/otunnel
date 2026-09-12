@@ -586,7 +586,7 @@ impl Transport for Harpoon {
         }
         let modern = protocol::version(&request.message).as_deref() == Some(protocol::MCP_VERSION);
         let identity = json!({"name":"harpoon","version":env!("CARGO_PKG_VERSION")});
-        let mut result = match envelope.method {
+        let mut result = match envelope.method.as_deref() {
             Some("server/discover") => {
                 json!({"supportedVersions":[protocol::MCP_VERSION,"2025-11-25"],"capabilities":{"tools":{}},"instructions":"Use list_targets to discover HTTP targets and call_target to access them. OAuth targets retain their endpoint roles in tags.","ttlMs":0,"cacheScope":"private"})
             }
