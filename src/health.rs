@@ -13,8 +13,9 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response, Sse, sse::Event},
     routing::get,
 };
-use bytes::Bytes;
-use futures_util::{Stream, stream};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::{Bytes, BytesMut};
+use futures_util::{Stream, StreamExt, stream};
 use tokio::{net::TcpListener, sync::watch};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -29,15 +30,22 @@ use crate::{
 pub struct Server {
     listener: Listener,
     status: watch::Receiver<Snapshot>,
-    url: Url,
+    url: String,
     details: bool,
 }
 impl Server {
     pub async fn bind(config: &Health, status: watch::Receiver<Snapshot>) -> Result<Self> {
         let (listener, url) = if let Some(socket) = &config.unix_socket {
             let path = std::path::absolute(crate::config::resolve(socket)?)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let url = format!(
+                "http+unix://{}",
+                URL_SAFE_NO_PAD.encode(path.to_string_lossy().as_bytes())
+            );
             let local = Local::bind(path)?;
-            (Listener::Local(local), Url::parse("http://localhost")?)
+            (Listener::Local(local), url)
         } else {
             let address = crate::config::resolve(&config.listen_addr)?;
             let address = if address.starts_with(':') {
@@ -48,8 +56,29 @@ impl Server {
             let listener = TcpListener::bind(&address)
                 .await
                 .with_context(|| format!("bind health listener {address}"))?;
-            let url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
-            (Listener::Tcp(listener), url)
+            let bound = listener.local_addr()?;
+            let host = address
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or("")
+                .trim_matches(['[', ']']);
+            let host = if host.is_empty()
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_unspecified())
+            {
+                "localhost"
+            } else {
+                host
+            };
+            let mut url = Url::parse("http://localhost")?;
+            url.set_host(Some(host))?;
+            url.set_port(Some(bound.port()))
+                .map_err(|_| anyhow::anyhow!("invalid health port"))?;
+            (
+                Listener::Tcp(listener),
+                url.as_str().trim_end_matches('/').to_owned(),
+            )
         };
         Ok(Self {
             listener,
@@ -59,7 +88,7 @@ impl Server {
         })
     }
 
-    pub fn url(&self) -> &Url {
+    pub fn url(&self) -> &str {
         &self.url
     }
 
@@ -72,11 +101,8 @@ impl Server {
         let router = Router::new()
             .route("/", get(|| async { Redirect::temporary("/ui") }))
             .route("/ui", get(|| async { Html(include_str!("ui.html")) }))
-            .route(
-                "/healthz",
-                get(|| async { Json(serde_json::json!({"status":"ok"})) }),
-            )
-            .route("/readyz", get(ready))
+            .route("/healthz", get(|| async { "live" }))
+            .route("/readyz", get(readiness))
             .route("/health", get(ready))
             .route("/health/mcp", get(status))
             .route("/api/status", get(status))
@@ -96,6 +122,15 @@ struct Monitor {
     details: bool,
     stop: CancellationToken,
 }
+async fn readiness(State(state): State<Monitor>) -> impl IntoResponse {
+    let snapshot = state.status.borrow();
+    if snapshot.ready {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "mcp startup probe pending")
+    }
+}
+
 async fn ready(State(state): State<Monitor>) -> Response {
     let snapshot = state.status.borrow().clone();
     let status = if snapshot.ready {
@@ -149,39 +184,93 @@ async fn metrics(State(state): State<Monitor>) -> impl IntoResponse {
         snapshot.failed,
         uptime
     );
+    let body = format!(
+        "# TYPE liveness gauge\nliveness 1\n# TYPE readiness gauge\nreadiness {}\n# TYPE commands_poll_last_successful_timestamp_seconds gauge\ncommands_poll_last_successful_timestamp_seconds {}\ncommands_poll_cycles_total {}\ncommands_poll_errors_total {}\ncommands_polled_total {}\n{body}",
+        u8::from(snapshot.ready),
+        snapshot.control.last_success,
+        snapshot.control.cycles,
+        snapshot.control.errors,
+        snapshot.control.commands
+    );
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
 }
 
-pub async fn probe(config: &Health, base: &str) -> Result<serde_json::Value> {
-    let url = Url::parse(base)?;
-    let client = Http::new(
-        url.clone(),
-        Options {
-            socket: config.unix_socket.as_deref(),
-            ..Default::default()
-        },
-    )?;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let response = client
-            .send(
-                http::Method::GET,
-                &url.join("/api/status")?,
-                Default::default(),
-                Bytes::new(),
-            )
-            .await?;
-        anyhow::ensure!(
-            response.status.is_success(),
-            "health endpoint returned HTTP {}",
-            response.status
-        );
-        Ok(serde_json::from_slice(&response.bytes().await?)?)
-    })
-    .await
-    .context("health request timed out")?
+/// An HTTP or HTTP-over-Unix-socket health endpoint.
+pub struct Target {
+    pub base: String,
+    url: String,
+    client: Http,
+}
+impl Target {
+    pub fn normalize(raw: &str) -> String {
+        let raw = raw.trim();
+        let raw = raw.strip_suffix("/healthz").unwrap_or(raw);
+        raw.strip_suffix("/readyz")
+            .unwrap_or(raw)
+            .trim_end_matches('/')
+            .to_owned()
+    }
+    pub fn new(raw: &str) -> Result<Self> {
+        let base = Self::normalize(raw);
+        anyhow::ensure!(!base.is_empty(), "health URL is empty");
+        let (url, socket) = if let Some(encoded) = base.strip_prefix("http+unix://") {
+            let socket = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded)?)?;
+            anyhow::ensure!(!socket.is_empty(), "health unix socket path is empty");
+            ("http://localhost".to_owned(), Some(socket))
+        } else {
+            (base.clone(), None)
+        };
+        let client = Http::new(
+            Url::parse(&url)?,
+            Options {
+                socket: socket.as_deref(),
+                ..Default::default()
+            },
+        )?;
+        Ok(Self { base, url, client })
+    }
+    pub async fn request(
+        &self,
+        path: &str,
+        timeout: Duration,
+        limit: Option<usize>,
+    ) -> Result<(u16, Bytes)> {
+        tokio::time::timeout(timeout, async {
+            let mut url = Url::parse(&format!("{}{path}", self.url))?;
+            for hop in 0..=10 {
+                let mut response = self
+                    .client
+                    .send(http::Method::GET, &url, Default::default(), Bytes::new())
+                    .await?;
+                if response.status.is_redirection()
+                    && let Some(location) = response.headers.get("location")
+                {
+                    anyhow::ensure!(hop < 10, "health request exceeded 10 redirects");
+                    url = url.join(location.to_str()?)?;
+                    continue;
+                }
+                let code = response.status.as_u16();
+                let mut body = BytesMut::new();
+                while let Some(chunk) = response.body.next().await {
+                    let chunk = chunk?;
+                    let count = limit.map_or(chunk.len(), |limit| {
+                        chunk.len().min(limit.saturating_sub(body.len()))
+                    });
+                    body.extend_from_slice(&chunk[..count]);
+                    if limit.is_some_and(|limit| body.len() >= limit) {
+                        break;
+                    }
+                }
+                return Ok((code, body.freeze()));
+            }
+            unreachable!()
+        })
+        .await
+        .context("health request timed out")?
+    }
 }
 
 enum Listener {

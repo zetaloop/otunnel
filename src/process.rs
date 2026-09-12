@@ -7,6 +7,44 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Invocation, resolve};
 
+/// Report whether a process exists without changing its state.
+pub fn running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // Signal zero checks existence and sends no signal to the process.
+        unsafe {
+            libc::kill(pid, 0) == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+        // Close the query handle after reading the process exit status.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0;
+            let success = GetExitCodeProcess(handle, &mut code) != 0;
+            CloseHandle(handle);
+            success && code == 259
+        }
+    }
+}
+
 pub struct Process {
     child: Box<dyn ChildWrapper>,
 }

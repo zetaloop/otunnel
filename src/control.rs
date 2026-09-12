@@ -51,6 +51,29 @@ impl std::fmt::Display for StatusError {
 }
 impl std::error::Error for StatusError {}
 
+#[derive(Clone, Default, Serialize)]
+pub struct Observation {
+    pub connected: bool,
+    pub instance_id: String,
+    pub metadata: Option<Value>,
+    pub last_attempt: f64,
+    pub last_success: f64,
+    pub last_error: f64,
+    pub next_retry: f64,
+    pub consecutive_failures: u64,
+    pub cycles: u64,
+    pub errors: u64,
+    pub commands: u64,
+    pub http_status: u16,
+}
+
+pub(crate) fn now() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 pub struct Control {
     http: Http,
     url: Url,
@@ -60,7 +83,7 @@ pub struct Control {
     poll_timeout: Duration,
     initial_poll_timeout: Duration,
     guard: Duration,
-    connected: watch::Sender<bool>,
+    observations: watch::Sender<Observation>,
 }
 
 impl Control {
@@ -104,10 +127,8 @@ impl Control {
             "x-tunnel-client-wire-protocol-version",
             HeaderValue::from_static(protocol::WIRE_VERSION),
         );
-        headers.insert(
-            "x-tunnel-client-instance-id",
-            uuid::Uuid::new_v4().to_string().parse()?,
-        );
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        headers.insert("x-tunnel-client-instance-id", instance_id.parse()?);
         if let Some(organization) = &cp.organization_id {
             headers.insert(
                 "openai-organization",
@@ -130,12 +151,16 @@ impl Control {
             poll_timeout: cp.poll_timeout.0,
             initial_poll_timeout: cp.initial_poll_timeout.0,
             guard: cp.poll_deadline_guardrail.0,
-            connected: watch::channel(false).0,
+            observations: watch::channel(Observation {
+                instance_id,
+                ..Default::default()
+            })
+            .0,
         })
     }
 
-    pub(crate) fn connection(&self) -> watch::Receiver<bool> {
-        self.connected.subscribe()
+    pub(crate) fn connection(&self) -> watch::Receiver<Observation> {
+        self.observations.subscribe()
     }
 
     pub fn set_channels(&self, mut channels: Vec<Channel>) -> Result<()> {
@@ -202,7 +227,10 @@ impl Control {
 
     pub async fn metadata(&self) -> Result<Value> {
         let metadata = self.fetch("").await?;
-        self.connected.send_replace(true);
+        self.observations.send_modify(|state| {
+            state.connected = true;
+            state.metadata = Some(metadata.clone());
+        });
         Ok(metadata)
     }
 
@@ -247,6 +275,11 @@ impl Control {
         }
         let mut attempt = 0;
         loop {
+            self.observations.send_modify(|state| {
+                state.last_attempt = now();
+                state.next_retry = 0.0;
+                state.cycles += 1;
+            });
             let result = timeout(self.poll_timeout + self.guard, async {
                 let response = self
                     .http
@@ -266,12 +299,25 @@ impl Control {
             })
             .await;
             let connected = matches!(&result, Ok(Ok(Ok(_))));
-            self.connected.send_if_modified(|current| {
-                if *current == connected {
-                    return false;
+            self.observations.send_modify(|state| {
+                state.connected = connected;
+                match &result {
+                    Ok(Ok(Ok(batch))) => {
+                        state.last_success = now();
+                        state.consecutive_failures = 0;
+                        state.commands += batch.commands.len() as u64;
+                        state.http_status = 200;
+                    }
+                    _ => {
+                        state.last_error = now();
+                        state.consecutive_failures += 1;
+                        state.errors += 1;
+                        state.http_status = match &result {
+                            Ok(Ok(Err((status, _)))) => *status,
+                            _ => 0,
+                        };
+                    }
                 }
-                *current = connected;
-                true
             });
             let retry_headers = match result {
                 Ok(Ok(Ok(batch))) => return Ok(batch),
@@ -289,7 +335,10 @@ impl Control {
                 }
                 Err(_) => HeaderMap::new(),
             };
-            tokio::time::sleep(retry_delay(attempt, &retry_headers)).await;
+            let delay = retry_delay(attempt, &retry_headers);
+            self.observations
+                .send_modify(|state| state.next_retry = now() + delay.as_secs_f64());
+            tokio::time::sleep(delay).await;
             attempt = attempt.saturating_add(1);
         }
     }

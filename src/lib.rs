@@ -12,7 +12,7 @@ pub mod harpoon;
 pub mod health;
 mod net;
 mod oauth;
-mod process;
+pub mod process;
 pub mod protocol;
 pub mod runtime;
 pub mod template;

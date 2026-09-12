@@ -27,6 +27,8 @@ use crate::{
 pub struct Snapshot {
     pub ready: bool,
     pub connected: bool,
+    pub control: crate::control::Observation,
+    pub lifecycle: &'static str,
     pub cloudflare_ready: Option<bool>,
     pub started_at: u64,
     pub channels: BTreeMap<String, Probe>,
@@ -87,6 +89,8 @@ impl Tunnel {
         let control = Arc::new(Control::new(&config)?);
         let harpoon = Arc::new(crate::harpoon::Harpoon::new(&config)?);
         let (state, _) = watch::channel(Snapshot {
+            control: control.connection().borrow().clone(),
+            lifecycle: "starting",
             started_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)?
                 .as_secs(),
@@ -317,6 +321,8 @@ impl Tunnel {
             }
             self.state.send_modify(|state| {
                 state.connected = true;
+                state.control = self.control.connection().borrow().clone();
+                state.lifecycle = "running";
                 state.ready = state.cloudflare_ready.unwrap_or(true);
             });
             tracing::info!(channels = self.bindings.len(), "tunnel connected");
@@ -326,6 +332,7 @@ impl Tunnel {
         self.state.send_modify(|state| {
             state.ready = false;
             state.connected = false;
+            state.lifecycle = "draining";
             if let Err(error) = &result {
                 state.last_error = Some(format!("{error:#}"));
             }
@@ -382,10 +389,10 @@ impl Tunnel {
                     () = shutdown.cancelled() => return Ok(()),
                     changed = connection.changed() => {
                         changed?;
-                        let connected = *connection.borrow_and_update();
+                        let observation = connection.borrow_and_update().clone();
                         self.state.send_modify(|state| {
-                            state.connected = connected;
-                            state.ready = connected && state.cloudflare_ready.unwrap_or(true);
+                            state.connected = observation.connected;
+                            state.control = observation;
                         });
                     }
                     child = self.children.join_next(), if !self.children.is_empty() => {

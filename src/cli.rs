@@ -1,3 +1,5 @@
+mod health;
+
 use std::{
     env, fs,
     io::{self, IsTerminal, Write},
@@ -10,7 +12,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use otunnel::{
     CancellationToken, Tunnel,
     config::{Config, Log},
-    health,
+    health::Server,
     runtime::Check,
 };
 use serde_json::{Value, json};
@@ -420,16 +422,7 @@ pub fn command() -> Command {
                     .help("Emit a JSON report"),
             ),
         )
-        .subcommand(
-            configured(Command::new("health").about("Read a running tunnel's health status"))
-                .arg(Arg::new("url").long("url").help("Health base URL"))
-                .arg(
-                    Arg::new("json")
-                        .long("json")
-                        .action(ArgAction::SetTrue)
-                        .help("Emit a JSON report"),
-                ),
-        )
+        .subcommand(health::command())
         .subcommand(
             Command::new("completion")
                 .about("Generate shell completions")
@@ -662,6 +655,9 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
         clap_complete::generate(shell, &mut command(), "otunnel", &mut io::stdout());
         return Ok(0);
     }
+    if name == "health" {
+        return health::execute(matches).await;
+    }
     let config = load(matches)?;
     logger(&config.log)?;
     match name {
@@ -679,7 +675,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
             let health = if config.health.unix_socket.is_some()
                 || !config.health.listen_addr.is_empty()
             {
-                let server = health::Server::bind(&config.health, tunnel.status()).await?;
+                let server = Server::bind(&config.health, tunnel.status()).await?;
                 tracing::info!(url = %server.url(), socket = ?config.health.unix_socket, "health service available");
                 url_file = config
                     .health
@@ -715,7 +711,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
             let tunnel = Tunnel::new(config.clone())?;
             let health =
                 if config.health.unix_socket.is_some() || !config.health.listen_addr.is_empty() {
-                    match health::Server::bind(&config.health, tunnel.status()).await {
+                    match Server::bind(&config.health, tunnel.status()).await {
                         Ok(server) => Some(Ok(server)),
                         Err(error) => Some(Err(error)),
                     }
@@ -758,35 +754,6 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
                 println!("RESULT {}", if report.passed() { "pass" } else { "fail" });
             }
             Ok(if report.passed() { 0 } else { 2 })
-        }
-        "health" => {
-            let base = if let Some(url) = matches.get_one::<String>("url") {
-                url.clone()
-            } else if let Some(file) = &config.health.url_file {
-                fs::read_to_string(file)?.trim().to_owned()
-            } else if config.health.unix_socket.is_some() {
-                "http://localhost".into()
-            } else {
-                anyhow::ensure!(
-                    !config.health.listen_addr.ends_with(":0"),
-                    "ephemeral health addresses require --url or health.url_file"
-                );
-                format!(
-                    "http://{}",
-                    otunnel::config::resolve(&config.health.listen_addr)?
-                )
-            };
-            let status = health::probe(&config.health, &base).await?;
-            let ready = status
-                .get("ready")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if matches.get_flag("json") {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
-                println!("{} {base}", if ready { "READY" } else { "NOT_READY" });
-            }
-            Ok(if ready { 0 } else { 2 })
         }
         _ => unreachable!(),
     }
@@ -856,7 +823,15 @@ struct Record {
 }
 impl Record {
     fn write(path: &str, content: String) -> Result<Self> {
-        fs::write(path, &content).with_context(|| format!("write {path}"))?;
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(content.as_bytes())?;
+        file.persist(path)
+            .with_context(|| format!("write {path}"))?;
         Ok(Self {
             path: PathBuf::from(path),
             content,

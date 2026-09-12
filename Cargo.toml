@@ -20,7 +20,7 @@ strip = true
 
 [features]
 default = ["cli"]
-cli = ["dep:axum", "dep:clap", "dep:clap_complete", "dep:csv", "dep:tracing-subscriber"]
+cli = ["dep:axum", "dep:clap", "dep:clap_complete", "dep:csv", "dep:tempfile", "dep:tracing-subscriber"]
 
 [[bin]]
 name = "otunnel"
@@ -56,6 +56,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = "1.2.0"
 serde_json = { version = "1.0.151", features = ["arbitrary_precision", "raw_value"] }
 shell-words = "1.1.1"
+tempfile = { version = "3.27.0", optional = true }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26.5"
 tokio-util = { version = "0.7.19", features = ["compat", "rt"] }
@@ -68,6 +69,7 @@ uuid = { version = "1.26.1", features = ["v4", "serde"] }
 [target."cfg(windows)".dependencies]
 async-io = "2.6.0"
 socket2 = "0.6.5"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.189"
