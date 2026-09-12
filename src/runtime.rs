@@ -318,6 +318,12 @@ impl Tunnel {
     async fn dispatch(&mut self, shutdown: &CancellationToken) -> Result<()> {
         let bindings = Arc::new(self.bindings.clone());
         let concurrency = self.config.control_plane.max_inflight_requests;
+        let ttl = self
+            .config
+            .mcp
+            .connection_max_ttl
+            .map(|span| span.0)
+            .filter(|duration| !duration.is_zero());
         let global = Arc::new(Semaphore::new(concurrency));
         let local: BTreeMap<_, _> = bindings
             .keys()
@@ -396,7 +402,7 @@ impl Tunnel {
                                     let _permit = global.acquire().await?;
                                     let permit = local.get(&command.channel).map(|limit| limit.acquire());
                                     let _local = match permit { Some(permit) => Some(permit.await?), None => None };
-                                    execute(&control, &bindings, command).await
+                                    execute(&control, &bindings, command, ttl).await
                                 };
                                 if let Some(deadline) = deadline {
                                     match timeout_at(deadline, work).await {
@@ -451,6 +457,7 @@ async fn execute(
     control: &Arc<Control>,
     bindings: &BTreeMap<String, Arc<dyn Transport>>,
     command: Command,
+    ttl: Option<Duration>,
 ) -> Result<()> {
     if !matches!(
         command.command_type.as_str(),
@@ -469,7 +476,16 @@ async fn execute(
                 headers,
             };
             let outcome = match binding {
-                Some(binding) => binding.forward(request.clone(), &delivery).await,
+                Some(binding) => {
+                    let forward = binding.forward(request.clone(), &delivery);
+                    match ttl {
+                        Some(ttl) => timeout(ttl, forward)
+                            .await
+                            .context("MCP connection lifetime exceeded")
+                            .and_then(|result| result),
+                        None => forward.await,
+                    }
+                }
                 None => Err(anyhow::anyhow!(
                     "channel {} is unavailable",
                     command.channel
@@ -497,17 +513,29 @@ async fn execute(
                     .await?;
             }
         }
-        "session_termination" => {
-            let reply = match binding {
-                Some(binding) => binding.terminate(headers).await?,
-                None => Reply::ack(404, "session_termination_response"),
+        "session_termination" | "oauth_discovery" => {
+            let kind = if command.command_type == "session_termination" {
+                "session_termination_response"
+            } else {
+                "oauth_discovery_response"
             };
-            delivery.send(reply).await?;
-        }
-        "oauth_discovery" => {
-            let reply = match binding {
-                Some(binding) => binding.discover().await?,
-                None => Reply::ack(404, "oauth_discovery_response"),
+            let outcome = match binding {
+                Some(binding) if command.command_type == "session_termination" => {
+                    binding.terminate(headers).await
+                }
+                Some(binding) => binding.discover().await,
+                None => Ok(Reply::ack(404, kind)),
+            };
+            let reply = match outcome {
+                Ok(reply) => reply,
+                Err(error) => {
+                    tracing::warn!(request_id = %command.request_id, %error, "MCP control request failed");
+                    let mut reply = Reply::ack(502, kind);
+                    reply.message = Some(serde_json::value::to_raw_value(
+                        &serde_json::json!({"error":format!("{error:#}")}),
+                    )?);
+                    reply
+                }
             };
             control.set_channels(channels(bindings))?;
             delivery.send(reply).await?;
