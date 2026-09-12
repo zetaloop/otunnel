@@ -1,7 +1,7 @@
 use std::{fs, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{Arg, ArgMatches, Command};
 use otunnel::{health::Target, process};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -47,12 +47,8 @@ pub fn command() -> Command {
                 .default_value("0"),
         )
         .arg(Arg::new("pid-file").long("pid-file"))
-        .arg(Arg::new("json").long("json").action(ArgAction::SetTrue))
-        .arg(
-            Arg::new("require-control-plane-poll")
-                .long("require-control-plane-poll")
-                .action(ArgAction::SetTrue),
-        )
+        .arg(super::flag("json"))
+        .arg(super::flag("require-control-plane-poll"))
 }
 
 pub async fn execute(arguments: &ArgMatches) -> Result<u8> {

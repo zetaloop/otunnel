@@ -356,7 +356,106 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         Text,
         "Global outbound HTTP proxy",
     ),
+    (
+        "allow-remote-ui",
+        "ALLOW_REMOTE_UI",
+        "/admin_ui/allow_remote",
+        Boolean,
+        "Allow remote access to the admin UI",
+    ),
+    (
+        "open-web-ui",
+        "OPEN_WEB_UI",
+        "/admin_ui/open_browser",
+        Boolean,
+        "Open the admin UI after startup",
+    ),
+    (
+        "admin-ui.log-buffer-events",
+        "ADMIN_UI_LOG_BUFFER_EVENTS",
+        "/admin_ui/log_buffer_events",
+        Number,
+        "Number of admin log events retained",
+    ),
+    (
+        "proxy.check-interval",
+        "PROXY_CHECK_INTERVAL",
+        "/proxy/check_interval",
+        Text,
+        "Proxy health check interval",
+    ),
+    (
+        "harpoon.capture-payloads",
+        "HARPOON_CAPTURE_PAYLOADS",
+        "/harpoon/capture_payloads",
+        Boolean,
+        "Retain Harpoon request and response payloads",
+    ),
+    (
+        "harpoon.allow-plaintext-http",
+        "HARPOON_ALLOW_PLAINTEXT_HTTP",
+        "/harpoon/allow_plaintext_http",
+        Boolean,
+        "Allow HTTP Harpoon targets",
+    ),
+    (
+        "harpoon.additional-transport",
+        "HARPOON_ADDITIONAL_TRANSPORTS",
+        "/harpoon/additional_transports",
+        List,
+        "Additional Harpoon transport URL",
+    ),
+    (
+        "log.http-raw-unsafe",
+        "LOG_HTTP_RAW_UNSAFE",
+        "/log/http_raw_unsafe",
+        Boolean,
+        "Log raw HTTP requests and responses",
+    ),
+    (
+        "mcp.stdio-send-initialized-notification",
+        "MCP_STDIO_SEND_INITIALIZED_NOTIFICATION",
+        "/mcp/stdio_send_initialized_notification",
+        Boolean,
+        "Complete downstream stdio initialization",
+    ),
 ];
+
+const ALIASES: &[(&str, &str)] = &[
+    ("control-plane.base-url", "control-plane-base-url"),
+    ("control-plane.url-path", "control-plane-url-path"),
+    ("control-plane.tunnel-id", "control-plane-tunnel-id"),
+    (
+        "control-plane.organization-id",
+        "control-plane-organization-id",
+    ),
+    ("control-plane.api-key", "control-plane-api-key"),
+    ("control-plane.client-cert", "control-plane-client-cert"),
+    ("control-plane.client-key", "control-plane-client-key"),
+    ("mcp.server-url", "mcp-server-url"),
+    ("mcp.command", "mcp-command"),
+    ("mcp.extra-headers", "mcp-extra-headers"),
+    ("mcp.discovery-extra-headers", "mcp-discovery-extra-headers"),
+    ("health.listen-addr", "health-listen-addr"),
+    ("health.unix-socket", "health-unix-socket"),
+    ("health.url-file", "health-url-file"),
+    ("health.show-details", "health-show-details"),
+];
+
+fn argument(name: &'static str, kind: Kind) -> Arg {
+    let argument = Arg::new(name).long(name);
+    match kind {
+        Boolean => argument
+            .num_args(0..=1)
+            .require_equals(true)
+            .default_missing_value("true")
+            .value_parser([
+                "1", "t", "T", "TRUE", "true", "True", "0", "f", "F", "FALSE", "false", "False",
+            ]),
+        List | Headers | Servers | Commands | Targets => argument.action(ArgAction::Append),
+        _ => argument,
+    }
+}
 
 pub fn command() -> Command {
     let source = || {
@@ -380,28 +479,23 @@ pub fn command() -> Command {
         ]
     };
     let configured = |command: Command| {
-        command
-            .args(source())
-            .args(SETTINGS.iter().map(|(name, environment, _, kind, help)| {
-                let mut argument = Arg::new(*name)
-                    .long(*name)
-                    .env(*environment)
-                    .hide_env_values(true)
-                    .help(*help);
-                match kind {
-                    Boolean => {
-                        argument = argument
-                            .num_args(0..=1)
-                            .default_missing_value("true")
-                            .value_parser(["true", "false"])
-                    }
-                    List | Headers | Servers | Commands | Targets => {
-                        argument = argument.action(ArgAction::Append)
-                    }
-                    _ => {}
-                }
-                argument
-            }))
+        command.args(source()).args(SETTINGS.iter().flat_map(
+            |(name, environment, _, kind, help)| {
+                let mut options = vec![
+                    argument(name, *kind)
+                        .env(*environment)
+                        .hide_env_values(true)
+                        .help(*help),
+                ];
+                options.extend(
+                    ALIASES
+                        .iter()
+                        .filter(|(canonical, _)| canonical == name)
+                        .map(|(_, alias)| argument(alias, *kind).hide(true)),
+                );
+                options
+            },
+        ))
     };
     Command::new("otunnel")
         .version(env!("CARGO_PKG_VERSION"))
@@ -416,12 +510,7 @@ pub fn command() -> Command {
                 Command::new("doctor")
                     .about("Diagnose the configured transports, services, and control plane"),
             )
-            .arg(
-                Arg::new("json")
-                    .long("json")
-                    .action(ArgAction::SetTrue)
-                    .help("Emit a JSON report"),
-            ),
+            .arg(flag("json").help("Emit a JSON report")),
         )
         .subcommand(health::command())
         .subcommand(profiles::command())
@@ -515,7 +604,20 @@ fn load(matches: &ArgMatches) -> Result<Config> {
     let config = source.map(Config::read).transpose()?.unwrap_or_default();
     let mut value = serde_json::to_value(config)?;
     for (name, _, pointer, kind, _) in SETTINGS {
-        let Some(arguments) = matches.get_many::<String>(name) else {
+        let selected = if matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine)
+        {
+            name
+        } else {
+            ALIASES
+                .iter()
+                .find(|(canonical, alias)| {
+                    canonical == name
+                        && matches.value_source(alias)
+                            == Some(clap::parser::ValueSource::CommandLine)
+                })
+                .map_or(name, |(_, alias)| alias)
+        };
+        let Some(arguments) = matches.get_many::<String>(selected) else {
             continue;
         };
         let mut arguments = arguments.cloned().collect::<Vec<_>>();
@@ -526,7 +628,7 @@ fn load(matches: &ArgMatches) -> Result<Config> {
             arguments =
                 serde_json::from_str(&arguments[0]).with_context(|| format!("parse --{name}"))?;
         }
-        if matches.value_source(name) == Some(clap::parser::ValueSource::EnvVariable) {
+        if matches.value_source(selected) == Some(clap::parser::ValueSource::EnvVariable) {
             match kind {
                 Servers | Commands | Targets => {
                     arguments = arguments
@@ -571,12 +673,19 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                     .parse::<u64>()
                     .with_context(|| format!("--{name} requires an unsigned integer"))?
             ),
-            Boolean => json!(arguments[0].parse::<bool>()?),
-            List => json!(
+            Boolean => json!(boolean(&arguments[0]).map_err(anyhow::Error::msg)?),
+            List if *name == "control-plane.poll-channel" => json!(
                 arguments
                     .iter()
                     .flat_map(|value| value.split(','))
                     .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+            ),
+            List => json!(
+                arguments
+                    .iter()
+                    .map(|value| value.trim())
                     .filter(|value| !value.is_empty())
                     .collect::<Vec<_>>()
             ),
@@ -586,9 +695,8 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                     let (name, value) = argument
                         .split_once(':')
                         .context("HTTP headers use Name: Value")?;
-                    let name = http::HeaderName::try_from(name.trim())?.to_string();
-                    headers.retain(|key, _| !key.eq_ignore_ascii_case(&name));
-                    headers.insert(name, json!(value.trim()));
+                    http::HeaderName::try_from(name.trim())?;
+                    headers.insert(name.trim().to_owned(), json!(value.trim()));
                 }
                 Value::Object(headers)
             }

@@ -339,11 +339,47 @@ pub fn pem(value: &str) -> Result<Vec<u8>> {
     }
 }
 pub fn headers(values: &BTreeMap<String, String>) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
+    let mut normalized = BTreeMap::new();
     for (name, value) in values {
+        let name = HeaderName::try_from(name)?.to_string();
+        if let Some(previous) = normalized.insert(name.clone(), value.as_str()) {
+            anyhow::ensure!(
+                previous == value,
+                "conflicting values for case-insensitive HTTP header {name}"
+            );
+        }
+    }
+    let mut headers = HeaderMap::new();
+    for (name, raw) in normalized {
+        let raw = raw.trim();
+        let value = match raw.split_once(':') {
+            Some((kind, variable)) if kind.eq_ignore_ascii_case("env") => env::var(variable.trim())
+                .with_context(|| format!("read header environment variable {variable}"))?
+                .trim()
+                .as_bytes()
+                .to_vec(),
+            Some((kind, path)) if kind.eq_ignore_ascii_case("file") => {
+                let mut bytes =
+                    fs::read(path.trim()).with_context(|| format!("read header file {path}"))?;
+                let ending = if bytes.ends_with(b"\r\n") {
+                    2
+                } else if bytes.ends_with(b"\r") || bytes.ends_with(b"\n") {
+                    1
+                } else {
+                    0
+                };
+                bytes.truncate(bytes.len() - ending);
+                bytes
+            }
+            _ => raw.as_bytes().to_vec(),
+        };
+        anyhow::ensure!(
+            !value.iter().all(u8::is_ascii_whitespace),
+            "resolved HTTP header {name} is empty"
+        );
         headers.insert(
             HeaderName::try_from(name)?,
-            HeaderValue::try_from(resolve(value)?)?,
+            HeaderValue::from_bytes(&value)?,
         );
     }
     Ok(headers)
