@@ -1,0 +1,45 @@
+[package]
+name = "otunnel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+axum = "0.8.9"
+base64 = "0.23.1"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+eventsource-stream = "0.2.3"
+futures-util = "0.3.34"
+http = "1.5.0"
+http-body-util = "0.1.5"
+httpdate = "1.0.3"
+humantime = "2.4.0"
+hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
+process-wrap = { version = "10.0.0", features = ["tokio1"] }
+rand = "0.10.2"
+reqwest = { version = "0.13.5", features = ["json", "query", "stream"] }
+rustls = "0.23.44"
+rustls-native-certs = "0.8.4"
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "1.2.0"
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+shell-words = "1.1.1"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = "0.26.5"
+tokio-util = { version = "0.7.19", features = ["compat", "rt"] }
+tower-service = "0.3.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
+
+[target."cfg(windows)".dependencies]
+async-io = "2.6.0"
+socket2 = "0.6.5"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.189"
