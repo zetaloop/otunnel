@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::{
     config::{self, Config},
-    net::{Http, Options, Response},
+    net::{Http, Options},
     protocol::{self, Command, Poll, Reply},
     transport::Sink,
 };
@@ -221,7 +221,7 @@ impl Control {
 
     pub async fn poll(&self, limit: usize, initial: bool) -> Result<Batch> {
         let duration = if initial {
-            self.initial_poll_timeout
+            self.initial_poll_timeout.min(self.poll_timeout)
         } else {
             self.poll_timeout
         };
@@ -236,7 +236,7 @@ impl Control {
         }
         let mut attempt = 0;
         loop {
-            let result = timeout(duration + self.guard, async {
+            let result = timeout(self.poll_timeout + self.guard, async {
                 let response = self
                     .http
                     .send(Method::GET, &url, self.headers(), Bytes::new())
@@ -296,16 +296,25 @@ impl Control {
         let url = self.endpoint("response")?;
         let mut attempt = 0;
         loop {
-            let response = timeout(
-                Duration::from_secs(30),
-                self.http
-                    .send(Method::POST, &url, headers.clone(), body.clone()),
-            )
+            let response = timeout(Duration::from_secs(30), async {
+                let response = self
+                    .http
+                    .send(Method::POST, &url, headers.clone(), body.clone())
+                    .await?;
+                let status = response.status;
+                let headers = response.headers.clone();
+                if let Err(error) = timeout(Duration::from_secs(1), response.bytes())
+                    .await
+                    .context("response body drain timed out")
+                    .and_then(|result| result)
+                {
+                    tracing::debug!(%error, "tunnel response acknowledgement body interrupted");
+                }
+                Ok::<_, anyhow::Error>((status, headers))
+            })
             .await;
             let retry_headers = match response {
-                Ok(Ok(Response {
-                    status, headers, ..
-                })) => {
+                Ok(Ok((status, headers))) => {
                     let code = status.as_u16();
                     if status.is_success() || code == 404 {
                         return Ok(());
@@ -397,7 +406,13 @@ impl Sink for Delivery {
             return self.control.post(&self.command, &reply).await;
         }
         if !self.notifications_failed.load(Ordering::Acquire)
-            && let Err(error) = self.control.post(&self.command, &reply).await
+            && let Err(error) = timeout(
+                Duration::from_secs(30),
+                self.control.post(&self.command, &reply),
+            )
+            .await
+            .context("notification delivery timed out")
+            .and_then(|result| result)
         {
             if error
                 .downcast_ref::<StatusError>()
