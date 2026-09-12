@@ -206,9 +206,27 @@ pub fn timeout(value: &Value) -> Option<Duration> {
 pub fn initialize() -> Result<Request> {
     Request::new(
         serde_json::json!({"jsonrpc":"2.0", "id":0, "method":"initialize", "params":{
-            "protocolVersion":MCP_VERSION, "capabilities":{}, "clientInfo":{"name":"otunnel","version":env!("CARGO_PKG_VERSION")}
+            "protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"otunnel","version":env!("CARGO_PKG_VERSION")}
         }}),
     )
+}
+
+pub fn request(method: &str, mut params: Value, stateless: bool) -> Result<Request> {
+    if stateless {
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
+            "io.modelcontextprotocol/clientInfo": {"name":"otunnel","version":env!("CARGO_PKG_VERSION")},
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+    }
+    Request::new(serde_json::json!({"jsonrpc":"2.0","id":0,"method":method,"params":params}))
+}
+
+pub fn version(message: &RawValue) -> Option<String> {
+    let value = field(message, "params")
+        .and_then(|params| field(&params, "_meta"))
+        .and_then(|meta| field(&meta, "io.modelcontextprotocol/protocolVersion"))?;
+    serde_json::from_str(value.get()).ok()
 }
 
 pub fn result(request: &Request, value: &RawValue) -> Result<Reply> {

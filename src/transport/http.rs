@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -28,6 +31,7 @@ pub struct HttpTransport {
     pub(crate) discovery_headers: HeaderMap,
     pub(crate) harpoon: Option<Arc<crate::harpoon::Harpoon>>,
     pub(crate) challenge: Arc<RwLock<Option<HeaderMap>>>,
+    stateless: Arc<AtomicBool>,
 }
 impl HttpTransport {
     pub fn new(server: &config::Server, config: &config::Config) -> Result<Self> {
@@ -57,12 +61,31 @@ impl HttpTransport {
             discovery_headers,
             harpoon: None,
             challenge: Arc::new(RwLock::new(None)),
+            stateless: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub fn harpoon(mut self, registry: Arc<crate::harpoon::Harpoon>) -> Self {
         self.harpoon = Some(registry);
         self
+    }
+
+    fn observe(&self, request: &Request, response: &RawValue) -> Result<()> {
+        if view(&request.message)?.method == Some("server/discover") {
+            let value: serde_json::Value = serde_json::from_str(response.get())?;
+            if let Some(versions) = value
+                .pointer("/result/supportedVersions")
+                .and_then(serde_json::Value::as_array)
+            {
+                self.stateless.store(
+                    versions
+                        .iter()
+                        .any(|version| version == protocol::MCP_VERSION),
+                    Ordering::Release,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn headers(&self, incoming: HeaderMap) -> Result<HeaderMap> {
@@ -103,6 +126,20 @@ impl Transport for HttpTransport {
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
         let id = view(&request.message)?.id.map(RawValue::to_owned);
         let mut headers = self.headers(request.headers.clone())?;
+        let version = protocol::version(&request.message);
+        let modern = version.as_deref() == Some(protocol::MCP_VERSION);
+        if let Some(version) = &version {
+            headers.insert("mcp-protocol-version", version.parse()?);
+        }
+        if let Some(method) = view(&request.message)?.method {
+            headers.insert("mcp-method", method.parse()?);
+        }
+        if let Some(name) = protocol::field(&request.message, "params")
+            .and_then(|params| protocol::field(&params, "name"))
+        {
+            let name: String = serde_json::from_str(name.get())?;
+            headers.insert("mcp-name", name.parse()?);
+        }
         let mut response = self
             .client
             .follow(
@@ -114,7 +151,10 @@ impl Transport for HttpTransport {
             )
             .await?;
         if response.status == http::StatusCode::UNAUTHORIZED
-            || view(&request.message)?.method == Some("initialize")
+            || matches!(
+                view(&request.message)?.method,
+                Some("initialize" | "server/discover")
+            )
         {
             *self
                 .challenge
@@ -154,6 +194,7 @@ impl Transport for HttpTransport {
                     })
                 });
                 let mut reply = if valid {
+                    self.observe(&request, message.as_ref().expect("validated response"))?;
                     Reply::json(message.expect("validated response"))
                 } else {
                     Reply::error(
@@ -181,7 +222,7 @@ impl Transport for HttpTransport {
                     }
                     Err(error) => bail!("MCP event stream: {error}"),
                 };
-                if !event.id.is_empty() {
+                if !modern && !event.id.is_empty() {
                     last_event = Some(event.id);
                 }
                 if let Some(delay) = event.retry {
@@ -213,6 +254,7 @@ impl Transport for HttpTransport {
                         protocol::same_id(response_id, &id),
                         "MCP response ID does not match its request"
                     );
+                    self.observe(&request, &message)?;
                 }
                 let mut reply = Reply::json(message);
                 reply.status = status.as_u16();
@@ -261,5 +303,8 @@ impl Transport for HttpTransport {
         let mut reply = Reply::ack(response.status.as_u16(), "session_termination_response");
         reply.headers = wire_headers(&response.headers, true);
         Ok(reply)
+    }
+    fn stateless(&self) -> bool {
+        self.stateless.load(Ordering::Acquire)
     }
 }

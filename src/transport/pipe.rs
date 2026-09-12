@@ -47,6 +47,7 @@ pub struct Pipe {
     state: Arc<State>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     initialization: Option<Json>,
+    stateless: bool,
 }
 
 impl Pipe {
@@ -128,19 +129,23 @@ impl Pipe {
             state,
             tasks: Mutex::new(vec![reader, writer]),
             initialization: None,
+            stateless: false,
         };
-        let reply = exchange(&pipe, protocol::initialize()?).await?;
+        let (reply, stateless) = super::negotiate(&pipe).await?;
         let message = reply.message.context("MCP initialize response is empty")?;
         let result = view(&message)?
             .result
             .context("MCP initialize returned an error")?
             .to_owned();
-        exchange(
-            &pipe,
-            Request::new(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))?,
-        )
-        .await?;
-        pipe.initialization = Some(result);
+        pipe.stateless = stateless;
+        if !stateless {
+            exchange(
+                &pipe,
+                Request::new(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))?,
+            )
+            .await?;
+            pipe.initialization = Some(result);
+        }
         Ok(pipe)
     }
 
@@ -257,7 +262,21 @@ impl State {
                 return Ok(());
             }
             let pending = self.pending.lock().expect("routing mutex poisoned");
-            if method == "notifications/progress" {
+            let subscription = field(&message, "params")
+                .and_then(|params| field(&params, "_meta"))
+                .and_then(|meta| field(&meta, "io.modelcontextprotocol/subscriptionId"));
+            if let Some(subscription) = subscription {
+                if let Ok(alias) = serde_json::from_str::<u64>(subscription.get())
+                    && let Some(call) = pending.get(&alias)
+                {
+                    let message = replace(
+                        &message,
+                        &["params", "_meta", "io.modelcontextprotocol/subscriptionId"],
+                        &call.original,
+                    )?;
+                    let _ = call.responses.send(message);
+                }
+            } else if method == "notifications/progress" {
                 let token = field(&message, "params").and_then(|v| field(&v, "progressToken"));
                 if let Some(token) = token
                     && let Ok(alias) = serde_json::from_str::<u64>(token.get())
@@ -283,7 +302,18 @@ impl State {
                 .expect("routing mutex poisoned")
                 .remove(&alias)
             {
-                let message = replace(&message, &["id"], &call.original)?;
+                let mut message = replace(&message, &["id"], &call.original)?;
+                if field(&message, "result")
+                    .and_then(|result| field(&result, "_meta"))
+                    .and_then(|meta| field(&meta, "io.modelcontextprotocol/subscriptionId"))
+                    .is_some()
+                {
+                    message = replace(
+                        &message,
+                        &["result", "_meta", "io.modelcontextprotocol/subscriptionId"],
+                        &call.original,
+                    )?;
+                }
                 let _ = call.responses.send(message);
             }
         } else {
@@ -386,5 +416,8 @@ impl Transport for Pipe {
     }
     fn process_affinity(&self) -> bool {
         true
+    }
+    fn stateless(&self) -> bool {
+        self.stateless
     }
 }

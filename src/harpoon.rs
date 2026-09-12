@@ -491,11 +491,16 @@ impl Transport for Harpoon {
         if envelope.id.is_none() {
             return sink.send(Reply::ack(202, "notify_ack")).await;
         }
-        let result = match envelope.method {
-            Some("initialize") => {
-                json!({"protocolVersion":protocol::MCP_VERSION,"serverInfo":{"name":"harpoon","version":env!("CARGO_PKG_VERSION")},"capabilities":{"tools":{}},"instructions":"Use list_targets to discover HTTP targets and call_target to access them. OAuth targets retain their endpoint roles in tags."})
+        let modern = protocol::version(&request.message).as_deref() == Some(protocol::MCP_VERSION);
+        let identity = json!({"name":"harpoon","version":env!("CARGO_PKG_VERSION")});
+        let mut result = match envelope.method {
+            Some("server/discover") => {
+                json!({"supportedVersions":[protocol::MCP_VERSION,"2025-11-25"],"capabilities":{"tools":{}},"instructions":"Use list_targets to discover HTTP targets and call_target to access them. OAuth targets retain their endpoint roles in tags.","ttlMs":0,"cacheScope":"private"})
             }
-            Some("ping") => json!({}),
+            Some("initialize") => {
+                json!({"protocolVersion":"2025-11-25","serverInfo":identity,"capabilities":{"tools":{}},"instructions":"Use list_targets to discover HTTP targets and call_target to access them. OAuth targets retain their endpoint roles in tags."})
+            }
+            Some("ping") if !modern => json!({}),
             Some("tools/list") => self.tools()?,
             Some("tools/call") => {
                 let params = protocol::field(&request.message, "params")
@@ -529,6 +534,10 @@ impl Transport for Harpoon {
                     .await;
             }
         };
+        if modern {
+            result["resultType"] = json!("complete");
+            result["_meta"] = json!({"io.modelcontextprotocol/serverInfo":identity});
+        }
         sink.send(protocol::result(&request, &to_raw_value(&result)?)?)
             .await
     }
