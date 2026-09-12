@@ -1,5 +1,6 @@
 //! Secure MCP Tunnel transport for applications sharing a Tokio runtime.
 
+mod cloudflare;
 pub mod config;
 pub mod control;
 pub mod harpoon;

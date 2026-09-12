@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, process::Stdio};
 
 use anyhow::{Context, Result};
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Invocation, resolve};
@@ -34,6 +34,14 @@ impl Process {
         for (key, value) in env {
             command.env(key, resolve(value)?);
         }
+        Self::launch(command)
+    }
+    pub fn launch(command: Command) -> Result<Self> {
+        let program = command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
         let mut command = CommandWrap::from(command);
         command.wrap(KillOnDrop);
         #[cfg(unix)]
@@ -43,8 +51,14 @@ impl Process {
         Ok(Self {
             child: command
                 .spawn()
-                .with_context(|| format!("start {}", args[0]))?,
+                .with_context(|| format!("start {program}"))?,
         })
+    }
+    pub fn stderr(&mut self) -> Result<ChildStderr> {
+        self.child
+            .stderr()
+            .take()
+            .context("child stderr is unavailable")
     }
     pub fn pipes(&mut self) -> Result<(ChildStdout, ChildStdin)> {
         let child = &mut self.child;

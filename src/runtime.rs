@@ -26,6 +26,8 @@ use crate::{
 #[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
     pub ready: bool,
+    pub connected: bool,
+    pub cloudflare_ready: Option<bool>,
     pub started_at: u64,
     pub channels: BTreeMap<String, Probe>,
     pub in_flight: usize,
@@ -104,6 +106,14 @@ impl Tunnel {
     }
 
     async fn prepare(&mut self) -> Result<()> {
+        if self.config.cloudflared.managed || self.config.cloudflared.token.is_some() {
+            let companion =
+                crate::cloudflare::Companion::new(&self.config.cloudflared, &self.control).await?;
+            self.state
+                .send_modify(|state| state.cloudflare_ready = Some(false));
+            self.children
+                .spawn(companion.supervise(self.stop.clone(), self.state.clone()));
+        }
         let mut pipes = Vec::new();
         for command in &self.config.mcp.commands {
             let enabled = self.config.enabled(&command.channel);
@@ -219,6 +229,13 @@ impl Tunnel {
             );
         }
         self.control.set_channels(channels(&self.bindings))?;
+        if self.state.borrow().cloudflare_ready == Some(false) {
+            let mut status = self.state.subscribe();
+            tokio::select! {
+                result = status.wait_for(|state| state.cloudflare_ready == Some(true)) => { result?; }
+                result = self.children.join_next() => { result.context("companion supervisor stopped")???; }
+            }
+        }
         Ok(())
     }
 
@@ -279,13 +296,17 @@ impl Tunnel {
                 () = shutdown.cancelled() => return Ok(()),
                 result = self.control.metadata() => { result?; }
             }
-            self.state.send_modify(|state| state.ready = true);
+            self.state.send_modify(|state| {
+                state.connected = true;
+                state.ready = state.cloudflare_ready.unwrap_or(true);
+            });
             tracing::info!(channels = self.bindings.len(), "tunnel connected");
             self.dispatch(&shutdown).await
         }
         .await;
         self.state.send_modify(|state| {
             state.ready = false;
+            state.connected = false;
             if let Err(error) = &result {
                 state.last_error = Some(format!("{error:#}"));
             }
@@ -407,8 +428,11 @@ impl Tunnel {
             }
         }
         while let Some(result) = self.children.join_next().await {
-            if let Err(error) = result {
-                failure.get_or_insert(error.into());
+            if let Err(error) = result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+            {
+                failure.get_or_insert(error);
             }
         }
         match failure {
