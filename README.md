@@ -127,4 +127,6 @@ cargo build --release
 
 The release workflow builds x86-64 and ARM64 binaries on native Windows, macOS, and Linux runners. Each archive contains the binary, license, configuration reference, and shell completions. A `v<VERSION>` tag identifies the Cargo package version for release assets; publishing the corresponding crate enables registry-based `cargo binstall` discovery.
 
+`python scripts/package.py` performs the release build and writes the native archive to `target/dist`. The workflow calls the same script with its runner's target. After the release assets are available, `cargo publish` publishes the library and CLI package to the registry.
+
 The implementation follows the public [Secure MCP Tunnel protocol](https://github.com/openai/tunnel-client/blob/master/docs/protocol.md) and [MCP specification](https://modelcontextprotocol.io/specification/2026-07-28). It is distributed under the [MIT license](LICENSE).

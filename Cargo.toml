@@ -2,6 +2,16 @@
 name = "otunnel"
 version = "0.1.0"
 edition = "2024"
+description = "Concurrent MCP tunnel client and embedding library"
+license = "MIT"
+repository = "https://github.com/zetaloop/otunnel"
+readme = "README.md"
+keywords = ["mcp", "tunnel", "openai", "stdio"]
+categories = ["network-programming", "command-line-utilities"]
+
+[profile.release]
+lto = "thin"
+strip = true
 
 [features]
 default = ["cli"]
