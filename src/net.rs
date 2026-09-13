@@ -29,6 +29,8 @@ use url::Url;
 
 use crate::config::pem;
 
+mod trace;
+
 pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
 
@@ -48,6 +50,7 @@ pub struct Http {
     origin: Url,
     proxy: Arc<crate::proxy::Proxy>,
     local: Option<Client<Connector, Full<Bytes>>>,
+    logging: Option<&'static str>,
 }
 
 pub struct Response {
@@ -139,7 +142,13 @@ impl Http {
             origin,
             proxy,
             local,
+            logging: None,
         })
+    }
+
+    pub fn logging(mut self, component: Option<&'static str>) -> Self {
+        self.logging = component;
+        self
     }
 
     pub(crate) fn proxied(&self, url: &Url) -> Result<bool> {
@@ -162,6 +171,7 @@ impl Http {
                 "otunnel/",
                 env!("CARGO_PKG_VERSION")
             )));
+        let trace = trace::Trace::request(self.logging, &method, url, &headers, &body);
         if url.origin() == self.origin.origin()
             && let Some(client) = &self.local
         {
@@ -169,10 +179,15 @@ impl Http {
             *request.headers_mut().expect("new request has headers") = headers;
             let response = client.request(request.body(Full::new(body))?).await?;
             let (parts, body) = response.into_parts();
-            return Ok(Response {
+            let version = parts.version;
+            let response = Response {
                 status: parts.status,
                 headers: parts.headers,
                 body: body.into_data_stream().map_err(anyhow::Error::from).boxed(),
+            };
+            return Ok(match trace {
+                Some(trace) => trace.response(response, version),
+                None => response,
             });
         }
         self.proxy.select(url)?;
@@ -187,10 +202,15 @@ impl Http {
             .body(body)
             .send()
             .await?;
-        Ok(Response {
+        let version = response.version();
+        let response = Response {
             status: response.status(),
             headers: response.headers().clone(),
             body: response.bytes_stream().map_err(anyhow::Error::from).boxed(),
+        };
+        Ok(match trace {
+            Some(trace) => trace.response(response, version),
+            None => response,
         })
     }
 

@@ -62,6 +62,7 @@ pub struct Harpoon {
     config: config::Harpoon,
     ca_bundle: Option<String>,
     proxy: Option<String>,
+    logging: bool,
     patterns: Vec<Regex>,
     targets: RwLock<IndexMap<String, Target>>,
 }
@@ -71,6 +72,7 @@ impl Harpoon {
         let harpoon = Self {
             config: config.harpoon.clone(),
             ca_bundle: config.ca_bundle.clone(),
+            logging: config.log.http_raw_unsafe,
             proxy: config
                 .harpoon
                 .http_proxy
@@ -138,7 +140,7 @@ impl Harpoon {
     }
 
     pub(crate) fn client(&self, url: &Url, socket: Option<&str>) -> Result<Http> {
-        Http::new(
+        Ok(Http::new(
             url.clone(),
             Options {
                 proxy: self.proxy.as_deref(),
@@ -146,7 +148,8 @@ impl Harpoon {
                 socket,
                 ..Default::default()
             },
-        )
+        )?
+        .logging(self.logging.then_some("harpoon")))
     }
 
     pub(crate) fn insert(&self, mut target: Target) -> Result<()> {

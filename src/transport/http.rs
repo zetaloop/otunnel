@@ -65,6 +65,7 @@ impl HttpTransport {
                 client_key: server.client_key.as_deref().or(mcp.client_key.as_deref()),
             },
         )?;
+        let client = client.logging(config.log.http_raw_unsafe.then_some("mcpclient"));
         let mut discovery_headers = config::headers(&mcp.extra_headers)?;
         discovery_headers.extend(config::headers(&mcp.discovery_extra_headers)?);
         Ok(Self {

@@ -126,6 +126,7 @@ impl Control {
                 ..Default::default()
             },
         )?;
+        let http = http.logging(config.log.http_raw_unsafe.then_some("controlplane"));
         let mut headers = config::headers(&cp.extra_headers)?;
         let mut authorization =
             HeaderValue::try_from(format!("Bearer {}", config::resolve(&cp.api_key)?))?;
@@ -261,9 +262,13 @@ impl Control {
 
     async fn fetch(&self, suffix: &str) -> Result<Value> {
         let url = self.endpoint(suffix)?;
+        let http = if suffix == "cloudflare/runtime" {
+            self.http.clone().logging(None)
+        } else {
+            self.http.clone()
+        };
         timeout(Duration::from_secs(30), async {
-            let response = self
-                .http
+            let response = http
                 .send(Method::GET, &url, self.headers(), Bytes::new())
                 .await?;
             if !response.status.is_success() {
