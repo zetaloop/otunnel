@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{ArgMatches, parser::ValueSource};
 use otunnel::{
     Tunnel,
@@ -63,16 +63,10 @@ pub async fn execute(arguments: &ArgMatches) -> Result<u8> {
         match std::fs::metadata(file) {
             Ok(_) => {
                 checks.push(Check::pass("profile_load", file.display().to_string()));
-                match std::fs::read_to_string(file)
-                    .with_context(|| format!("read {}", file.display()))
-                    .and_then(|contents| Config::validate_profile(&contents))
-                {
-                    Ok(()) => {}
+                match Config::read(file) {
+                    Ok(_) => {}
                     Err(error) => {
-                        checks.push(Check::fail(
-                            "profile_load",
-                            format!("parse config file {}: {error:#}", file.display()),
-                        ));
+                        checks.push(Check::fail("profile_load", format!("{error:#}")));
                         return output(arguments, checks, BTreeMap::new(), String::new());
                     }
                 }

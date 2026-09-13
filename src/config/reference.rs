@@ -147,7 +147,12 @@ fn header_syntax(source: &str, headers: &BTreeMap<String, String>, control: bool
 }
 
 pub fn resolve(value: &str) -> Result<String> {
+    resolve_named("configuration value", value)
+}
+
+pub(super) fn resolve_named(source: &str, value: &str) -> Result<String> {
     let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "{source} cannot be empty");
     let Some((kind, name)) = value.split_once(':') else {
         return Ok(value.into());
     };
@@ -155,20 +160,34 @@ pub fn resolve(value: &str) -> Result<String> {
         let name = name.trim();
         anyhow::ensure!(
             !name.is_empty(),
-            "environment variable name is required after env:"
+            "invalid {source} reference {value:?}: environment variable name is required"
         );
-        env::var(name).with_context(|| format!("read environment variable {name}"))?
+        let resolved = env::var(name).with_context(|| {
+            format!(
+                "invalid {source} reference {value:?}: environment variable {name:?} is not set"
+            )
+        })?;
+        anyhow::ensure!(
+            !resolved.trim().is_empty(),
+            "invalid {source} reference {value:?}: environment variable {name:?} is empty"
+        );
+        resolved
     } else if kind.eq_ignore_ascii_case("file") {
         let name = name.trim();
-        anyhow::ensure!(!name.is_empty(), "file path is required after file:");
-        fs::read_to_string(name).with_context(|| format!("read {name}"))?
+        anyhow::ensure!(
+            !name.is_empty(),
+            "invalid {source} reference {value:?}: file path is required"
+        );
+        let resolved = fs::read_to_string(name)
+            .with_context(|| format!("invalid {source} reference {value:?}: read file"))?;
+        anyhow::ensure!(
+            !resolved.trim().is_empty(),
+            "invalid {source} reference {value:?}: file is empty"
+        );
+        resolved
     } else {
         return Ok(value.into());
     };
-    anyhow::ensure!(
-        !resolved.trim().is_empty(),
-        "reference {value:?} resolved to an empty value"
-    );
     Ok(resolved.trim().to_owned())
 }
 
@@ -192,33 +211,24 @@ pub(super) fn read(config: &mut Config) -> Result<()> {
         ("control_plane.url_path", &mut config.control_plane.url_path),
     ] {
         if let Some(value) = value {
-            *value = resolve(value).with_context(|| name.to_owned())?;
-            anyhow::ensure!(!value.is_empty(), "{name} cannot be empty");
+            *value = resolve_named(name, value)?;
         }
     }
-    config.health.listen_addr =
-        resolve(&config.health.listen_addr).context("health.listen_addr")?;
-    anyhow::ensure!(
-        !config.health.listen_addr.is_empty(),
-        "health.listen_addr cannot be empty"
-    );
+    config.control_plane.api_key =
+        resolve_named("control_plane.api_key", &config.control_plane.api_key)?;
+
+    config.health.listen_addr = resolve_named("health.listen_addr", &config.health.listen_addr)?;
     if let Some(socket) = &mut config.health.unix_socket {
-        *socket = resolve(socket).context("health.unix_socket")?;
-        anyhow::ensure!(!socket.is_empty(), "health.unix_socket cannot be empty");
+        *socket = resolve_named("health.unix_socket", socket)?;
     }
     for server in &mut config.mcp.server_urls {
-        server.url = resolve(&server.url).context("mcp.server_urls.url")?;
-        anyhow::ensure!(!server.url.is_empty(), "mcp.server_urls entry requires url");
+        server.url = resolve_named("mcp.server_urls.url", &server.url)?;
         if let Some(socket) = &mut server.unix_socket {
             *socket = path(socket)?.to_string_lossy().into_owned();
         }
     }
     for command in &mut config.mcp.commands {
-        command.command = resolve(&command.command).context("mcp.commands.command")?;
-        anyhow::ensure!(
-            !command.command.is_empty(),
-            "mcp.commands entry requires command"
-        );
+        command.command = resolve_named("mcp.commands.command", &command.command)?;
     }
     config.normalize()
 }

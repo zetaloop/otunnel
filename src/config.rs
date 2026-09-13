@@ -77,11 +77,11 @@ impl Config {
 
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut config = Self::parse(
-            &fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
-        )
-        .with_context(|| format!("parse {}", path.display()))?;
-        reference::read(&mut config)?;
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let context = || format!("parse config file {}", path.display());
+        Self::validate_profile(&text).with_context(context)?;
+        let mut config = Self::parse(&text).with_context(context)?;
+        reference::read(&mut config).with_context(context)?;
         Ok(config)
     }
     pub fn parse(text: &str) -> Result<Self> {
@@ -176,9 +176,14 @@ impl Config {
                 }),
             "invalid tunnel ID: expected tunnel_<32 lowercase letters or digits>"
         );
-        if resolve(&self.control_plane.api_key)?.is_empty() {
-            bail!("control_plane.api_key is required");
-        }
+        let api_key =
+            reference::resolve_named("control_plane.api_key", &self.control_plane.api_key)?;
+        anyhow::ensure!(
+            api_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+            "control plane API key is malformed"
+        );
         if self.control_plane.max_inflight_requests == 0 || self.mcp.max_concurrent_requests == 0 {
             bail!("request concurrency must be positive");
         }
