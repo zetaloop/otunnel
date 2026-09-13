@@ -46,11 +46,12 @@ humantime = "2.4.0"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
 indexmap = "2.14.2"
+ipnet = "2.12.2"
 percent-encoding = "2.3.2"
 process-wrap = { version = "10.0.0", features = ["tokio1"] }
 rand = "0.10.2"
 regex = "1.13.1"
-reqwest = { version = "0.13.5", features = ["json", "query", "stream"] }
+reqwest = { version = "0.13.5", features = ["json", "query", "socks", "stream"] }
 rustls = "0.23.44"
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"

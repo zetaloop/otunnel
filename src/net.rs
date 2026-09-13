@@ -46,6 +46,7 @@ pub struct Http {
     client: reqwest::Client,
     public: reqwest::Client,
     origin: Url,
+    proxy: Arc<crate::proxy::Proxy>,
     local: Option<Client<Connector, Full<Bytes>>>,
 }
 
@@ -70,29 +71,25 @@ impl Response {
 impl Http {
     pub fn new(origin: Url, options: Options<'_>) -> Result<Self> {
         let certificates = options.ca_bundle.map(pem).transpose()?;
-        let mut base = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never());
-        if let Some(proxy) = options.proxy {
-            base = base.proxy(reqwest::Proxy::all(resolve(proxy)?)?);
-        }
-        if let Some(certs) = &certificates {
-            for certificate in reqwest::Certificate::from_pem_bundle(certs)? {
-                base = base.add_root_certificate(certificate);
+        let proxy = Arc::new(crate::proxy::Proxy::new(options.proxy)?);
+        let builder = || -> Result<reqwest::ClientBuilder> {
+            let route = proxy.clone();
+            let mut builder = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .no_proxy()
+                .proxy(reqwest::Proxy::custom(move |url| {
+                    route.select(url).ok().flatten().cloned()
+                }));
+            if let Some(certs) = &certificates {
+                for certificate in reqwest::Certificate::from_pem_bundle(certs)? {
+                    builder = builder.add_root_certificate(certificate);
+                }
             }
-        }
-        let public = base.build()?;
-        let mut scoped = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never());
-        if let Some(proxy) = options.proxy {
-            scoped = scoped.proxy(reqwest::Proxy::all(resolve(proxy)?)?);
-        }
-        if let Some(certs) = &certificates {
-            for certificate in reqwest::Certificate::from_pem_bundle(certs)? {
-                scoped = scoped.add_root_certificate(certificate);
-            }
-        }
+            Ok(builder)
+        };
+        let public = builder()?.build()?;
+        let mut scoped = builder()?;
         let identity = match (options.client_cert, options.client_key) {
             (Some(cert), Some(key)) => Some((pem(cert)?, pem(key)?)),
             (None, None) => None,
@@ -140,6 +137,7 @@ impl Http {
             client,
             public,
             origin,
+            proxy,
             local,
         })
     }
@@ -170,6 +168,7 @@ impl Http {
                 body: body.into_data_stream().map_err(anyhow::Error::from).boxed(),
             });
         }
+        self.proxy.select(url)?;
         let client = if url.origin() == self.origin.origin() {
             &self.client
         } else {

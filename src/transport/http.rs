@@ -37,14 +37,24 @@ impl HttpTransport {
     pub fn new(server: &config::Server, config: &config::Config) -> Result<Self> {
         let url = Url::parse(&config::resolve(&server.url)?)?;
         let mcp = &config.mcp;
+        anyhow::ensure!(
+            server.unix_socket.is_none() || server.http_proxy.is_none(),
+            "mcp config: unix-socket cannot be combined with http-proxy for channel {:?}",
+            server.channel
+        );
+        let proxy = if server.unix_socket.is_some() {
+            None
+        } else {
+            server
+                .http_proxy
+                .as_deref()
+                .or(mcp.http_proxy.as_deref())
+                .or(config.http_proxy.as_deref())
+        };
         let client = Http::new(
             url.clone(),
             Options {
-                proxy: server
-                    .http_proxy
-                    .as_deref()
-                    .or(mcp.http_proxy.as_deref())
-                    .or(config.http_proxy.as_deref()),
+                proxy,
                 socket: server.unix_socket.as_deref(),
                 ca_bundle: config.ca_bundle.as_deref(),
                 client_cert: server.client_cert.as_deref().or(mcp.client_cert.as_deref()),
