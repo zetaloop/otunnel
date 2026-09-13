@@ -25,12 +25,12 @@ pub fn command() -> Command {
         .arg(
             Arg::new("url")
                 .long("url")
-                .help("Admin base URL or health endpoint URL"),
+                .help("Health base URL or /healthz or /readyz URL"),
         )
         .arg(
             Arg::new("url-file")
                 .long("url-file")
-                .help("File containing the admin base URL"),
+                .help("File containing the health base URL"),
         )
         .arg(
             Arg::new("port")
