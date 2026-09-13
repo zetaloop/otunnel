@@ -923,7 +923,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
                 .process
                 .pid_file
                 .as_ref()
-                .map(|path| Record::write(path, std::process::id().to_string()))
+                .map(|path| Record::write(path, format!("{}\n", std::process::id())))
                 .transpose()?;
             let mut url_file = None;
             let health = if config.health.unix_socket.is_some()
