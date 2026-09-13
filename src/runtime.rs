@@ -371,6 +371,20 @@ impl Tunnel {
                 result = self.prepare(false) => result?,
             }
             self.observe();
+            if !self.config.mcp.startup_wait_timeout.0.is_zero()
+                && self
+                    .bindings
+                    .get("main")
+                    .is_some_and(|transport| transport.startup_probe())
+            {
+                let mut status = self.state.subscribe();
+                tokio::select! {
+                    result = status.wait_for(|state| state.mcp_probe.state != "pending") => {
+                        result.context("MCP startup probe stopped")?;
+                    }
+                    () = shutdown.cancelled() => return Ok(()),
+                }
+            }
             self.state.send_modify(|state| {
                 state.lifecycle = "running";
                 state.refresh_readiness();
