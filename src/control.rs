@@ -25,6 +25,9 @@ use crate::{
     transport::Sink,
 };
 
+mod observation;
+pub use observation::Upload;
+
 #[derive(Clone, Serialize)]
 pub struct Channel {
     pub name: String,
@@ -53,6 +56,11 @@ impl std::error::Error for StatusError {}
 
 #[derive(Clone, Default, Serialize)]
 pub struct Observation {
+    pub poll_state: &'static str,
+    pub effective_wait: f64,
+    pub deadline: f64,
+    pub failure_category: &'static str,
+    pub upload: Upload,
     pub connected: bool,
     pub instance_id: String,
     pub metadata: Option<Value>,
@@ -156,6 +164,13 @@ impl Control {
             learned_poll_ms: AtomicU64::new(0),
             uses_proxy,
             observations: watch::channel(Observation {
+                poll_state: "starting",
+                effective_wait: cp.poll_timeout.0.as_secs_f64(),
+                deadline: (cp.poll_timeout.0 + cp.poll_deadline_guardrail.0).as_secs_f64(),
+                upload: Upload {
+                    disposition: "not_observed",
+                    ..Default::default()
+                },
                 instance_id,
                 ..Default::default()
             })
@@ -232,7 +247,6 @@ impl Control {
     pub async fn metadata(&self) -> Result<Value> {
         let metadata = self.fetch("").await?;
         self.observations.send_modify(|state| {
-            state.connected = true;
             state.metadata = Some(metadata.clone());
         });
         Ok(metadata)
@@ -296,6 +310,9 @@ impl Control {
             let mut received_headers = false;
             let mut response_status = 0;
             self.observations.send_modify(|state| {
+                state.poll_state = "polling";
+                state.effective_wait = requested.as_secs_f64();
+                state.deadline = (duration + self.guard).as_secs_f64();
                 state.last_attempt = now();
                 state.next_retry = 0.0;
                 state.cycles += 1;
@@ -352,12 +369,20 @@ impl Control {
                 state.connected = connected;
                 match &result {
                     Ok(Ok(Ok(batch))) => {
+                        state.poll_state = "idle";
+                        state.failure_category = "";
                         state.last_success = now();
                         state.consecutive_failures = 0;
                         state.commands += batch.commands.len() as u64;
                         state.http_status = response_status;
                     }
                     _ => {
+                        state.poll_state = "backoff";
+                        state.failure_category = match &result {
+                            Ok(Ok(Err(_))) => "http_error",
+                            Ok(Err(error)) => observation::category(error),
+                            _ => "timeout",
+                        };
                         state.last_error = now();
                         state.consecutive_failures += 1;
                         state.errors += 1;
@@ -393,70 +418,90 @@ impl Control {
     }
 
     async fn post(&self, command: &Correlation, reply: &Reply) -> Result<()> {
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            request_id: &'a str,
-            channel: &'a str,
-            #[serde(flatten)]
-            reply: &'a Reply,
-        }
-        let body = Bytes::from(serde_json::to_vec(&Payload {
-            request_id: &command.request_id,
-            channel: &command.channel,
-            reply,
-        })?);
-        let mut headers = self.headers();
-        let mut shard = HeaderValue::try_from(&command.shard_token)?;
-        shard.set_sensitive(true);
-        headers.insert("x-tunnel-shard-token", shard);
-        headers.insert("content-type", HeaderValue::from_static("application/json"));
-        let url = self.endpoint("response")?;
-        let mut attempt = 0;
-        loop {
-            let response = timeout(Duration::from_secs(30), async {
-                let response = self
-                    .http
-                    .send(Method::POST, &url, headers.clone(), body.clone())
-                    .await?;
-                let status = response.status;
-                let headers = response.headers.clone();
-                if let Err(error) = timeout(Duration::from_secs(1), response.bytes())
-                    .await
-                    .context("response body drain timed out")
-                    .and_then(|result| result)
-                {
-                    tracing::debug!(%error, "tunnel response acknowledgement body interrupted");
-                }
-                Ok::<_, anyhow::Error>((status, headers))
-            })
-            .await;
-            let retry_headers = match response {
-                Ok(Ok((status, headers))) => {
-                    let code = status.as_u16();
-                    if status.is_success() || (code == 404 && reply.terminal()) {
-                        return Ok(());
+        let receipt = observation::Receipt::new(&self.observations);
+        let result: Result<u16> = async {
+            #[derive(Serialize)]
+            struct Payload<'a> {
+                request_id: &'a str,
+                channel: &'a str,
+                #[serde(flatten)]
+                reply: &'a Reply,
+            }
+            let body = Bytes::from(serde_json::to_vec(&Payload {
+                request_id: &command.request_id,
+                channel: &command.channel,
+                reply,
+            })?);
+            let mut headers = self.headers();
+            let mut shard = HeaderValue::try_from(&command.shard_token)?;
+            shard.set_sensitive(true);
+            headers.insert("x-tunnel-shard-token", shard);
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            let url = self.endpoint("response")?;
+            let mut attempt = 0;
+            loop {
+                receipt.attempt(attempt != 0);
+                let response = timeout(Duration::from_secs(30), async {
+                    let response = self
+                        .http
+                        .send(Method::POST, &url, headers.clone(), body.clone())
+                        .await?;
+                    let status = response.status;
+                    let headers = response.headers.clone();
+                    if let Err(error) = timeout(Duration::from_secs(1), response.bytes())
+                        .await
+                        .context("response body drain timed out")
+                        .and_then(|result| result)
+                    {
+                        tracing::debug!(%error, "tunnel response acknowledgement body interrupted");
                     }
-                    if code == 429 || (reply.terminal() && matches!(code, 408 | 502 | 503 | 504)) {
-                        headers
-                    } else {
-                        return Err(StatusError {
-                            status: code,
-                            operation: "response",
+                    Ok::<_, anyhow::Error>((status, headers))
+                })
+                .await;
+                match &response {
+                    Ok(Ok((status, _)))
+                        if !status.is_success()
+                            && !(status.as_u16() == 404 && reply.terminal()) =>
+                    {
+                        receipt.failure("http_error", status.as_u16())
+                    }
+                    Ok(Err(error)) => receipt.failure(observation::category(error), 0),
+                    Err(_) => receipt.failure("timeout", 0),
+                    _ => {}
+                }
+                let retry_headers = match response {
+                    Ok(Ok((status, headers))) => {
+                        let code = status.as_u16();
+                        if status.is_success() || (code == 404 && reply.terminal()) {
+                            return Ok(code);
                         }
-                        .into());
+                        if code == 429
+                            || (reply.terminal() && matches!(code, 408 | 502 | 503 | 504))
+                        {
+                            headers
+                        } else {
+                            return Err(StatusError {
+                                status: code,
+                                operation: "response",
+                            }
+                            .into());
+                        }
                     }
-                }
-                Ok(Err(error)) if reply.terminal() || crate::net::connecting(&error) => {
-                    tracing::debug!(%error, "retrying tunnel response delivery");
-                    HeaderMap::new()
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(_) if reply.terminal() => HeaderMap::new(),
-                Err(_) => bail!("notification delivery timed out"),
-            };
-            tokio::time::sleep(retry_delay(attempt, &retry_headers)).await;
-            attempt = attempt.saturating_add(1);
+                    Ok(Err(error)) if reply.terminal() || crate::net::connecting(&error) => {
+                        tracing::debug!(%error, "retrying tunnel response delivery");
+                        HeaderMap::new()
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) if reply.terminal() => HeaderMap::new(),
+                    Err(_) => bail!("notification delivery timed out"),
+                };
+                tokio::time::sleep(retry_delay(attempt, &retry_headers)).await;
+                attempt = attempt.saturating_add(1);
+            }
         }
+        .await;
+        receipt.finish(&result);
+        result.map(|_| ())
     }
 }
 
