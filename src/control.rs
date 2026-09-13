@@ -100,11 +100,16 @@ pub struct Control {
 impl Control {
     pub fn new(config: &Config) -> Result<Self> {
         let cp = &config.control_plane;
-        let mut url = Url::parse(&config::resolve(&cp.base_url)?)?;
-        if cp.client_cert.is_some() && url.host_str() == Some("api.openai.com") {
-            url.set_host(Some("mtls.api.openai.com"))?;
-        }
-        url = config::endpoint(&url, &config::resolve(&cp.url_path)?, "v1/tunnels")?;
+        let mut url = Url::parse(cp.base_url()).context("invalid control-plane.base-url")?;
+        anyhow::ensure!(
+            url.host_str().is_some(),
+            "control-plane.base-url must include scheme and host"
+        );
+        url = config::endpoint(
+            &url,
+            cp.url_path.as_deref().unwrap_or_default(),
+            "v1/tunnels",
+        )?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("control plane URL cannot contain path segments"))?
             .pop_if_empty()
@@ -140,10 +145,7 @@ impl Control {
         let instance_id = INSTANCE_ID.clone();
         headers.insert("x-tunnel-client-instance-id", instance_id.parse()?);
         if let Some(organization) = &cp.organization_id {
-            headers.insert(
-                "openai-organization",
-                config::resolve(organization)?.parse()?,
-            );
+            headers.insert("openai-organization", organization.trim().parse()?);
         }
         let mut subscriptions = cp
             .poll_channels

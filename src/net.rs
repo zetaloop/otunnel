@@ -27,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tower_service::Service;
 use url::Url;
 
-use crate::config::{pem, resolve};
+use crate::config::pem;
 
 pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
@@ -126,7 +126,7 @@ impl Http {
                 builder.with_no_client_auth()
             };
             let connector = Connector {
-                path: PathBuf::from(resolve(socket)?),
+                path: crate::config::path(socket)?,
                 tls: Arc::new(tls),
             };
             Some(Client::builder(TokioExecutor::new()).build(connector))

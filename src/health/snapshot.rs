@@ -357,7 +357,7 @@ pub(super) async fn status(State(monitor): State<Monitor>) -> Json<Value> {
     let mut value = json!({
         "version":env!("CARGO_PKG_VERSION"),"client_instance_id":state.control.instance_id,
         "started_at":timestamp(state.started_at as f64),"uptime_seconds":(control::now()-state.started_at as f64).max(0.0) as u64,
-        "health_listen_addr":monitor.address,"control_plane_base_url":cp.base_url,"control_plane_tunnel_id":cp.tunnel_id,
+        "health_listen_addr":monitor.address,"control_plane_base_url":cp.base_url(),"control_plane_tunnel_id":cp.tunnel_id,
         "control_plane_max_inflight":cp.max_inflight_requests,"control_plane_poll_timeout":cp.poll_timeout.to_string(),
         "control_plane_poll_deadline_guardrail":cp.poll_deadline_guardrail.to_string(),
         "raw_http_logging_enabled":config.log.http_raw_unsafe

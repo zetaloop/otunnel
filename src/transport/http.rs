@@ -35,7 +35,11 @@ pub struct HttpTransport {
 }
 impl HttpTransport {
     pub fn new(server: &config::Server, config: &config::Config) -> Result<Self> {
-        let url = Url::parse(&config::resolve(&server.url)?)?;
+        let url = Url::parse(&server.url).context("invalid mcp.server-url")?;
+        anyhow::ensure!(
+            url.host_str().is_some(),
+            "mcp.server-url must include scheme and host"
+        );
         let mcp = &config.mcp;
         anyhow::ensure!(
             server.unix_socket.is_none() || server.http_proxy.is_none(),

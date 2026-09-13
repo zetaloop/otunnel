@@ -620,7 +620,7 @@ fn load(matches: &ArgMatches) -> Result<Config> {
     let config = source.map(Config::read).transpose()?.unwrap_or_default();
     let mut initial_poll_timeout = config.control_plane.initial_poll_timeout;
     let mut value = serde_json::to_value(config)?;
-    for (name, _, pointer, kind, _) in SETTINGS {
+    for (name, environment, pointer, kind, _) in SETTINGS {
         let selected = if matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine)
         {
             name
@@ -638,6 +638,31 @@ fn load(matches: &ArgMatches) -> Result<Config> {
             continue;
         };
         let mut arguments = arguments.cloned().collect::<Vec<_>>();
+        let origin = matches.value_source(selected);
+        if matches!(*name, "control-plane.api-key" | "cloudflared.token") {
+            if origin == Some(clap::parser::ValueSource::EnvVariable) {
+                arguments[0] = format!("env:{environment}");
+            } else if arguments[0].is_empty() {
+                if env::var_os(environment).is_some() {
+                    arguments[0] = format!("env:{environment}");
+                } else {
+                    continue;
+                }
+            } else {
+                let reference = if *name == "cloudflared.token" {
+                    arguments[0].trim().to_ascii_lowercase()
+                } else {
+                    arguments[0].clone()
+                };
+                anyhow::ensure!(
+                    reference.starts_with("env:") || reference.starts_with("file:"),
+                    "{name} must be an env:NAME or file:PATH reference"
+                );
+            }
+        }
+        if name.ends_with("http-proxy") && origin == Some(clap::parser::ValueSource::CommandLine) {
+            anyhow::ensure!(!arguments[0].trim().is_empty(), "--{name} requires a value");
+        }
         if matches!(kind, List | Headers | Servers | Commands | Targets)
             && arguments.len() == 1
             && arguments[0].trim_start().starts_with('[')
@@ -735,10 +760,22 @@ fn load(matches: &ArgMatches) -> Result<Config> {
     let mut config: Config = serde_json::from_value(value)?;
     config.control_plane.initial_poll_timeout = initial_poll_timeout;
     if config.control_plane.api_key.is_empty()
-        && let Ok(key) = env::var("OPENAI_API_KEY")
+        && env::var_os("CONTROL_PLANE_API_KEY").is_none()
+        && env::var_os("OPENAI_API_KEY").is_some()
     {
-        config.control_plane.api_key = key;
+        config.control_plane.api_key = "env:OPENAI_API_KEY".into();
     }
+    if let Some(token) = &config.cloudflared.token {
+        anyhow::ensure!(
+            token
+                .trim()
+                .split_once(':')
+                .is_some_and(|(kind, _)| kind.eq_ignore_ascii_case("env")
+                    || kind.eq_ignore_ascii_case("file")),
+            "cloudflared.token must be an env:NAME or file:PATH reference"
+        );
+    }
+    config.normalize()?;
     Ok(config)
 }
 

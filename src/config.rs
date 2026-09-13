@@ -34,7 +34,9 @@ macro_rules! settings {
 }
 
 mod duration;
+mod reference;
 pub use duration::Span;
+pub use reference::{path, resolve};
 
 settings!(Config {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,8 +57,12 @@ settings!(Config {
 impl Config {
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        Self::parse(&fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?)
-            .with_context(|| format!("parse {}", path.display()))
+        let mut config = Self::parse(
+            &fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))?;
+        reference::read(&mut config)?;
+        Ok(config)
     }
     pub fn parse(text: &str) -> Result<Self> {
         let mut input = text.as_bytes();
@@ -84,7 +90,6 @@ impl Config {
             // A version-two profile is a single YAML document, including empty trailing documents.
             serde_saphyr::from_str::<Self>(text)?;
         }
-        config.scope()?;
         Ok(config)
     }
     fn scope(&self) -> Result<()> {
@@ -208,6 +213,70 @@ impl Config {
         }
         Ok(())
     }
+    pub fn normalize(&mut self) -> Result<()> {
+        for name in self
+            .mcp
+            .commands
+            .iter_mut()
+            .map(|command| &mut command.channel)
+            .chain(
+                self.mcp
+                    .server_urls
+                    .iter_mut()
+                    .map(|server| &mut server.channel),
+            )
+            .chain(self.control_plane.poll_channels.iter_mut())
+        {
+            *name = channel(name)?;
+        }
+        let optional = |value: &mut Option<String>| {
+            if let Some(text) = value {
+                *text = text.trim().to_owned();
+                if text.is_empty() {
+                    *value = None;
+                }
+            }
+        };
+        for value in [
+            &mut self.ca_bundle,
+            &mut self.http_proxy,
+            &mut self.mcp.http_proxy,
+            &mut self.mcp.client_cert,
+            &mut self.mcp.client_key,
+            &mut self.harpoon.http_proxy,
+            &mut self.control_plane.client_cert,
+            &mut self.control_plane.client_key,
+            &mut self.control_plane.http_proxy,
+            &mut self.control_plane.organization_id,
+            &mut self.health.unix_socket,
+            &mut self.health.url_file,
+            &mut self.process.pid_file,
+            &mut self.log.file,
+        ] {
+            optional(value);
+        }
+        for server in &mut self.mcp.server_urls {
+            for value in [
+                &mut server.unix_socket,
+                &mut server.http_proxy,
+                &mut server.client_cert,
+                &mut server.client_key,
+            ] {
+                optional(value);
+            }
+        }
+        for target in &mut self.harpoon.targets {
+            optional(&mut target.unix_socket);
+        }
+        if self.health.listen_addr.is_empty() {
+            self.health.listen_addr = Health::default().listen_addr;
+        }
+        self.cloudflared.path = self.cloudflared.path.trim().to_owned();
+        if self.cloudflared.path.is_empty() {
+            self.cloudflared.path = "cloudflared".into();
+        }
+        Ok(())
+    }
     pub fn enabled(&self, channel: &str) -> bool {
         self.control_plane.poll_channels.is_empty()
             || self
@@ -219,8 +288,8 @@ impl Config {
 }
 
 settings!(ControlPlane {
-    base_url: String = "https://api.openai.com".into(),
-    url_path: String = String::new(),
+    base_url: Option<String> = None,
+    url_path: Option<String> = None,
     tunnel_id: String = String::new(),
     api_key: String = String::new(),
     organization_id: Option<String> = None,
@@ -235,6 +304,22 @@ settings!(ControlPlane {
     client_cert: Option<String> = None,
     client_key: Option<String> = None,
 });
+impl ControlPlane {
+    pub fn base_url(&self) -> &str {
+        let url = self
+            .base_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+            .unwrap_or("https://api.openai.com");
+        if self.client_cert.is_some()
+            && url.trim().trim_end_matches('/') == "https://api.openai.com"
+        {
+            "https://mtls.api.openai.com"
+        } else {
+            url
+        }
+    }
+}
 settings!(Mcp {
     server_urls: Vec<Server> = Vec::new(),
     commands: Vec<Command> = Vec::new(),
@@ -459,25 +544,9 @@ pub fn expand_home(value: &str) -> Result<PathBuf> {
     }
 }
 
-pub fn resolve(value: &str) -> Result<String> {
-    if let Some(name) = value.strip_prefix("env:") {
-        env::var(name).with_context(|| format!("read environment variable {name}"))
-    } else if let Some(path) = value.strip_prefix("file:") {
-        Ok(fs::read_to_string(path)
-            .with_context(|| format!("read {path}"))?
-            .trim()
-            .into())
-    } else {
-        Ok(value.into())
-    }
-}
 pub fn pem(value: &str) -> Result<Vec<u8>> {
-    if let Some(path) = value.strip_prefix("file:") {
-        fs::read(path).with_context(|| format!("read {path}"))
-    } else {
-        let path = resolve(value)?;
-        fs::read(&path).with_context(|| format!("read {path}"))
-    }
+    let file = path(value)?;
+    fs::read(&file).with_context(|| format!("read {}", file.display()))
 }
 pub fn headers(values: &BTreeMap<String, String>) -> Result<HeaderMap> {
     let mut normalized = BTreeMap::new();

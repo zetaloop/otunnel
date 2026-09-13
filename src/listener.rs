@@ -46,7 +46,7 @@ pub(crate) enum Listener {
 impl Listener {
     pub async fn bind(config: &Health) -> Result<(Self, String)> {
         if let Some(socket) = &config.unix_socket {
-            let path = std::path::absolute(crate::config::resolve(socket)?)?;
+            let path = std::path::absolute(socket)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -56,7 +56,7 @@ impl Listener {
             );
             return Ok((Self::Local(Local::bind(path)?), url));
         }
-        let address = crate::config::resolve(&config.listen_addr)?;
+        let address = config.listen_addr.clone();
         let address = if address.starts_with(':') {
             format!("0.0.0.0{address}")
         } else {

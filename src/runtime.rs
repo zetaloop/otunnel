@@ -81,22 +81,7 @@ pub struct Tunnel {
 
 impl Tunnel {
     pub fn new(mut config: Config) -> Result<Self> {
-        for name in config
-            .mcp
-            .commands
-            .iter_mut()
-            .map(|command| &mut command.channel)
-            .chain(
-                config
-                    .mcp
-                    .server_urls
-                    .iter_mut()
-                    .map(|server| &mut server.channel),
-            )
-            .chain(config.control_plane.poll_channels.iter_mut())
-        {
-            *name = crate::config::channel(name)?;
-        }
+        config.normalize()?;
         let control = Arc::new(Control::new(&config)?);
         let harpoon = Arc::new(crate::harpoon::Harpoon::new(&config)?);
         let probe = config
