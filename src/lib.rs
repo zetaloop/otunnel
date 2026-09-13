@@ -21,6 +21,7 @@ mod oauth;
 pub mod process;
 pub mod protocol;
 mod proxy;
+mod proxy_health;
 pub mod runtime;
 pub mod template;
 pub use anyhow::{Error, Result};

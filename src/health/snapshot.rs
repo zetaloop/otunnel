@@ -78,6 +78,7 @@ fn components(monitor: &Monitor, state: &Snapshot) -> BTreeMap<&'static str, Val
     let config = &monitor.config;
     let polling = &state.control;
     let mut components = BTreeMap::new();
+    components.insert("proxy", proxy(&state.proxy));
     let pressure = state.activity.pressure_started > 0.0;
     let poll_state = if state.lifecycle == "draining" {
         "stopped"
@@ -257,6 +258,56 @@ fn components(monitor: &Monitor, state: &Snapshot) -> BTreeMap<&'static str, Val
     components.insert("cloudflared", component(status, phase, reason, state.cloudflare_observed_at,
         json!({"enabled":state.cloudflare_ready.is_some(),"ready":state.cloudflare_ready==Some(true)})));
     components
+}
+
+fn proxy(snapshot: &crate::proxy_health::Snapshot) -> Value {
+    let proxied = snapshot.routes.iter().any(|route| route.state != "direct");
+    let pending = snapshot.routes.iter().any(|route| route.state == "pending");
+    let failed = snapshot
+        .routes
+        .iter()
+        .any(|route| route.state == "unhealthy");
+    let routes: Vec<_> = snapshot
+        .routes
+        .iter()
+        .take(16)
+        .enumerate()
+        .map(|(index, route)| {
+            let mut value = json!({
+                "label":format!("route-{}", index + 1),
+                "kind":route.kind,
+                "state":route.state,
+            });
+            if !route.failure.is_empty() {
+                value["failure_category"] = json!(route.failure);
+            }
+            if route.last_check > 0.0 {
+                value["last_check"] = json!(route.last_check);
+            }
+            if route.last_success > 0.0 {
+                value["last_success"] = json!(route.last_success);
+            }
+            value
+        })
+        .collect();
+    let (status, state, reason) = if failed {
+        ("degraded", "unhealthy", "route_check_failed")
+    } else if pending {
+        ("unknown", "pending", "")
+    } else if proxied {
+        ("ok", "healthy", "")
+    } else {
+        ("disabled", "direct", "")
+    };
+    let mut value = component(
+        status,
+        state,
+        reason,
+        snapshot.observed_at,
+        json!({"route_count":snapshot.routes.len(),"routes":routes}),
+    );
+    value["limited"] = json!(snapshot.routes.len() > 16);
+    value
 }
 
 pub(super) async fn health(State(monitor): State<Monitor>, request: Request) -> Response {

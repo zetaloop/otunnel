@@ -102,10 +102,6 @@ impl Config {
                 self.admin_ui.log_buffer_events != defaults.log_buffer_events,
             ),
             ("harpoon.capture_payloads", self.harpoon.capture_payloads),
-            (
-                "proxy.check_interval",
-                self.proxy.check_interval.0 != Proxy::default().check_interval.0,
-            ),
         ] {
             anyhow::ensure!(!enabled, "{name} must retain its default in otunnel");
         }
@@ -190,6 +186,10 @@ impl Config {
             self.control_plane.poll_timeout.0
                 <= Duration::from_secs(600) - self.control_plane.poll_deadline_guardrail.0,
             "control-plane.poll-timeout plus control-plane.poll-deadline-guardrail must be less than or equal to 10m0s"
+        );
+        anyhow::ensure!(
+            !self.proxy.check_interval.0.is_zero(),
+            "proxy.check-interval must be positive"
         );
         if let Some(limit) = self.harpoon.max_response_bytes {
             anyhow::ensure!(limit > 0, "harpoon.max-response-bytes must be positive");

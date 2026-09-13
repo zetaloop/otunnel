@@ -37,6 +37,7 @@ pub struct Snapshot {
     pub lifecycle: &'static str,
     pub cloudflare_ready: Option<bool>,
     pub cloudflare_observed_at: f64,
+    pub proxy: crate::proxy_health::Snapshot,
     pub started_at: u64,
     pub channels: BTreeMap<String, Probe>,
     pub evidence: BTreeMap<String, serde_json::Value>,
@@ -73,6 +74,7 @@ pub struct Tunnel {
     config: Config,
     control: Arc<Control>,
     harpoon: Arc<crate::harpoon::Harpoon>,
+    proxy: Arc<crate::proxy_health::Checker>,
     bindings: BTreeMap<String, Arc<dyn Transport>>,
     children: JoinSet<Result<()>>,
     observers: JoinSet<()>,
@@ -85,6 +87,7 @@ impl Tunnel {
         config.normalize()?;
         let control = Arc::new(Control::new(&config)?);
         let harpoon = Arc::new(crate::harpoon::Harpoon::new(&config)?);
+        let proxy = Arc::new(crate::proxy_health::Checker::new(&config)?);
         let probe = config
             .mcp
             .server_urls
@@ -103,6 +106,7 @@ impl Tunnel {
             },
             cloudflare_ready: (config.cloudflared.managed || config.cloudflared.token.is_some())
                 .then_some(false),
+            proxy: proxy.status().borrow().clone(),
             control: control.connection().borrow().clone(),
             lifecycle: "starting",
             started_at: SystemTime::now()
@@ -114,6 +118,7 @@ impl Tunnel {
             config,
             control,
             harpoon,
+            proxy,
             bindings: BTreeMap::new(),
             children: JoinSet::new(),
             observers: JoinSet::new(),

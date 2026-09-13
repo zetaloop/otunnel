@@ -137,6 +137,21 @@ pub(super) async fn probe(transport: &dyn Transport, wait: Duration, tools: bool
 
 impl Tunnel {
     pub(super) fn observe(&mut self) {
+        let proxy = self.proxy.clone();
+        let stop = self.stop.clone();
+        self.observers.spawn(async move { proxy.run(stop).await });
+        let mut proxy = self.proxy.status();
+        let state = self.state.clone();
+        let stop = self.stop.clone();
+        self.observers.spawn(async move {
+            loop {
+                state.send_modify(|state| state.proxy = proxy.borrow_and_update().clone());
+                tokio::select! {
+                    result = proxy.changed() => if result.is_err() { return; },
+                    () = stop.cancelled() => return,
+                }
+            }
+        });
         if let Some(main) = self
             .bindings
             .get("main")
