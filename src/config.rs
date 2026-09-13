@@ -100,9 +100,30 @@ impl Config {
             // A version-two profile is a single YAML document, including empty trailing documents.
             serde_saphyr::from_str::<Self>(text)?;
         }
+        config.scope()?;
         Ok(config)
     }
+    fn scope(&self) -> Result<()> {
+        let defaults = AdminUi::default();
+        for (name, enabled) in [
+            ("admin_ui.allow_remote", self.admin_ui.allow_remote),
+            ("admin_ui.open_browser", self.admin_ui.open_browser),
+            (
+                "admin_ui.log_buffer_events",
+                self.admin_ui.log_buffer_events != defaults.log_buffer_events,
+            ),
+            ("harpoon.capture_payloads", self.harpoon.capture_payloads),
+            (
+                "proxy.check_interval",
+                self.proxy.check_interval.0 != Proxy::default().check_interval.0,
+            ),
+        ] {
+            anyhow::ensure!(!enabled, "{name} must retain its default in otunnel");
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<()> {
+        self.scope()?;
         anyhow::ensure!(
             self.config_version
                 .is_none_or(|version| matches!(version, 1 | 2)),
@@ -173,6 +194,7 @@ settings!(ControlPlane {
     organization_id: Option<String> = None,
     max_inflight_requests: usize = 20,
     poll_timeout: Span = Span(Duration::from_secs(30)),
+    #[serde(skip)]
     initial_poll_timeout: Span = Span(Duration::from_secs(30)),
     poll_deadline_guardrail: Span = Span(Duration::from_secs(5)),
     poll_channels: Vec<String> = Vec::new(),
@@ -201,32 +223,48 @@ settings!(Server {
     http_proxy: Option<String> = None,
     client_cert: Option<String> = None,
     client_key: Option<String> = None,
-    command: Option<Invocation> = None,
-    cwd: Option<String> = None,
-    env: BTreeMap<String, String> = BTreeMap::new(),
 });
 settings!(Command {
     channel: String = main_channel(),
-    command: Invocation = Invocation::Text(String::new()),
-    cwd: Option<String> = None,
-    env: BTreeMap<String, String> = BTreeMap::new(),
+    command: String = String::new(),
 });
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Invocation {
-    Text(String),
-    Args(Vec<String>),
-}
-impl Invocation {
-    pub fn args(&self) -> Result<Vec<String>> {
-        let args = match self {
-            Self::Text(value) => shell_words::split(&resolve(value)?)?,
-            Self::Args(args) => args.clone(),
-        };
-        anyhow::ensure!(!args.is_empty(), "command is empty");
-        Ok(args)
+pub fn command_args(value: &str) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in value.trim().chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+        } else if quote == Some('\'') {
+            if character == '\'' {
+                quote = None;
+            } else {
+                word.push(character);
+            }
+        } else {
+            match character {
+                '\\' => escaped = true,
+                '"' => quote = if quote.is_some() { None } else { Some('"') },
+                '\'' if quote.is_none() => quote = Some('\''),
+                ' ' | '\t' | '\n' | '\r' if quote.is_none() => {
+                    if !word.is_empty() {
+                        args.push(std::mem::take(&mut word));
+                    }
+                }
+                _ => word.push(character),
+            }
+        }
     }
+    anyhow::ensure!(!escaped, "unterminated escape sequence");
+    anyhow::ensure!(quote.is_none(), "unterminated quoted string");
+    if !word.is_empty() {
+        args.push(word);
+    }
+    anyhow::ensure!(!args.is_empty(), "command is empty");
+    Ok(args)
 }
 
 settings!(Harpoon {
@@ -245,7 +283,6 @@ settings!(Harpoon {
 settings!(Target {
     label: String = String::new(),
     url: String = String::new(),
-    #[serde(alias = "desc")]
     description: String = String::new(),
     unix_socket: Option<String> = None,
     template: Option<crate::template::Definition> = None,

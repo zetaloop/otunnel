@@ -148,22 +148,13 @@ impl Tunnel {
         let mut pipes = Vec::new();
         for command in &self.config.mcp.commands {
             let enabled = self.config.enabled(&command.channel);
-            let mut process = Process::spawn(
-                &command.command,
-                command.cwd.as_deref(),
-                &command.env,
-                enabled,
-            )?;
+            let mut process = Process::spawn(&command.command, enabled)?;
             if enabled {
                 pipes.push((command.channel.clone(), process.pipes()?));
             }
             self.children.spawn(process.supervise(self.stop.clone()));
         }
         for server in &self.config.mcp.server_urls {
-            if let Some(command) = &server.command {
-                let process = Process::spawn(command, server.cwd.as_deref(), &server.env, false)?;
-                self.children.spawn(process.supervise(self.stop.clone()));
-            }
             if self.config.enabled(&server.channel) {
                 anyhow::ensure!(
                     !self.bindings.contains_key(&server.channel),

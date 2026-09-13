@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Arg, ArgMatches, Command};
-use otunnel::config::{self, Config, Invocation};
+use otunnel::config::{self, Config};
 use serde_json::json;
 
 const SAMPLES: &[(&str, &str)] = &[
@@ -276,7 +276,7 @@ pub fn init(arguments: &ArgMatches) -> Result<u8> {
     validate(&data)?;
     let command = text(arguments, "mcp-command");
     if !command.is_empty() {
-        preflight(&Invocation::Text(command).args()?, 0)?;
+        preflight(&config::command_args(&command)?, 0)?;
     }
     let path = config::profile_path(name, Some(&text(arguments, "profile-dir")))?;
     write(&path, data.as_bytes(), arguments.get_flag("force"))?;
@@ -346,6 +346,10 @@ impl From<&ArgMatches> for Values {
 }
 fn generate(name: &str, mut values: Values) -> Result<String> {
     sample(name)?;
+    anyhow::ensure!(
+        !values.browser,
+        "admin_ui.open_browser must retain its default in otunnel"
+    );
     anyhow::ensure!(
         values
             .tunnel

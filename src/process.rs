@@ -1,11 +1,9 @@
-use std::{collections::BTreeMap, process::Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio_util::sync::CancellationToken;
-
-use crate::config::{Invocation, resolve};
 
 /// Report whether a process exists without changing its state.
 pub fn running(pid: u32) -> bool {
@@ -49,29 +47,18 @@ pub struct Process {
     child: Box<dyn ChildWrapper>,
 }
 impl Process {
-    pub fn spawn(
-        invocation: &Invocation,
-        cwd: Option<&str>,
-        env: &BTreeMap<String, String>,
-        piped: bool,
-    ) -> Result<Self> {
-        let args = invocation.args()?;
+    pub fn spawn(invocation: &str, piped: bool) -> Result<Self> {
+        let args = crate::config::command_args(invocation)?;
         let mut command = Command::new(&args[0]);
         command
             .args(&args[1..])
             .stdin(Stdio::piped())
             .stderr(Stdio::inherit());
-        if piped {
-            command.stdout(Stdio::piped());
+        command.stdout(if piped {
+            Stdio::piped()
         } else {
-            command.stdout(Stdio::inherit());
-        }
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
-        for (key, value) in env {
-            command.env(key, resolve(value)?);
-        }
+            Stdio::inherit()
+        });
         Self::launch(command)
     }
     pub fn launch(command: Command) -> Result<Self> {

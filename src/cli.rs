@@ -617,6 +617,7 @@ fn load(matches: &ArgMatches) -> Result<Config> {
     }
     let source = source(matches)?;
     let config = source.map(Config::read).transpose()?.unwrap_or_default();
+    let mut initial_poll_timeout = config.control_plane.initial_poll_timeout;
     let mut value = serde_json::to_value(config)?;
     for (name, _, pointer, kind, _) in SETTINGS {
         let selected = if matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine)
@@ -718,24 +719,20 @@ fn load(matches: &ArgMatches) -> Result<Config> {
             Servers | Commands | Targets => Value::Array(
                 arguments
                     .iter()
-                    .map(|value| {
-                        mapping(
-                            value,
-                            if matches!(kind, Commands) {
-                                "command"
-                            } else {
-                                "url"
-                            },
-                        )
-                    })
+                    .map(|value| mapping(value, *kind))
                     .collect::<Result<_>>()?,
             ),
         };
+        if *name == "control-plane.initial-poll-timeout" {
+            initial_poll_timeout = serde_json::from_value(parsed)?;
+            continue;
+        }
         *value
             .pointer_mut(pointer)
             .context("configuration field is missing")? = parsed;
     }
     let mut config: Config = serde_json::from_value(value)?;
+    config.control_plane.initial_poll_timeout = initial_poll_timeout;
     if config.control_plane.api_key.is_empty()
         && let Ok(key) = env::var("OPENAI_API_KEY")
     {
@@ -744,31 +741,106 @@ fn load(matches: &ArgMatches) -> Result<Config> {
     Ok(config)
 }
 
-fn mapping(value: &str, primary: &str) -> Result<Value> {
-    if value.trim_start().starts_with('{') {
-        return Ok(serde_json::from_str(value)?);
+fn mapping(value: &str, kind: Kind) -> Result<Value> {
+    let entry = value.trim();
+    let qualified = [
+        "url=",
+        "command=",
+        "channel=",
+        "unix-socket=",
+        "http-proxy=",
+        "client-cert=",
+        "client-key=",
+    ]
+    .iter()
+    .any(|prefix| entry.to_ascii_lowercase().starts_with(prefix));
+    if matches!(kind, Commands) {
+        let (channel, command) = if !qualified {
+            ("main", value)
+        } else if let Some(entry) = entry.strip_prefix("channel=") {
+            let (channel, rest) = entry
+                .split_once(',')
+                .context("command entry is missing command")?;
+            (
+                channel.trim(),
+                rest.trim()
+                    .strip_prefix("command=")
+                    .context("command entry requires command=...")?
+                    .trim(),
+            )
+        } else {
+            let command = entry
+                .strip_prefix("command=")
+                .context("command entry requires command=...")?
+                .trim();
+            command
+                .rsplit_once(",channel=")
+                .map_or(("main", command), |(command, channel)| {
+                    (channel.trim(), command.trim())
+                })
+        };
+        if qualified {
+            for key in [
+                "http-proxy",
+                "url",
+                "unix-socket",
+                "client-cert",
+                "client-key",
+            ] {
+                anyhow::ensure!(
+                    !command.to_ascii_lowercase().contains(&format!(",{key}=")),
+                    "unsupported stdio field {key}"
+                );
+            }
+        }
+        otunnel::config::command_args(command)?;
+        return Ok(json!({"channel":otunnel::config::channel(channel)?, "command":command}));
     }
-    let structured = value
-        .trim_start_matches('"')
-        .split_once('=')
-        .is_some_and(|(name, _)| {
-            name.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-            })
-        });
-    if !structured {
-        return Ok(json!({primary:value}));
+    if matches!(kind, Servers) && !qualified {
+        return Ok(json!({"url":value}));
     }
     let mut result = serde_json::Map::new();
-    let mut csv = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .from_reader(value.as_bytes());
-    let record = csv.records().next().context("empty channel definition")??;
-    for field in &record {
+    for field in entry
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+    {
         let (key, value) = field
             .split_once('=')
             .context("channel fields use name=value")?;
-        result.insert(key.trim().replace('-', "_"), json!(value.trim()));
+        let mut key = key.trim().replace('-', "_");
+        let mut value = value.trim();
+        if matches!(kind, Targets) {
+            key.make_ascii_lowercase();
+            value = value.trim_matches(['\"', '\'']);
+            if key == "desc" {
+                key = "description".into();
+            } else if !["label", "url", "unix_socket"].contains(&key.as_str()) {
+                continue;
+            }
+        } else {
+            anyhow::ensure!(
+                !key.is_empty() && !value.is_empty(),
+                "channel fields must not be empty"
+            );
+        }
+        result.insert(key, json!(value));
+    }
+    anyhow::ensure!(
+        result
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.is_empty()),
+        "target URL is required"
+    );
+    if matches!(kind, Targets) {
+        anyhow::ensure!(
+            result
+                .get("label")
+                .and_then(Value::as_str)
+                .is_some_and(|label| !label.is_empty()),
+            "target label is required"
+        );
     }
     Ok(Value::Object(result))
 }
