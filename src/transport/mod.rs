@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 
 use crate::protocol::{self, Reply, Request};
 
+mod failure;
+pub(crate) use failure::Failure;
 mod http;
 mod observation;
 mod pipe;

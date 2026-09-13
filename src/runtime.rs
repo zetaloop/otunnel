@@ -566,7 +566,36 @@ async fn execute(
     }
     let delivery = Delivery::new(control.clone(), &command);
     let headers = protocol::header_map(&command.headers)?;
-    let binding = bindings.get(&command.channel);
+    let Some(binding) = bindings.get(&command.channel) else {
+        let message = format!("unsupported channel {:?}", command.channel);
+        let mut reply = match command.command_type.as_str() {
+            "jsonrpc" => {
+                let request = Request {
+                    discovery: false,
+                    message: command.jsonrpc.context("JSON-RPC command has no payload")?,
+                    headers,
+                };
+                let id = protocol::view(&request.message)?.id;
+                let mut reply = Reply::json(serde_json::value::to_raw_value(&serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "error":{"code":-32603,"message":format!("Bad Request: {message}")}
+                }))?);
+                reply.status = 400;
+                reply
+            }
+            "oauth_discovery" => {
+                let mut reply = Reply::ack(400, "oauth_discovery_response");
+                reply.message = Some(serde_json::value::to_raw_value(&serde_json::json!({
+                    "error":{"message":message,"type":"invalid_request_error","code":"unsupported_channel"}
+                }))?);
+                reply
+            }
+            _ => Reply::ack(400, "session_termination_response"),
+        };
+        reply.headers.clear();
+        delivery.send(reply).await?;
+        bail!(message);
+    };
     match command.command_type.as_str() {
         "jsonrpc" => {
             let request = Request {
@@ -574,21 +603,13 @@ async fn execute(
                 message: command.jsonrpc.context("JSON-RPC command has no payload")?,
                 headers,
             };
-            let outcome = match binding {
-                Some(binding) => {
-                    let forward = binding.forward(request.clone(), &delivery);
-                    match ttl {
-                        Some(ttl) => timeout(ttl, forward)
-                            .await
-                            .context("MCP connection lifetime exceeded")
-                            .and_then(|result| result),
-                        None => forward.await,
-                    }
-                }
-                None => Err(anyhow::anyhow!(
-                    "channel {} is unavailable",
-                    command.channel
-                )),
+            let forward = binding.forward(request.clone(), &delivery);
+            let outcome = match ttl {
+                Some(ttl) => timeout(ttl, forward)
+                    .await
+                    .context("MCP connection lifetime exceeded")
+                    .and_then(|result| result),
+                None => forward.await,
             };
             if let Err(error) = outcome {
                 if error
@@ -604,17 +625,16 @@ async fn execute(
                 {
                     return Err(error);
                 }
+                tracing::warn!(%error, "MCP forwarding failed");
                 delivery
-                    .send(Reply::error(&request, 502, -32603, format!("{error:#}"))?)
+                    .send(transport::Failure::from_error(&error).reply(&request)?)
                     .await?;
             } else if !delivery.terminal_started() {
                 delivery
-                    .send(Reply::error(
-                        &request,
-                        502,
-                        -32603,
-                        "MCP stream ended without a terminal response",
-                    )?)
+                    .send(
+                        transport::Failure::protocol(0, "invalid_protocol_response")
+                            .reply(&request)?,
+                    )
                     .await?;
             }
         }
@@ -624,12 +644,10 @@ async fn execute(
             } else {
                 "oauth_discovery_response"
             };
-            let outcome = match binding {
-                Some(binding) if command.command_type == "session_termination" => {
-                    binding.terminate(headers, false).await
-                }
-                Some(binding) => binding.discover().await,
-                None => Ok(Reply::ack(404, kind)),
+            let outcome = if command.command_type == "session_termination" {
+                binding.terminate(headers, false).await
+            } else {
+                binding.discover().await
             };
             let reply = match outcome {
                 Ok(reply) => reply,

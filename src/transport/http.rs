@@ -15,7 +15,7 @@ use http::{HeaderMap, Method};
 use serde_json::{json, value::RawValue};
 use url::Url;
 
-use super::{Sink, Transport};
+use super::{Failure, Sink, Transport};
 use crate::{
     config,
     net::{Http, Options},
@@ -211,6 +211,11 @@ impl Transport for HttpTransport {
                 request.discovery,
             )
             .await?;
+        if !response.status.is_success() {
+            return sink
+                .send(Failure::response(&request, response).await?)
+                .await;
+        }
         let Some(id) = id else {
             let mut reply = Reply::ack(response.status.as_u16(), "notify_ack");
             reply.headers = wire_headers(&response.headers, true);
@@ -240,22 +245,27 @@ impl Transport for HttpTransport {
                     view(message).is_ok_and(|v| {
                         v.method.is_none()
                             && v.id.is_some_and(|value| protocol::same_id(value, &id))
-                            && (v.error.is_some() || v.result.is_some())
+                            && protocol::field(message, "jsonrpc").is_some_and(|value| {
+                                serde_json::from_str::<String>(value.get())
+                                    .is_ok_and(|value| value == "2.0")
+                            })
+                            && (protocol::field(message, "error").is_some()
+                                != protocol::field(message, "result").is_some())
                     })
                 });
                 let mut reply = if valid {
                     self.observe(&request, message.as_ref().expect("validated response"))?;
                     Reply::json(message.expect("validated response"))
                 } else {
-                    Reply::error(
-                        &request,
-                        status.as_u16(),
-                        -32603,
-                        format!("MCP endpoint returned HTTP {status} without a JSON-RPC response"),
-                    )?
+                    Failure::protocol(0, "invalid_protocol_response").reply(&request)?
                 };
-                reply.status = status.as_u16();
+                if valid {
+                    reply.status = status.as_u16();
+                }
                 reply.headers = response_headers;
+                reply
+                    .headers
+                    .insert("Content-Type".into(), vec!["application/json".into()]);
                 return sink.send(reply).await;
             }
             anyhow::ensure!(
