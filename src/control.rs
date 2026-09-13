@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -83,6 +83,8 @@ pub struct Control {
     poll_timeout: Duration,
     initial_poll_timeout: Duration,
     guard: Duration,
+    learned_poll_ms: AtomicU64,
+    uses_proxy: bool,
     observations: watch::Sender<Observation>,
 }
 
@@ -139,6 +141,7 @@ impl Control {
             .collect::<Result<Vec<_>>>()?;
         subscriptions.sort();
         subscriptions.dedup();
+        let uses_proxy = http.proxied(&url)?;
         Ok(Self {
             http,
             url,
@@ -148,6 +151,8 @@ impl Control {
             poll_timeout: cp.poll_timeout.0,
             initial_poll_timeout: cp.initial_poll_timeout.0,
             guard: cp.poll_deadline_guardrail.0,
+            learned_poll_ms: AtomicU64::new(0),
+            uses_proxy,
             observations: watch::channel(Observation {
                 instance_id,
                 ..Default::default()
@@ -255,35 +260,53 @@ impl Control {
         .context("tunnel metadata request timed out")?
     }
 
-    pub async fn poll(&self, limit: usize, initial: bool) -> Result<Batch> {
-        let duration = if initial {
-            self.initial_poll_timeout.min(self.poll_timeout)
-        } else {
-            self.poll_timeout
-        };
-        let mut url = self.endpoint("poll")?;
-        {
-            let mut query = url.query_pairs_mut();
-            for channel in &self.subscriptions {
-                query.append_pair("channel", channel);
-            }
-            query.append_pair("limit", &limit.clamp(1, 25).to_string());
-            query.append_pair("timeout_ms", &duration.as_millis().to_string());
+    pub async fn poll(&self, limit: usize, mut initial: bool) -> Result<Batch> {
+        if limit == 0 {
+            return Ok(Batch {
+                received: Instant::now(),
+                commands: Vec::new(),
+            });
         }
         let mut attempt = 0;
         loop {
+            let learned = self.learned_poll_ms.load(Ordering::Relaxed);
+            let duration = if learned == 0 {
+                self.poll_timeout
+            } else {
+                self.poll_timeout.min(Duration::from_millis(learned))
+            };
+            let requested = if initial {
+                self.initial_poll_timeout.min(duration)
+            } else {
+                duration
+            };
+            initial = false;
+            let mut url = self.endpoint("poll")?;
+            {
+                let mut query = url.query_pairs_mut();
+                for channel in &self.subscriptions {
+                    query.append_pair("channel", channel);
+                }
+                query.append_pair("limit", &limit.min(25).to_string());
+                query.append_pair("timeout_ms", &requested.as_millis().max(1).to_string());
+            }
+            let started = Instant::now();
+            let mut received_headers = false;
+            let mut response_status = 0;
             self.observations.send_modify(|state| {
                 state.last_attempt = now();
                 state.next_retry = 0.0;
                 state.cycles += 1;
             });
-            let result = timeout(self.poll_timeout + self.guard, async {
+            let result = timeout(duration + self.guard, async {
                 let response = self
                     .http
                     .send(Method::GET, &url, self.headers(), Bytes::new())
                     .await?;
+                received_headers = true;
                 let received = Instant::now();
                 let status = response.status.as_u16();
+                response_status = status;
                 let headers = response.headers.clone();
                 let commands = if status == 204 {
                     Vec::new()
@@ -295,6 +318,33 @@ impl Control {
                 Ok(Ok(Batch { received, commands }))
             })
             .await;
+            if self.uses_proxy
+                && !received_headers
+                && let Ok(Err(error)) = &result
+                && !crate::net::connecting(error)
+                && error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+                        || cause
+                            .downcast_ref::<hyper::Error>()
+                            .is_some_and(hyper::Error::is_incomplete_message)
+                })
+            {
+                let elapsed = started.elapsed();
+                let minimum = Duration::from_secs(5);
+                if requested > minimum && elapsed > minimum && elapsed < duration + self.guard {
+                    let margin = self.guard.max(minimum).min(elapsed / 2);
+                    let adjusted = (elapsed - margin).max(minimum).as_millis() as u64;
+                    if Duration::from_millis(adjusted) < requested {
+                        self.learned_poll_ms
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                (current == 0 || adjusted < current).then_some(adjusted)
+                            })
+                            .ok();
+                    }
+                }
+            }
             let connected = matches!(&result, Ok(Ok(Ok(_))));
             self.observations.send_modify(|state| {
                 state.connected = connected;
@@ -303,7 +353,7 @@ impl Control {
                         state.last_success = now();
                         state.consecutive_failures = 0;
                         state.commands += batch.commands.len() as u64;
-                        state.http_status = 200;
+                        state.http_status = response_status;
                     }
                     _ => {
                         state.last_error = now();

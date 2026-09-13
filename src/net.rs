@@ -142,6 +142,13 @@ impl Http {
         })
     }
 
+    pub(crate) fn proxied(&self, url: &Url) -> Result<bool> {
+        if self.local.is_some() && url.origin() == self.origin.origin() {
+            return Ok(false);
+        }
+        Ok(self.proxy.select(url)?.is_some())
+    }
+
     pub async fn send(
         &self,
         method: Method,
