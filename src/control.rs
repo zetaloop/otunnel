@@ -501,10 +501,9 @@ impl Control {
             headers.insert("x-tunnel-shard-token", shard);
             headers.insert("content-type", HeaderValue::from_static("application/json"));
             let url = self.endpoint("response")?;
-            let mut attempt = 0;
-            loop {
+            for attempt in 0..3 {
                 receipt.attempt(attempt != 0);
-                let response = timeout(Duration::from_secs(30), async {
+                let response = timeout(self.poll_timeout + self.guard, async {
                     let response = self
                         .http
                         .send(Method::POST, &url, headers.clone(), body.clone())
@@ -523,7 +522,7 @@ impl Control {
                 .await;
                 match &response {
                     Ok(Ok((status, _)))
-                        if !status.is_success()
+                        if status.as_u16() != 200
                             && !(status.as_u16() == 404 && reply.terminal()) =>
                     {
                         receipt.failure("http_error", status.as_u16())
@@ -535,11 +534,12 @@ impl Control {
                 let retry_headers = match response {
                     Ok(Ok((status, headers))) => {
                         let code = status.as_u16();
-                        if status.is_success() || (code == 404 && reply.terminal()) {
+                        if code == 200 || (code == 404 && reply.terminal()) {
                             return Ok(code);
                         }
-                        if code == 429
-                            || (reply.terminal() && matches!(code, 408 | 502 | 503 | 504))
+                        if attempt < 2
+                            && (code == 429
+                                || (reply.terminal() && matches!(code, 408 | 502 | 503 | 504)))
                         {
                             headers
                         } else {
@@ -550,17 +550,19 @@ impl Control {
                             .into());
                         }
                     }
-                    Ok(Err(error)) if reply.terminal() || crate::net::connecting(&error) => {
+                    Ok(Err(error))
+                        if attempt < 2 && (reply.terminal() || crate::net::connecting(&error)) =>
+                    {
                         tracing::debug!(%error, "retrying tunnel response delivery");
                         HeaderMap::new()
                     }
                     Ok(Err(error)) => return Err(error),
-                    Err(_) if reply.terminal() => HeaderMap::new(),
-                    Err(_) => bail!("notification delivery timed out"),
+                    Err(_) if attempt < 2 && reply.terminal() => HeaderMap::new(),
+                    Err(error) => return Err(error).context("tunnel response delivery timed out"),
                 };
                 tokio::time::sleep(retry_delay(attempt, &retry_headers)).await;
-                attempt = attempt.saturating_add(1);
             }
+            unreachable!()
         }
         .await;
         receipt.finish(&result);
@@ -570,25 +572,26 @@ impl Control {
 
 fn retry_delay(attempt: u32, headers: &HeaderMap) -> Duration {
     let local = Duration::from_secs_f64(
-        (0.25 * 2_f64.powi(attempt.min(7) as i32) * (0.5 + rand::random::<f64>())).min(30.0),
+        (0.2 + rand::random::<f64>() * (0.2 * 2_f64.powi(attempt.min(63) as i32) - 0.2)).min(10.0),
     );
     let server = headers
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| {
-            value
-                .parse::<u64>()
-                .ok()
-                .map(Duration::from_secs)
-                .or_else(|| {
-                    httpdate::parse_http_date(value)
-                        .ok()?
-                        .duration_since(SystemTime::now())
-                        .ok()
-                })
+            let value = value.trim();
+            if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+                Some(Duration::from_secs(
+                    value.parse::<u64>().unwrap_or(60).min(60),
+                ))
+            } else {
+                httpdate::parse_http_date(value)
+                    .ok()?
+                    .duration_since(SystemTime::now())
+                    .ok()
+            }
         })
         .unwrap_or_default()
-        .min(Duration::from_secs(300));
+        .min(Duration::from_secs(60));
     local.max(server)
 }
 
