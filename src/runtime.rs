@@ -130,7 +130,7 @@ impl Tunnel {
         self.harpoon.clone()
     }
 
-    async fn prepare(&mut self) -> Result<()> {
+    async fn prepare(&mut self, diagnostic: bool) -> Result<()> {
         if self.config.cloudflared.managed || self.config.cloudflared.token.is_some() {
             let companion =
                 crate::cloudflare::Companion::new(&self.config.cloudflared, &self.control).await?;
@@ -183,13 +183,29 @@ impl Tunnel {
                 !self.bindings.contains_key(&channel),
                 "duplicate channel {channel}"
             );
-            let pipe = timeout(probe_timeout, Pipe::new(reader, writer))
-                .await
-                .with_context(|| format!("channel {channel} initialization timed out"))??;
+            let pipe = Pipe::new(reader, writer)
+                .await?
+                .send_initialized_notification(self.config.mcp.stdio_send_initialized_notification);
             self.bindings.insert(channel, Arc::new(pipe));
         }
         for (name, transport) in &self.bindings {
             if !transport.available() {
+                continue;
+            }
+            if !diagnostic && !transport.startup_probe() {
+                self.state.send_modify(|state| {
+                    state.channels.insert(
+                        name.clone(),
+                        transport::Probe {
+                            status: 200,
+                            authentication_required: false,
+                            server: None,
+                            tools: None,
+                            oauth_status: None,
+                            oauth_error: None,
+                        },
+                    );
+                });
                 continue;
             }
             let deadline = Instant::now() + probe_timeout;
@@ -278,7 +294,7 @@ impl Tunnel {
                 |error| format!("{error:#}"),
             ),
         });
-        match self.prepare().await {
+        match self.prepare(true).await {
             Ok(()) => checks.push(Check {
                 name: "mcp".into(),
                 passed: true,
@@ -318,7 +334,7 @@ impl Tunnel {
             self.config.validate()?;
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
-                result = self.prepare() => result?,
+                result = self.prepare(false) => result?,
             }
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),

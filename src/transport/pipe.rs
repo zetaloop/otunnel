@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -20,7 +20,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{Sink, Transport, exchange};
+use super::{Sink, Transport};
 use crate::protocol::{self, Json, Reply, Request, field, replace, view};
 
 struct Pending {
@@ -42,12 +42,12 @@ struct State {
 }
 
 /// A multiplexed MCP connection over newline-delimited JSON.
-/// The connection owns one downstream initialization and exposes independent upstream sessions.
 pub struct Pipe {
     state: Arc<State>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    initialization: Option<Json>,
-    stateless: bool,
+    send_initialized: bool,
+    initialized: AtomicBool,
+    stateless: AtomicBool,
 }
 
 impl Pipe {
@@ -125,37 +125,24 @@ impl Pipe {
                 .expect("routing mutex poisoned")
                 .clear();
         });
-        let mut pipe = Self {
+        Ok(Self {
             state,
             tasks: Mutex::new(vec![reader, writer]),
-            initialization: None,
-            stateless: false,
-        };
-        let (reply, stateless) = super::negotiate(&pipe).await?;
-        let message = reply.message.context("MCP discovery response is empty")?;
-        let envelope = view(&message)?;
-        let result = envelope
-            .result
-            .with_context(|| {
-                format!(
-                    "MCP discovery failed: {}",
-                    envelope.error.map_or("missing result", |error| error.get())
-                )
-            })?
-            .to_owned();
-        pipe.stateless = stateless;
-        if !stateless {
-            exchange(
-                &pipe,
-                Request::new(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))?,
-            )
-            .await?;
-            pipe.initialization = Some(result);
-        }
-        Ok(pipe)
+            send_initialized: false,
+            initialized: AtomicBool::new(false),
+            stateless: AtomicBool::new(false),
+        })
+    }
+
+    pub fn send_initialized_notification(mut self, enabled: bool) -> Self {
+        self.send_initialized = enabled;
+        self
     }
 
     async fn relay(&self, mut request: Request, sink: &dyn Sink) -> Result<()> {
+        let method = view(&request.message)?
+            .method
+            .map(|method| method.into_owned());
         let id = view(&request.message)?.id.map(RawValue::to_owned);
         let Some(id) = id else {
             if view(&request.message)?.method.as_deref() == Some("notifications/cancelled") {
@@ -219,7 +206,31 @@ impl Pipe {
         };
         self.state.write(request.message).await?;
         while let Some(message) = receiver.recv().await {
-            let terminal = view(&message)?.method.is_none();
+            let response = view(&message)?;
+            let terminal = response.method.is_none();
+            if terminal && response.result.is_some() {
+                if method.as_deref() == Some("initialize") && self.send_initialized {
+                    self.state
+                        .write(to_raw_value(
+                            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                        )?)
+                        .await?;
+                    self.initialized.store(true, Ordering::Release);
+                }
+                if method.as_deref() == Some("server/discover") {
+                    let versions = response
+                        .result
+                        .and_then(|result| field(result, "supportedVersions"))
+                        .and_then(|value| serde_json::from_str::<Vec<String>>(value.get()).ok());
+                    if versions.is_some_and(|versions| {
+                        versions
+                            .iter()
+                            .any(|version| version == protocol::MCP_VERSION)
+                    }) {
+                        self.stateless.store(true, Ordering::Release);
+                    }
+                }
+            }
             let mut reply = Reply::json(message);
             if !terminal {
                 reply.kind = "jsonrpc_notify";
@@ -364,20 +375,16 @@ impl Drop for Pipe {
 #[async_trait]
 impl Transport for Pipe {
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
-        if let Some(initialization) = &self.initialization {
-            match view(&request.message)?.method.as_deref() {
-                Some("initialize") => {
-                    let mut reply = protocol::result(&request, initialization)?;
-                    reply.headers.insert(
-                        "Mcp-Session-Id".into(),
-                        vec![uuid::Uuid::new_v4().to_string()],
-                    );
-                    return sink.send(reply).await;
-                }
-                Some("notifications/initialized") => {
+        let envelope = view(&request.message)?;
+        if self.send_initialized {
+            match envelope.method.as_deref() {
+                Some("initialize") => self.initialized.store(false, Ordering::Release),
+                Some("notifications/initialized")
+                    if envelope.id.is_none() && self.initialized.load(Ordering::Acquire) =>
+                {
                     return sink.send(Reply::ack(202, "notify_ack")).await;
                 }
-                _ => (),
+                _ => {}
             }
         }
         self.relay(request, sink).await
@@ -424,6 +431,9 @@ impl Transport for Pipe {
         true
     }
     fn stateless(&self) -> bool {
-        self.stateless
+        self.stateless.load(Ordering::Acquire)
+    }
+    fn startup_probe(&self) -> bool {
+        false
     }
 }

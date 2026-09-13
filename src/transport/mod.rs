@@ -34,6 +34,9 @@ pub trait Transport: Send + Sync {
     async fn closed(&self) -> Result<()> {
         std::future::pending().await
     }
+    fn startup_probe(&self) -> bool {
+        true
+    }
     fn process_affinity(&self) -> bool {
         false
     }
