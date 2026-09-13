@@ -28,7 +28,7 @@ pub(crate) mod headers;
 const INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets and call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
 const TEMPLATE_INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets. For exact targets, use call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. For entries with template_version and parameters_schema, use call_target_template with the label and all parameters declared by parameters_schema; each value must satisfy that schema. Templates make GET requests to a fixed destination and do not follow redirects. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
 
-const SUPPORTED_VERSIONS: [&str; 5] = [
+pub(crate) const SUPPORTED_VERSIONS: [&str; 5] = [
     protocol::MCP_VERSION,
     "2025-11-25",
     "2025-06-18",

@@ -137,10 +137,7 @@ impl Server {
                     .on(MethodFilter::HEAD, harpoon_method)
                     .fallback(harpoon_method)
                     .layer(DefaultBodyLimit::max(MCP_BODY_LIMIT))
-                    .layer(middleware::from_fn_with_state(
-                        state.clone(),
-                        harpoon_access,
-                    )),
+                    .layer(middleware::from_fn(harpoon_access)),
             );
         }
         let router = router.with_state(state);
@@ -157,7 +154,6 @@ impl Server {
 #[derive(Clone)]
 struct HarpoonHttp {
     harpoon: Arc<Harpoon>,
-    localhost: bool,
     sessions: Arc<RwLock<BTreeMap<String, CancellationToken>>>,
 }
 
@@ -181,57 +177,75 @@ fn mcp_session(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-#[derive(Clone)]
-struct Peer(String);
+fn loopback_address(value: &str) -> bool {
+    let host = if let Some(value) = value.strip_prefix('[') {
+        value.split_once(']').map_or(value, |(host, _)| host)
+    } else if value
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b':')
+        .count()
+        == 1
+    {
+        value.split_once(':').map_or(value, |(host, _)| host)
+    } else {
+        value
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+#[derive(Clone, Debug)]
+struct Peer {
+    remote: String,
+    local: String,
+}
 impl Connected<axum::serve::IncomingStream<'_, Listener>> for Peer {
     fn connect_info(stream: axum::serve::IncomingStream<'_, Listener>) -> Self {
-        Self(stream.remote_addr().clone())
+        stream.remote_addr().clone()
     }
 }
 
 async fn harpoon_access(
-    State(state): State<Monitor>,
     ConnectInfo(peer): ConnectInfo<Peer>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if peer.0 != "local"
-        && !peer
-            .0
-            .parse::<std::net::SocketAddr>()
-            .is_ok_and(|address| address.ip().is_loopback())
-    {
+    if peer.remote != "local" && !loopback_address(&peer.remote) {
         return mcp_error(
             StatusCode::FORBIDDEN,
             "harpoon transport is restricted to loopback",
         );
     }
-    if state
-        .harpoon
-        .as_ref()
-        .is_some_and(|server| server.localhost)
+    let host = request
+        .headers()
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if peer.remote != "local" && loopback_address(&peer.local) && !loopback_address(host) {
+        return mcp_error(
+            StatusCode::FORBIDDEN,
+            &format!("Forbidden: invalid Host header {host:?}"),
+        );
+    }
+    let version = request
+        .headers()
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !version.is_empty()
+        && version < protocol::MCP_VERSION
+        && !crate::harpoon::SUPPORTED_VERSIONS.contains(&version)
     {
-        let host = request
-            .headers()
-            .get("host")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        let local = Url::parse(&format!("http://{host}"))
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .is_some_and(|host| {
-                host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|address| address.is_loopback())
-            });
-        if !local {
-            return mcp_error(
-                StatusCode::FORBIDDEN,
-                &format!("Forbidden: invalid Host header {host:?}"),
-            );
-        }
+        return mcp_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "Bad Request: Unsupported protocol version (supported versions: {})",
+                crate::harpoon::SUPPORTED_VERSIONS.join(",")
+            ),
+        );
     }
     next.run(request).await
 }
@@ -275,6 +289,78 @@ fn sse_messages(messages: &[Box<RawValue>]) -> String {
         .iter()
         .map(|message| format!("event: message\ndata: {}\n\n", message.get()))
         .collect()
+}
+
+fn jsonrpc_error(message: &RawValue, code: i32, text: String) -> Response {
+    let id = protocol::view(message)
+        .ok()
+        .and_then(|message| message.id)
+        .and_then(|id| serde_json::from_str::<serde_json::Value>(id.get()).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json")],
+        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":text}})
+            .to_string(),
+    )
+        .into_response()
+}
+
+fn validate_mcp_headers(
+    headers: &HeaderMap,
+    message: &RawValue,
+) -> std::result::Result<(), String> {
+    let version = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if version < protocol::MCP_VERSION {
+        return Ok(());
+    }
+    let envelope = protocol::view(message).map_err(|error| error.to_string())?;
+    let Some(method) = envelope.method.as_deref() else {
+        return Ok(());
+    };
+    let header = headers
+        .get("mcp-method")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if header.is_empty() {
+        return Err("missing required Mcp-Method header".into());
+    }
+    if header != method {
+        return Err(format!(
+            "header mismatch: Mcp-Method header value '{header}' does not match body value '{method}'"
+        ));
+    }
+    let key = match method {
+        "tools/call" | "prompts/get" => Some("name"),
+        "resources/read" => Some("uri"),
+        _ => None,
+    };
+    if let Some(key) = key {
+        let name = headers
+            .get("mcp-name")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if name.is_empty() {
+            return Err(format!(
+                "missing required Mcp-Name header for method {method:?}"
+            ));
+        }
+        let body = protocol::field(message, "params")
+            .and_then(|params| protocol::field(&params, key))
+            .and_then(|value| serde_json::from_str::<String>(value.get()).ok())
+            .ok_or_else(|| {
+                format!("failed to extract name from parameters for method {method:?}")
+            })?;
+        if name != body {
+            return Err(format!(
+                "header mismatch: Mcp-Name header value '{name}' does not match body value '{body}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn harpoon_post(
@@ -355,6 +441,53 @@ async fn harpoon_post(
             Err(_) => return mcp_error(StatusCode::BAD_REQUEST, "invalid JSON-RPC request"),
         }
     };
+    if messages.len() == 1 {
+        let version = headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let meta = protocol::version(&messages[0]).unwrap_or_default();
+        if version >= protocol::MCP_VERSION || !meta.is_empty() {
+            if mcp_session(&headers).is_some()
+                && protocol::view(&messages[0])
+                    .is_ok_and(|request| request.method.as_deref() != Some("server/discover"))
+            {
+                return mcp_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "Bad Request: protocol version {version:?} is only supported on stateless HTTP servers (set StreamableHTTPOptions.Stateless = true)"
+                    ),
+                );
+            }
+            if version.is_empty() {
+                return jsonrpc_error(&messages[0], -32020,
+                    "Mcp-Protocol-Version header is required for requests carrying \"io.modelcontextprotocol/protocolVersion\"".into());
+            }
+            if meta.is_empty() {
+                return jsonrpc_error(
+                    &messages[0],
+                    -32602,
+                    "missing or invalid _meta field \"io.modelcontextprotocol/protocolVersion\""
+                        .into(),
+                );
+            }
+            if version != meta {
+                return jsonrpc_error(
+                    &messages[0],
+                    -32020,
+                    format!(
+                        "Mcp-Protocol-Version header {version:?} does not match request io.modelcontextprotocol/protocolVersion {meta:?}"
+                    ),
+                );
+            }
+        }
+        if let Err(message) = validate_mcp_headers(&headers, &messages[0]) {
+            return jsonrpc_error(&messages[0], -32020, message);
+        }
+        if let Err(message) = crate::harpoon::validate_meta(&messages[0]) {
+            return jsonrpc_error(&messages[0], -32602, message);
+        }
+    }
     if messages
         .iter()
         .any(|message| protocol::view(message).is_err())
@@ -707,21 +840,30 @@ enum Listener {
 }
 impl axum::serve::Listener for Listener {
     type Io = Box<dyn Io>;
-    type Addr = String;
+    type Addr = Peer;
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             let result: io::Result<(Self::Io, Self::Addr)> = match self {
                 Self::Tcp(listener) => {
                     TcpListener::accept(listener)
                         .await
-                        .map(|(stream, address)| {
-                            (Box::new(stream) as Box<dyn Io>, address.to_string())
+                        .and_then(|(stream, remote)| {
+                            let peer = Peer {
+                                remote: remote.to_string(),
+                                local: stream.local_addr()?.to_string(),
+                            };
+                            Ok((Box::new(stream) as Box<dyn Io>, peer))
                         })
                 }
-                Self::Local(listener) => listener
-                    .accept()
-                    .await
-                    .map(|stream| (stream, "local".into())),
+                Self::Local(listener) => listener.accept().await.map(|stream| {
+                    (
+                        stream,
+                        Peer {
+                            remote: "local".into(),
+                            local: "local".into(),
+                        },
+                    )
+                }),
             };
             match result {
                 Ok(connection) => return connection,
@@ -732,11 +874,15 @@ impl axum::serve::Listener for Listener {
             }
         }
     }
-    fn local_addr(&self) -> io::Result<String> {
-        match self {
-            Self::Tcp(listener) => Ok(listener.local_addr()?.to_string()),
-            Self::Local(listener) => Ok(listener.path.display().to_string()),
-        }
+    fn local_addr(&self) -> io::Result<Peer> {
+        let local = match self {
+            Self::Tcp(listener) => listener.local_addr()?.to_string(),
+            Self::Local(listener) => listener.path.display().to_string(),
+        };
+        Ok(Peer {
+            remote: local.clone(),
+            local,
+        })
     }
 }
 
