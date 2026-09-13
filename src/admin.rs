@@ -140,6 +140,10 @@ impl Client {
         authorization.set_sensitive(true);
         headers.insert("authorization", authorization);
         headers.insert("accept", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static(crate::harpoon::headers::USER_AGENT),
+        );
         headers.insert("x-tunnel-client-name", HeaderValue::from_static("otunnel"));
         headers.insert(
             "x-tunnel-client-version",
