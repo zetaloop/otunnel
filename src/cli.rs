@@ -913,10 +913,10 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
         _ => {}
     }
     let config = load(matches)?;
+    config.validate()?;
     logger(&config.log)?;
     match name {
         "run" => {
-            config.validate()?;
             let tunnel = Tunnel::new(config.clone())?;
             let stop = CancellationToken::new();
             let _pid = config

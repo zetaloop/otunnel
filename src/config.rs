@@ -113,6 +113,22 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         self.scope()?;
+        let level = self.log.level.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            matches!(level.as_str(), "debug" | "info" | "warn" | "error"),
+            "parse log level {:?}: expected debug, info, warn, or error",
+            self.log.level
+        );
+        let format = self.log.format.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            matches!(format.as_str(), "" | "struct-text" | "json"),
+            "unsupported log format {:?}: supported formats are \"struct-text\" or \"json\"",
+            self.log.format
+        );
+        anyhow::ensure!(
+            level == "info" || !format.is_empty(),
+            "log level requires 'struct-text' or 'json' log format"
+        );
         anyhow::ensure!(
             self.config_version
                 .is_none_or(|version| matches!(version, 1 | 2)),
@@ -275,6 +291,8 @@ impl Config {
         if self.cloudflared.path.is_empty() {
             self.cloudflared.path = "cloudflared".into();
         }
+        self.log.level = self.log.level.trim().to_ascii_lowercase();
+        self.log.format = self.log.format.trim().to_ascii_lowercase();
         Ok(())
     }
     pub fn enabled(&self, channel: &str) -> bool {
