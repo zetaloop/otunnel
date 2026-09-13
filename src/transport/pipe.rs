@@ -382,7 +382,7 @@ impl Transport for Pipe {
         }
         self.relay(request, sink).await
     }
-    async fn terminate(&self, headers: HeaderMap) -> Result<Reply> {
+    async fn terminate(&self, headers: HeaderMap, _discovery: bool) -> Result<Reply> {
         let scope = headers
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())

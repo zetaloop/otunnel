@@ -88,47 +88,90 @@ impl HttpTransport {
         Ok(())
     }
 
-    fn headers(&self, incoming: HeaderMap) -> Result<HeaderMap> {
-        let mut headers = self.headers.clone();
-        headers.extend(incoming);
-        let nominated: Vec<_> = headers
-            .get_all("connection")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .map(|v| v.trim().to_owned())
-            .collect();
-        for name in nominated {
-            headers.remove(name);
+    fn headers(
+        &self,
+        url: &Url,
+        base: &HeaderMap,
+        incoming: &HeaderMap,
+        discovery: bool,
+    ) -> HeaderMap {
+        let mut headers = base.clone();
+        if url.origin() == self.url.origin() {
+            if discovery
+                || url.path().trim_end_matches('/') == self.url.path().trim_end_matches('/')
+            {
+                headers.extend(self.headers.clone());
+                if discovery {
+                    headers.extend(self.discovery_headers.clone());
+                }
+            }
+            headers.extend(incoming.clone());
         }
-        for name in [
-            "connection",
-            "content-length",
-            "transfer-encoding",
-            "keep-alive",
-            "proxy-connection",
-        ] {
+        for name in ["host", "content-length", "transfer-encoding"] {
             headers.remove(name);
         }
         headers
-            .entry("accept")
-            .or_insert("application/json, text/event-stream".parse()?);
-        headers.insert("content-type", "application/json".parse()?);
-        Ok(headers)
+    }
+
+    pub(crate) async fn send(
+        &self,
+        mut method: Method,
+        mut url: Url,
+        mut headers: HeaderMap,
+        mut body: Bytes,
+        incoming: &HeaderMap,
+        discovery: bool,
+    ) -> Result<crate::net::Response> {
+        let origin = url.origin();
+        for hop in 0..10 {
+            let response = self
+                .client
+                .send(
+                    method.clone(),
+                    &url,
+                    self.headers(&url, &headers, incoming, discovery),
+                    body.clone(),
+                )
+                .await?;
+            if !matches!(response.status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(response);
+            }
+            let Some(location) = response.headers.get("location") else {
+                return Ok(response);
+            };
+            let next = url.join(location.to_str()?)?;
+            anyhow::ensure!(
+                next.origin() == origin,
+                "MCP redirect destination must use the configured origin"
+            );
+            anyhow::ensure!(hop < 9, "MCP request stopped after 10 redirects");
+            if response.status.as_u16() == 303 && method != Method::HEAD
+                || matches!(response.status.as_u16(), 301 | 302)
+                    && !matches!(method, Method::GET | Method::HEAD)
+            {
+                method = Method::GET;
+                body = Bytes::new();
+            }
+            let mut referer = url.clone();
+            let _ = referer.set_username("");
+            let _ = referer.set_password(None);
+            headers.insert("referer", referer.as_str().parse()?);
+            url = next;
+        }
+        unreachable!()
     }
 }
 
 #[async_trait]
 impl Transport for HttpTransport {
-    fn discovery_headers(&self) -> HeaderMap {
-        self.discovery_headers.clone()
-    }
     async fn discover(&self) -> Result<Reply> {
         crate::oauth::discover(self).await
     }
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
         let id = view(&request.message)?.id.map(RawValue::to_owned);
-        let mut headers = self.headers(request.headers.clone())?;
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "application/json, text/event-stream".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
         let version = protocol::version(&request.message);
         let modern = version.as_deref() == Some(protocol::MCP_VERSION);
         if let Some(version) = &version {
@@ -144,13 +187,13 @@ impl Transport for HttpTransport {
             headers.insert("mcp-name", name.parse()?);
         }
         let mut response = self
-            .client
-            .follow(
+            .send(
                 Method::POST,
                 self.url.clone(),
                 headers.clone(),
                 Bytes::copy_from_slice(request.message.get().as_bytes()),
-                10,
+                &request.headers,
+                request.discovery,
             )
             .await?;
         if response.status == http::StatusCode::UNAUTHORIZED
@@ -240,14 +283,15 @@ impl Transport for HttpTransport {
                     let response = Request::new(
                         json!({"jsonrpc":"2.0","id":envelope.id,"error":{"code":-32601,"message":"Client capability is unavailable"}}),
                     )?;
-                    self.client
-                        .send(
-                            Method::POST,
-                            &self.url,
-                            headers.clone(),
-                            Bytes::copy_from_slice(response.message.get().as_bytes()),
-                        )
-                        .await?;
+                    self.send(
+                        Method::POST,
+                        self.url.clone(),
+                        headers.clone(),
+                        Bytes::copy_from_slice(response.message.get().as_bytes()),
+                        &request.headers,
+                        request.discovery,
+                    )
+                    .await?;
                     continue;
                 }
                 let terminal = envelope.method.is_none();
@@ -281,26 +325,26 @@ impl Transport for HttpTransport {
             headers.insert("last-event-id", last.parse()?);
             tokio::time::sleep(retry).await;
             response = self
-                .client
-                .follow(
+                .send(
                     Method::GET,
                     self.url.clone(),
                     headers.clone(),
                     Bytes::new(),
-                    10,
+                    &request.headers,
+                    request.discovery,
                 )
                 .await?;
         }
     }
-    async fn terminate(&self, headers: HeaderMap) -> Result<Reply> {
+    async fn terminate(&self, headers: HeaderMap, discovery: bool) -> Result<Reply> {
         let response = self
-            .client
-            .follow(
+            .send(
                 Method::DELETE,
                 self.url.clone(),
-                self.headers(headers)?,
+                HeaderMap::new(),
                 Bytes::new(),
-                10,
+                &headers,
+                discovery,
             )
             .await?;
         let mut reply = Reply::ack(response.status.as_u16(), "session_termination_response");

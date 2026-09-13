@@ -507,6 +507,7 @@ async fn execute(
     match command.command_type.as_str() {
         "jsonrpc" => {
             let request = Request {
+                discovery: false,
                 message: command.jsonrpc.context("JSON-RPC command has no payload")?,
                 headers,
             };
@@ -562,7 +563,7 @@ async fn execute(
             };
             let outcome = match binding {
                 Some(binding) if command.command_type == "session_termination" => {
-                    binding.terminate(headers).await
+                    binding.terminate(headers, false).await
                 }
                 Some(binding) => binding.discover().await,
                 None => Ok(Reply::ack(404, kind)),

@@ -63,12 +63,14 @@ impl Poll {
 pub struct Request {
     pub message: Json,
     pub headers: HeaderMap,
+    pub discovery: bool,
 }
 impl Request {
     pub fn new(value: Value) -> Result<Self> {
         Ok(Self {
             message: to_raw_value(&value)?,
             headers: HeaderMap::new(),
+            discovery: false,
         })
     }
     pub fn scope(&self) -> String {

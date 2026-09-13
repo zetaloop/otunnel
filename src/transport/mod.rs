@@ -22,10 +22,7 @@ pub trait Sink: Send + Sync {
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()>;
-    fn discovery_headers(&self) -> HeaderMap {
-        HeaderMap::new()
-    }
-    async fn terminate(&self, _headers: HeaderMap) -> Result<Reply> {
+    async fn terminate(&self, _headers: HeaderMap, _discovery: bool) -> Result<Reply> {
         Ok(Reply::ack(405, "session_termination_response"))
     }
     async fn discover(&self) -> Result<Reply> {
@@ -82,7 +79,7 @@ pub struct Probe {
 
 pub(crate) async fn negotiate(transport: &dyn Transport) -> Result<(Reply, bool)> {
     let mut request = protocol::request("server/discover", json!({}), true)?;
-    request.headers = transport.discovery_headers();
+    request.discovery = true;
     let reply = exchange(transport, request).await?;
     if reply.status == 401 || reply.status == 403 {
         return Ok((reply, false));
@@ -105,7 +102,7 @@ pub(crate) async fn negotiate(transport: &dyn Transport) -> Result<(Reply, bool)
         }
     }
     let mut request = protocol::initialize()?;
-    request.headers = transport.discovery_headers();
+    request.discovery = true;
     Ok((exchange(transport, request).await?, false))
 }
 
@@ -146,7 +143,7 @@ pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
     } else {
         value.get("serverInfo").cloned()
     };
-    let mut headers = transport.discovery_headers();
+    let mut headers = HeaderMap::new();
     if stateless {
         headers.insert("mcp-protocol-version", protocol::MCP_VERSION.parse()?);
     } else {
@@ -162,6 +159,7 @@ pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
             let mut initialized =
                 Request::new(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))?;
             initialized.headers = headers.clone();
+            initialized.discovery = true;
             exchange(transport, initialized).await?;
         }
         if value.pointer("/capabilities/tools").is_some() {
@@ -174,6 +172,7 @@ pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
                 }
                 let mut list = protocol::request("tools/list", params, stateless)?;
                 list.headers = headers.clone();
+                list.discovery = true;
                 let reply = exchange(transport, list).await?;
                 anyhow::ensure!(
                     reply.status < 400,
@@ -210,7 +209,7 @@ pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
     }
     .await;
     if headers.contains_key("mcp-session-id") {
-        transport.terminate(headers).await?;
+        transport.terminate(headers, true).await?;
     }
     result
 }
