@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::{
-    sync::{Semaphore, watch},
+    sync::watch,
     task::JoinSet,
     time::{Instant, timeout, timeout_at},
 };
@@ -40,10 +40,26 @@ pub struct Snapshot {
     pub channels: BTreeMap<String, Probe>,
     pub evidence: BTreeMap<String, serde_json::Value>,
     pub in_flight: usize,
+    pub activity: Activity,
     pub completed: u64,
     pub expired: u64,
     pub failed: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize)]
+pub struct Activity {
+    pub queued: usize,
+    #[serde(skip)]
+    pub active: BTreeMap<String, f64>,
+    pub enqueued: u64,
+    pub dequeued: u64,
+    pub last_enqueue: f64,
+    pub last_dequeue: f64,
+    pub last_start: f64,
+    pub last_completion: f64,
+    pub pressure_started: f64,
+    pub pressure_seconds: f64,
 }
 
 #[derive(Serialize)]
@@ -316,25 +332,16 @@ impl Tunnel {
 
     async fn dispatch(&mut self, shutdown: &CancellationToken) -> Result<()> {
         let bindings = Arc::new(self.bindings.clone());
-        let concurrency = self.config.control_plane.max_inflight_requests;
+        let capacity = self.config.control_plane.max_inflight_requests;
+        let concurrency = self.config.mcp.max_concurrent_requests;
         let ttl = self
             .config
             .mcp
             .connection_max_ttl
             .map(|span| span.0)
             .filter(|duration| !duration.is_zero());
-        let global = Arc::new(Semaphore::new(concurrency));
-        let local: BTreeMap<_, _> = bindings
-            .keys()
-            .map(|name| {
-                (
-                    name.clone(),
-                    Arc::new(Semaphore::new(self.config.mcp.max_concurrent_requests)),
-                )
-            })
-            .collect();
-        let local = Arc::new(local);
-        let mut requests: JoinSet<Result<bool>> = JoinSet::new();
+        let mut queued = std::collections::VecDeque::new();
+        let mut requests: JoinSet<(String, Result<bool>)> = JoinSet::new();
         let mut connection = self.control.connection();
         let mut connections = JoinSet::new();
         for (name, binding) in bindings.iter() {
@@ -351,10 +358,42 @@ impl Tunnel {
         let mut initial = true;
         let result = async {
             loop {
-                if poll.is_none() && requests.len() < concurrency {
+                while requests.len() < concurrency {
+                    let Some((command, received)): Option<(Command, Instant)> = queued.pop_front() else { break; };
+                    let control = self.control.clone();
+                    let bindings = bindings.clone();
+                    let id = command.request_id.clone();
+                    self.state.send_modify(|state| {
+                        let now = crate::control::now();
+                        state.activity.queued = queued.len();
+                        state.activity.dequeued += 1;
+                        state.activity.last_dequeue = now;
+                        state.activity.last_start = now;
+                        state.activity.active.insert(id.clone(), now);
+                    });
+                    requests.spawn(async move {
+                        let deadline = protocol::timeout(&command.response_timeout).and_then(|duration| received.checked_add(duration));
+                        let result = if deadline.is_some_and(|deadline| deadline <= Instant::now()) { Ok(false) }
+                            else if let Some(deadline) = deadline {
+                                match timeout_at(deadline, execute(&control, &bindings, command, ttl)).await {
+                                    Ok(result) => result.map(|()| true), Err(_) => Ok(false),
+                                }
+                            } else { execute(&control, &bindings, command, ttl).await.map(|()| true) };
+                        (id, result)
+                    });
+                }
+                let pressure = queued.len() >= capacity;
+                self.state.send_if_modified(|state| {
+                    if pressure == (state.activity.pressure_started > 0.0) { return false; }
+                    let now = crate::control::now();
+                    if pressure { state.activity.pressure_started = now; }
+                    else { state.activity.pressure_seconds += now - state.activity.pressure_started; state.activity.pressure_started = 0.0; }
+                    true
+                });
+                if poll.is_none() && !pressure {
                     self.control.set_channels(channels(&bindings))?;
                     let control = self.control.clone();
-                    let limit = concurrency - requests.len();
+                    let limit = capacity - queued.len();
                     poll = Some(Box::pin(async move { control.poll(limit, initial).await }));
                     initial = false;
                 }
@@ -363,10 +402,7 @@ impl Tunnel {
                     changed = connection.changed() => {
                         changed?;
                         let observation = connection.borrow_and_update().clone();
-                        self.state.send_modify(|state| {
-                            state.connected = observation.connected;
-                            state.control = observation;
-                        });
+                        self.state.send_modify(|state| { state.connected = observation.connected; state.control = observation; });
                     }
                     child = self.children.join_next(), if !self.children.is_empty() => {
                         child.context("child supervisor stopped")???;
@@ -377,18 +413,16 @@ impl Tunnel {
                         bail!("MCP connection stopped");
                     }
                     result = requests.join_next(), if !requests.is_empty() => {
-                        let result = result.context("request worker stopped")?;
+                        let (id, result) = result.context("request worker stopped")??;
                         self.state.send_modify(|state| {
                             state.evidence = bindings.iter().filter_map(|(name, binding)| binding.observation().map(|value| (name.clone(), value))).collect();
-                            state.in_flight = requests.len();
-                            match &result {
-                                Ok(Ok(true)) => state.completed += 1,
-                                Ok(Ok(false)) => state.expired += 1,
-                                _ => state.failed += 1,
-                            }
+                            state.in_flight = requests.len() + queued.len();
+                            state.activity.active.remove(&id);
+                            state.activity.last_completion = crate::control::now();
+                            match &result { Ok(true) => state.completed += 1, Ok(false) => state.expired += 1, Err(_) => state.failed += 1 }
                         });
-                        match result? {
-                            Ok(_) => {}
+                        match result {
+                            Ok(_) => {},
                             Err(error) if error.downcast_ref::<StatusError>().is_some_and(|error| matches!(error.status, 401 | 403)) => return Err(error),
                             Err(error) => {
                                 self.state.send_modify(|state| state.last_error = Some(format!("{error:#}")));
@@ -399,29 +433,14 @@ impl Tunnel {
                     batch = async { match &mut poll { Some(poll) => poll.await, None => std::future::pending().await } } => {
                         let batch = batch?;
                         poll = None;
-                        for command in batch.commands {
-                            let control = self.control.clone();
-                            let bindings = bindings.clone();
-                            let global = global.clone();
-                            let local = local.clone();
-                            requests.spawn(async move {
-                                let deadline = protocol::timeout(&command.response_timeout).and_then(|duration| batch.received.checked_add(duration));
-                                if deadline.is_some_and(|deadline| deadline <= Instant::now()) { return Ok(false); }
-                                let work = async {
-                                    let _permit = global.acquire().await?;
-                                    let permit = local.get(&command.channel).map(|limit| limit.acquire());
-                                    let _local = match permit { Some(permit) => Some(permit.await?), None => None };
-                                    execute(&control, &bindings, command, ttl).await
-                                };
-                                if let Some(deadline) = deadline {
-                                    match timeout_at(deadline, work).await {
-                                        Ok(result) => result.map(|()| true),
-                                        Err(_) => Ok(false),
-                                    }
-                                } else { work.await.map(|()| true) }
-                            });
-                        }
-                        self.state.send_modify(|state| state.in_flight = requests.len());
+                        let count = batch.commands.len();
+                        queued.extend(batch.commands.into_iter().map(|command| (command, batch.received)));
+                        self.state.send_modify(|state| {
+                            state.in_flight = requests.len() + queued.len();
+                            state.activity.queued = queued.len();
+                            state.activity.enqueued += count as u64;
+                            if count > 0 { state.activity.last_enqueue = crate::control::now(); }
+                        });
                     }
                 }
             }
@@ -430,7 +449,11 @@ impl Tunnel {
         while requests.join_next().await.is_some() {}
         connections.abort_all();
         while connections.join_next().await.is_some() {}
-        self.state.send_modify(|state| state.in_flight = 0);
+        self.state.send_modify(|state| {
+            state.in_flight = 0;
+            state.activity.queued = 0;
+            state.activity.active.clear();
+        });
         result
     }
 
