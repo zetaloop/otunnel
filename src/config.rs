@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 // YAML null has the same effect as an omitted setting.
 macro_rules! settings {
@@ -55,6 +56,25 @@ settings!(Config {
 });
 
 impl Config {
+    pub fn validate_profile(text: &str) -> Result<()> {
+        let config = Self::parse(text)?;
+        config.scope()?;
+        let mut input = text.as_bytes();
+        let raw = serde_saphyr::read::<_, Value>(&mut input)
+            .next()
+            .transpose()?
+            .context("configuration is empty")?;
+        reference::validate_profile(&config, &raw)?;
+        for target in &config.harpoon.targets {
+            if let Some(definition) = &target.template {
+                definition
+                    .validate()
+                    .with_context(|| format!("harpoon target {:?} template", target.label))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut config = Self::parse(
@@ -116,6 +136,13 @@ impl Config {
         additional: impl IntoIterator<Item = String>,
     ) -> Result<()> {
         self.scope()?;
+        reference::validate_headers(self, true)?;
+        if let Some(organization) = &self.control_plane.organization_id {
+            anyhow::ensure!(
+                !organization.contains(['\r', '\n']),
+                "control-plane.organization-id cannot contain header line breaks"
+            );
+        }
         let level = self.log.level.trim().to_ascii_lowercase();
         anyhow::ensure!(
             matches!(level.as_str(), "debug" | "info" | "warn" | "error"),

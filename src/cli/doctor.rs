@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgMatches, parser::ValueSource};
 use otunnel::{
     Tunnel,
+    config::Config,
     diagnostic::{Check, Report, Status},
     health::Server,
 };
@@ -60,7 +61,22 @@ pub async fn execute(arguments: &ArgMatches) -> Result<u8> {
     checks.push(Check::pass("config_source", description));
     if let Some(file) = &path {
         match std::fs::metadata(file) {
-            Ok(_) => checks.push(Check::pass("profile_load", file.display().to_string())),
+            Ok(_) => {
+                checks.push(Check::pass("profile_load", file.display().to_string()));
+                match std::fs::read_to_string(file)
+                    .with_context(|| format!("read {}", file.display()))
+                    .and_then(|contents| Config::validate_profile(&contents))
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        checks.push(Check::fail(
+                            "profile_load",
+                            format!("parse config file {}: {error:#}", file.display()),
+                        ));
+                        return output(arguments, checks, BTreeMap::new(), String::new());
+                    }
+                }
+            }
             Err(error) => {
                 checks.push(Check::fail(
                     "profile_load",

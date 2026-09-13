@@ -416,17 +416,7 @@ fn generate(name: &str, mut values: Values) -> Result<String> {
 }
 
 fn validate(contents: &str) -> Result<()> {
-    let config = Config::parse(contents)?;
-    for target in config.harpoon.targets {
-        if let Some(definition) = target.template {
-            anyhow::ensure!(
-                config.config_version == Some(2),
-                "Harpoon templates require config_version: 2"
-            );
-            definition.validate()?;
-        }
-    }
-    Ok(())
+    Config::validate_profile(contents)
 }
 fn create_directory(path: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
