@@ -8,6 +8,6 @@ cargo check --package otunnel --all-targets --no-default-features
 cargo dist
 ```
 
-`cargo dist` writes the native release to `dist/`. `cargo xtask matrix` supplies the release targets from the same workspace tooling.
+Packages go to `dist/`. `cargo xtask matrix` lists release targets.
 
-A `vX.Y.Z` tag starts platform checks and prepares a GitHub release draft. Manual workflow runs offer `dryrun` for artifacts or `draft` for a tagged commit. Publishing the draft publishes the crate through Trusted Publishing, configured for `publish.yml` and the `release` environment. Manual dispatch with the tag resumes a publication.
+A `vX.Y.Z` tag runs platform checks and creates a release draft. Manual runs provide `dryrun` artifacts or a `draft` for a tag. Publishing the draft publishes the crate through Trusted Publishing, using `publish.yml` and the `release` environment.
