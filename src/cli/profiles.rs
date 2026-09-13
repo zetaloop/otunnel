@@ -110,7 +110,7 @@ pub fn init_command() -> Command {
             .default_value("127.0.0.1:8080"),
     )
     .arg(super::flag("force"))
-    .arg(super::flag("open-web-ui"))
+    .arg(super::flag("open-web-ui").hide(true))
 }
 
 pub fn execute(arguments: &ArgMatches) -> Result<u8> {

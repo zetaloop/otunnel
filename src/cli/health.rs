@@ -104,7 +104,6 @@ pub async fn execute(arguments: &ArgMatches) -> Result<u8> {
     let mut passed = !base.is_empty();
     if !base.is_empty() {
         report["base_url"] = json!(base);
-        report["ui_url"] = json!(format!("{base}/ui"));
         for (key, path) in [("healthz", "/healthz"), ("readyz", "/readyz")] {
             let endpoint = probe(&base, path).await;
             passed &= endpoint.ok;
@@ -232,10 +231,8 @@ fn print(report: &Value) {
     if locator["error"].is_string() {
         println!("Locator error: {}", text(&locator["error"]));
     }
-    for (label, key) in [("Base URL", "base_url"), ("UI URL", "ui_url")] {
-        if report[key].is_string() {
-            println!("{label}: {}", text(&report[key]));
-        }
+    if let Some(base) = report["base_url"].as_str() {
+        println!("Base URL: {base}");
     }
     for (label, key) in [
         ("Healthz", "healthz"),

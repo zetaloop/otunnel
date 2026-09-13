@@ -266,7 +266,7 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "HEALTH_LISTEN_ADDR",
         "/health/listen_addr",
         Text,
-        "Health address; port 0 selects an ephemeral port; empty disables TCP",
+        "Health listener address; port 0 selects an ephemeral port",
     ),
     (
         "health.unix-socket",
@@ -289,13 +289,7 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         Boolean,
         "Include channel details in readiness responses",
     ),
-    (
-        "log.level",
-        "LOG_LEVEL",
-        "/log/level",
-        Text,
-        "Log filter, such as info or otunnel=debug",
-    ),
+    ("log.level", "LOG_LEVEL", "/log/level", Text, "Log level"),
     (
         "log.format",
         "LOG_FORMAT",
@@ -488,6 +482,14 @@ pub fn command() -> Command {
                     argument(name, *kind)
                         .env(*environment)
                         .hide_env_values(true)
+                        .hide(matches!(
+                            *name,
+                            "allow-remote-ui"
+                                | "open-web-ui"
+                                | "admin-ui.log-buffer-events"
+                                | "proxy.check-interval"
+                                | "harpoon.capture-payloads"
+                        ))
                         .help(*help),
                 ];
                 options.extend(
