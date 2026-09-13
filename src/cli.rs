@@ -504,6 +504,13 @@ pub fn command() -> Command {
     };
     Command::new("otunnel")
         .version(env!("CARGO_PKG_VERSION"))
+        .disable_version_flag(true)
+        .arg(
+            Arg::new("version")
+                .short('v')
+                .long("version")
+                .action(ArgAction::Version),
+        )
         .about("Connect local MCP services to OpenAI tunnels")
         .subcommand_required(true)
         .arg_required_else_help(true)
