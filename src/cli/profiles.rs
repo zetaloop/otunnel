@@ -452,7 +452,11 @@ fn write(path: &Path, contents: &[u8], force: bool) -> Result<()> {
     }
     #[cfg(windows)]
     if force {
-        let mut file = fs::OpenOptions::new().create(true).write(true).open(path)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
         anyhow::ensure!(file.metadata()?.is_file(), "profile must be a regular file");
         file.set_len(0)?;
         file.write_all(contents)?;
