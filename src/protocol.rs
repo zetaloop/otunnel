@@ -13,6 +13,49 @@ pub type Headers = BTreeMap<String, Vec<String>>;
 pub const MCP_VERSION: &str = "2026-07-28";
 pub const WIRE_VERSION: &str = "2026-08-25";
 
+pub(crate) const SUPPORTED_VERSIONS: [&str; 5] = [
+    MCP_VERSION,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
+
+pub(crate) fn validate_meta(message: &RawValue) -> std::result::Result<(), String> {
+    let Some(version) = version(message) else {
+        return Ok(());
+    };
+    if version.as_str() < MCP_VERSION {
+        return Ok(());
+    }
+    let meta = field(message, "params").and_then(|params| field(&params, "_meta"));
+    let capabilities = meta
+        .as_deref()
+        .and_then(|meta| field(meta, "io.modelcontextprotocol/clientCapabilities"))
+        .and_then(|value| serde_json::from_str::<Value>(value.get()).ok());
+    if !capabilities.is_some_and(|value| value.is_object()) {
+        return Err(
+            "missing or invalid _meta field \"io.modelcontextprotocol/clientCapabilities\"".into(),
+        );
+    }
+    if let Some(info) = meta
+        .as_deref()
+        .and_then(|meta| field(meta, "io.modelcontextprotocol/clientInfo"))
+    {
+        let valid = serde_json::from_str::<Value>(info.get())
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|value| {
+                value.get("name").is_none_or(Value::is_string)
+                    && value.get("version").is_none_or(Value::is_string)
+            });
+        if !valid {
+            return Err("invalid _meta field \"io.modelcontextprotocol/clientInfo\"".into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct Command {
     pub request_id: String,

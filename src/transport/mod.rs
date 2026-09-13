@@ -10,6 +10,10 @@ use crate::protocol::{self, Reply, Request};
 
 mod http;
 mod pipe;
+#[cfg(feature = "cli")]
+mod server;
+#[cfg(feature = "cli")]
+pub use server::Server;
 
 pub use http::HttpTransport;
 pub use pipe::Pipe;

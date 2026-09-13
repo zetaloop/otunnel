@@ -28,50 +28,6 @@ pub(crate) mod headers;
 const INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets and call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
 const TEMPLATE_INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets. For exact targets, use call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. For entries with template_version and parameters_schema, use call_target_template with the label and all parameters declared by parameters_schema; each value must satisfy that schema. Templates make GET requests to a fixed destination and do not follow redirects. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
 
-pub(crate) const SUPPORTED_VERSIONS: [&str; 5] = [
-    protocol::MCP_VERSION,
-    "2025-11-25",
-    "2025-06-18",
-    "2025-03-26",
-    "2024-11-05",
-];
-
-pub(crate) fn validate_meta(message: &RawValue) -> std::result::Result<(), String> {
-    let Some(version) = protocol::version(message) else {
-        return Ok(());
-    };
-    if version.as_str() < protocol::MCP_VERSION {
-        return Ok(());
-    }
-    let meta =
-        protocol::field(message, "params").and_then(|params| protocol::field(&params, "_meta"));
-    let capabilities = meta
-        .as_deref()
-        .and_then(|meta| protocol::field(meta, "io.modelcontextprotocol/clientCapabilities"))
-        .and_then(|value| serde_json::from_str::<Value>(value.get()).ok());
-    if !capabilities.is_some_and(|value| value.is_object()) {
-        return Err(
-            "missing or invalid _meta field \"io.modelcontextprotocol/clientCapabilities\"".into(),
-        );
-    }
-    if let Some(info) = meta
-        .as_deref()
-        .and_then(|meta| protocol::field(meta, "io.modelcontextprotocol/clientInfo"))
-    {
-        let valid = serde_json::from_str::<Value>(info.get())
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .is_some_and(|value| {
-                value.get("name").is_none_or(Value::is_string)
-                    && value.get("version").is_none_or(Value::is_string)
-            });
-        if !valid {
-            return Err("invalid _meta field \"io.modelcontextprotocol/clientInfo\"".into());
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone, Serialize)]
 pub struct TargetInfo {
     pub label: String,
@@ -549,7 +505,7 @@ impl Transport for Harpoon {
         if envelope.id.is_none() {
             return sink.send(Reply::ack(202, "notify_ack")).await;
         }
-        if let Err(message) = validate_meta(&request.message) {
+        if let Err(message) = protocol::validate_meta(&request.message) {
             return sink
                 .send(Reply::error(&request, 200, -32602, message)?)
                 .await;
@@ -565,7 +521,7 @@ impl Transport for Harpoon {
         let mut result = match envelope.method.as_deref() {
             Some("server/discover") => {
                 json!({
-                    "supportedVersions":SUPPORTED_VERSIONS,
+                    "supportedVersions":protocol::SUPPORTED_VERSIONS,
                     "capabilities":{"tools":{}},
                     "instructions":instructions,
                     "ttlMs":0,
@@ -578,7 +534,7 @@ impl Transport for Harpoon {
                     .and_then(|version| serde_json::from_str::<String>(version.get()).ok())
                     .unwrap_or_default();
                 let version = if requested.as_str() < protocol::MCP_VERSION
-                    && SUPPORTED_VERSIONS.contains(&requested.as_str())
+                    && protocol::SUPPORTED_VERSIONS.contains(&requested.as_str())
                 {
                     requested
                 } else {
