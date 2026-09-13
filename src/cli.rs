@@ -1,3 +1,4 @@
+mod admin;
 mod health;
 mod profiles;
 
@@ -513,6 +514,7 @@ pub fn command() -> Command {
             .arg(flag("json").help("Emit a JSON report")),
         )
         .subcommand(health::command())
+        .subcommand(admin::command())
         .subcommand(profiles::command())
         .subcommand(profiles::init_command())
         .subcommand(
@@ -571,6 +573,14 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
         };
     }
     Ok(None)
+}
+
+fn value<'a>(arguments: &'a ArgMatches, name: &str) -> &'a str {
+    arguments
+        .try_get_one::<String>(name)
+        .ok()
+        .flatten()
+        .map_or("", String::as_str)
 }
 
 fn boolean(value: &str) -> std::result::Result<bool, String> {
@@ -769,6 +779,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
     }
     match name {
         "health" => return health::execute(matches).await,
+        "admin" => return admin::execute(matches).await,
         "profiles" => return profiles::execute(matches),
         "init" => return profiles::init(matches),
         _ => {}

@@ -246,6 +246,46 @@ settings!(Proxy {
     check_interval: Span = Span(Duration::from_secs(60))
 });
 
+pub(crate) fn endpoint(base: &url::Url, prefix: &str, route: &str) -> Result<url::Url> {
+    let prefix = prefix.trim();
+    let mut result = base.clone();
+    result.set_path("/");
+    result.set_query(None);
+    result.set_fragment(None);
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        anyhow::ensure!(
+            prefix.starts_with('/') && !prefix.starts_with("//"),
+            "control-plane.url-path must start with '/' and contain only a path"
+        );
+        let parsed = result.join(prefix)?;
+        anyhow::ensure!(
+            parsed.query().is_none_or(str::is_empty) && parsed.fragment().is_none_or(str::is_empty),
+            "control-plane.url-path cannot contain a query or fragment"
+        );
+        percent_encoding::percent_decode_str(parsed.path())
+            .decode_utf8()?
+            .into_owned()
+    };
+    let mut segments = Vec::new();
+    for segment in prefix.split('/').chain(route.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+    result
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("control-plane URL cannot contain path segments"))?
+        .clear()
+        .extend(segments);
+    Ok(result)
+}
+
 pub fn main_channel() -> String {
     "main".into()
 }

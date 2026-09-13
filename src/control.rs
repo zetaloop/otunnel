@@ -93,10 +93,7 @@ impl Control {
         if cp.client_cert.is_some() && url.host_str() == Some("api.openai.com") {
             url.set_host(Some("mtls.api.openai.com"))?;
         }
-        url.set_path(&format!(
-            "{}/v1/tunnels/",
-            config::resolve(&cp.url_path)?.trim_end_matches('/')
-        ));
+        url = config::endpoint(&url, &config::resolve(&cp.url_path)?, "v1/tunnels")?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("control plane URL cannot contain path segments"))?
             .pop_if_empty()

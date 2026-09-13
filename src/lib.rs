@@ -4,6 +4,7 @@
 //! [`CancellationToken`] is cancelled. [`transport::Transport`] allows a host
 //! application to provide its own asynchronous MCP implementation.
 
+pub mod admin;
 mod cloudflare;
 pub mod config;
 pub mod control;

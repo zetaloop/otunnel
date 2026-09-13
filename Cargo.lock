@@ -1249,6 +1249,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "percent-encoding",
  "process-wrap",
  "rand",
  "regex",
