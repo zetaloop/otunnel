@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use regex::Regex;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // YAML null has the same effect as an omitted setting.
 macro_rules! settings {
@@ -33,24 +33,8 @@ macro_rules! settings {
     };
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Span(pub Duration);
-impl Serialize for Span {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&humantime::format_duration(self.0))
-    }
-}
-impl<'de> Deserialize<'de> for Span {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        if value == "0" {
-            return Ok(Self(Duration::ZERO));
-        }
-        humantime::parse_duration(&value)
-            .map(Self)
-            .map_err(serde::de::Error::custom)
-    }
-}
+mod duration;
+pub use duration::Span;
 
 settings!(Config {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,15 +113,63 @@ impl Config {
                 .is_none_or(|version| matches!(version, 1 | 2)),
             "unsupported config_version"
         );
-        if self.control_plane.tunnel_id.is_empty() {
-            bail!("control_plane.tunnel_id is required");
-        }
+        anyhow::ensure!(
+            self.control_plane
+                .tunnel_id
+                .strip_prefix("tunnel_")
+                .is_some_and(|id| {
+                    id.len() == 32
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                }),
+            "invalid tunnel ID: expected tunnel_<32 lowercase letters or digits>"
+        );
         if resolve(&self.control_plane.api_key)?.is_empty() {
             bail!("control_plane.api_key is required");
         }
         if self.control_plane.max_inflight_requests == 0 || self.mcp.max_concurrent_requests == 0 {
             bail!("request concurrency must be positive");
         }
+        anyhow::ensure!(
+            self.control_plane.max_inflight_requests <= 10000,
+            "control-plane.max-inflight must be less than or equal to 10000"
+        );
+        for (name, duration) in [
+            (
+                "control-plane.poll-timeout",
+                self.control_plane.poll_timeout.0,
+            ),
+            (
+                "control-plane.initial-poll-timeout",
+                self.control_plane.initial_poll_timeout.0,
+            ),
+            (
+                "control-plane.poll-deadline-guardrail",
+                self.control_plane.poll_deadline_guardrail.0,
+            ),
+            (
+                "cloudflared.ready-timeout",
+                self.cloudflared.ready_timeout.0,
+            ),
+            (
+                "mcp.connection-max-ttl",
+                self.mcp
+                    .connection_max_ttl
+                    .map_or(Duration::ZERO, |span| span.0),
+            ),
+        ] {
+            anyhow::ensure!(!duration.is_zero(), "{name} must be positive");
+        }
+        anyhow::ensure!(
+            self.control_plane.poll_deadline_guardrail.0 < Duration::from_secs(60),
+            "control-plane.poll-deadline-guardrail must be less than 1m0s"
+        );
+        anyhow::ensure!(
+            self.control_plane.poll_timeout.0
+                <= Duration::from_secs(600) - self.control_plane.poll_deadline_guardrail.0,
+            "control-plane.poll-timeout plus control-plane.poll-deadline-guardrail must be less than or equal to 10m0s"
+        );
         if let Some(limit) = self.harpoon.max_response_bytes {
             anyhow::ensure!(limit > 0, "harpoon.max-response-bytes must be positive");
             anyhow::ensure!(

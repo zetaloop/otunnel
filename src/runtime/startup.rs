@@ -89,7 +89,7 @@ impl fmt::Display for StartupTimeout {
         write!(
             formatter,
             "MCP startup wait exceeded {}",
-            humantime::format_duration(self.0)
+            crate::config::Span(self.0)
         )
     }
 }

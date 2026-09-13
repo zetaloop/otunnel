@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Arg, ArgMatches, Command};
 use otunnel::config::Span;
-use std::time::Duration;
 
 pub fn command() -> Command {
     Command::new("cloudflared")
@@ -129,39 +128,8 @@ pub fn execute(arguments: &ArgMatches) -> Result<u8> {
     }
     output.push_str(&format!(
         "retries: {retries}\ngrace-period: {}\n",
-        quoted(&duration(grace.0))?
+        quoted(&grace.to_string())?
     ));
     print!("{output}");
     Ok(0)
-}
-
-fn duration(value: Duration) -> String {
-    let nanos = value.as_nanos();
-    let (unit, scale) = match nanos {
-        0..1000 => ("ns", 1),
-        1000..1_000_000 => ("µs", 1000),
-        1_000_000..1_000_000_000 => ("ms", 1_000_000),
-        _ => ("s", 1_000_000_000),
-    };
-    let fraction = nanos % scale;
-    let seconds = if scale == 1_000_000_000 {
-        nanos / scale % 60
-    } else {
-        nanos / scale
-    };
-    let mut result = String::new();
-    if value.as_secs() >= 3600 {
-        result.push_str(&format!("{}h", value.as_secs() / 3600));
-    }
-    if value.as_secs() >= 60 {
-        result.push_str(&format!("{}m", value.as_secs() / 60 % 60));
-    }
-    result.push_str(&seconds.to_string());
-    if fraction != 0 {
-        let digits = (scale as u64).ilog10() as usize;
-        result.push('.');
-        result.push_str(format!("{fraction:0digits$}").trim_end_matches('0'));
-    }
-    result.push_str(unit);
-    result
 }

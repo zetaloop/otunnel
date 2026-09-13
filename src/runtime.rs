@@ -238,6 +238,12 @@ impl Tunnel {
             self.bindings.values().any(|binding| binding.available()),
             "no MCP channels configured"
         );
+        if self.config.control_plane.poll_channels.is_empty() {
+            anyhow::ensure!(
+                self.bindings.contains_key("main"),
+                "main channel is required; set --mcp.server-url or --mcp.command"
+            );
+        }
         for channel in &self.config.control_plane.poll_channels {
             anyhow::ensure!(
                 self.bindings.contains_key(channel),
