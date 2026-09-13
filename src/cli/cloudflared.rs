@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use clap::{Arg, ArgMatches, Command};
 use otunnel::config::Span;
+use std::process::Command as ProcessCommand;
 
 pub fn command() -> Command {
     Command::new("cloudflared")
         .about("Inspect the Cloudflare Tunnel companion")
         .arg_required_else_help(true)
+        .subcommand(Command::new("version").about("Print the installed cloudflared version"))
         .subcommand(
             Command::new("config")
                 .about("Print a standalone cloudflared configuration")
@@ -31,9 +33,15 @@ pub fn command() -> Command {
 }
 
 pub fn execute(arguments: &ArgMatches) -> Result<u8> {
-    let (_, arguments) = arguments
+    let (action, arguments) = arguments
         .subcommand()
         .context("missing cloudflared command")?;
+    if action == "version" {
+        let status = ProcessCommand::new("cloudflared")
+            .arg("--version")
+            .status()?;
+        return Ok(status.code().unwrap_or(1).try_into().unwrap_or(1));
+    }
     let value = |name| {
         arguments
             .get_one::<String>(name)
