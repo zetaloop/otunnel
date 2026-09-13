@@ -11,6 +11,8 @@ pub mod control;
 pub mod harpoon;
 #[cfg(feature = "cli")]
 pub mod health;
+#[cfg(feature = "cli")]
+pub mod management;
 mod net;
 mod oauth;
 pub mod process;
