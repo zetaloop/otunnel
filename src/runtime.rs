@@ -125,6 +125,11 @@ impl Tunnel {
         self.state.subscribe()
     }
 
+    #[cfg(feature = "cli")]
+    pub fn harpoon(&self) -> Arc<crate::harpoon::Harpoon> {
+        self.harpoon.clone()
+    }
+
     async fn prepare(&mut self) -> Result<()> {
         if self.config.cloudflared.managed || self.config.cloudflared.token.is_some() {
             let companion =

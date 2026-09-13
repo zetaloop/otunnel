@@ -128,6 +128,13 @@ impl Config {
             self.harpoon.max_redirects <= 5,
             "harpoon.max-redirects must be less than or equal to 5"
         );
+        for transport in &self.harpoon.additional_transports {
+            anyhow::ensure!(
+                transport.trim().eq_ignore_ascii_case("http-streamable"),
+                "unsupported harpoon transport {:?}",
+                transport.trim()
+            );
+        }
         for pattern in &self.harpoon.hosts_include_regex {
             Regex::new(&format!("(?i:{})", pattern.trim()))
                 .with_context(|| format!("invalid harpoon host regex {pattern:?}"))?;
