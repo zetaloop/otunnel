@@ -152,13 +152,7 @@ impl Control {
         if let Some(organization) = &cp.organization_id {
             headers.insert("openai-organization", organization.trim().parse()?);
         }
-        let mut subscriptions = cp
-            .poll_channels
-            .iter()
-            .map(|name| config::channel(name))
-            .collect::<Result<Vec<_>>>()?;
-        subscriptions.sort();
-        subscriptions.dedup();
+        let subscriptions = cp.poll_channels.clone().unwrap_or_default();
         let uses_proxy = http.proxied(&url)?;
         Ok(Self {
             http,

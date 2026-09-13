@@ -728,8 +728,6 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                 arguments
                     .iter()
                     .flat_map(|value| value.split(','))
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
                     .collect::<Vec<_>>()
             ),
             List => json!(

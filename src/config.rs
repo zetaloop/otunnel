@@ -108,6 +108,13 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_channels(std::iter::empty::<String>())
+    }
+
+    pub(crate) fn validate_with_channels(
+        &self,
+        additional: impl IntoIterator<Item = String>,
+    ) -> Result<()> {
         self.scope()?;
         let level = self.log.level.trim().to_ascii_lowercase();
         anyhow::ensure!(
@@ -218,14 +225,46 @@ impl Config {
             .mcp
             .server_urls
             .iter()
-            .map(|server| &server.channel)
-            .chain(self.mcp.commands.iter().map(|command| &command.channel))
+            .map(|server| server.channel.clone())
+            .chain(
+                self.mcp
+                    .commands
+                    .iter()
+                    .map(|command| command.channel.clone()),
+            )
+            .chain(additional)
         {
-            let name = channel(name)?;
+            let name = channel(&name)?;
             anyhow::ensure!(
                 channels.insert(name.clone()),
                 "channel {name} has multiple bindings"
             );
+        }
+        match &self.control_plane.poll_channels {
+            None => anyhow::ensure!(
+                channels.contains("main"),
+                if channels.is_empty() {
+                    "main channel is required; set --mcp.server-url or --mcp.command, or MCP_SERVER_URL or MCP_COMMAND"
+                } else {
+                    "main channel is required; add channel=main to one --mcp.server-url or --mcp.command entry"
+                }
+            ),
+            Some(poll_channels) => {
+                for name in poll_channels {
+                    match name.as_str() {
+                        "harpoon" => anyhow::ensure!(
+                            channels.contains("harpoon")
+                                || !self.harpoon.targets.is_empty()
+                                || poll_channels.iter().any(|channel| channel == "main"),
+                            "control-plane.poll-channel harpoon has no routable target"
+                        ),
+                        _ => anyhow::ensure!(
+                            channels.contains(name),
+                            "control-plane.poll-channel {name:?} has no local handler"
+                        ),
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -241,9 +280,33 @@ impl Config {
                     .iter_mut()
                     .map(|server| &mut server.channel),
             )
-            .chain(self.control_plane.poll_channels.iter_mut())
         {
             *name = channel(name)?;
+        }
+        if let Some(channels) = &mut self.control_plane.poll_channels {
+            anyhow::ensure!(
+                !channels.is_empty(),
+                "control-plane.poll-channel contains an empty channel"
+            );
+            let mut poll_channels = BTreeSet::new();
+            for name in channels.iter_mut() {
+                let original = name.clone();
+                anyhow::ensure!(
+                    !original.trim().is_empty(),
+                    "control-plane.poll-channel contains an empty channel"
+                );
+                let normalized = channel(&original)?;
+                anyhow::ensure!(
+                    original == normalized,
+                    "control-plane.poll-channel {original:?} is not canonical; use {normalized:?}"
+                );
+                anyhow::ensure!(
+                    poll_channels.insert(normalized.clone()),
+                    "duplicate control-plane.poll-channel {normalized:?}"
+                );
+                *name = normalized;
+            }
+            channels.sort();
         }
         let optional = |value: &mut Option<String>| {
             if let Some(text) = value {
@@ -296,12 +359,10 @@ impl Config {
         Ok(())
     }
     pub fn enabled(&self, channel: &str) -> bool {
-        self.control_plane.poll_channels.is_empty()
-            || self
-                .control_plane
-                .poll_channels
-                .iter()
-                .any(|name| name == channel)
+        self.control_plane
+            .poll_channels
+            .as_ref()
+            .is_none_or(|channels| channels.iter().any(|name| name == channel))
     }
 }
 
@@ -316,7 +377,7 @@ settings!(ControlPlane {
     #[serde(skip)]
     initial_poll_timeout: Span = Span(Duration::from_secs(30)),
     poll_deadline_guardrail: Span = Span(Duration::from_secs(5)),
-    poll_channels: Vec<String> = Vec::new(),
+    poll_channels: Option<Vec<String>> = None,
     extra_headers: BTreeMap<String, String> = BTreeMap::new(),
     http_proxy: Option<String> = None,
     client_cert: Option<String> = None,

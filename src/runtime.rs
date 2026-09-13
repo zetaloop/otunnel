@@ -229,17 +229,19 @@ impl Tunnel {
             self.bindings.values().any(|binding| binding.available()),
             "no MCP channels configured"
         );
-        if self.config.control_plane.poll_channels.is_empty() {
+        if self.config.control_plane.poll_channels.is_none() {
             anyhow::ensure!(
                 self.bindings.contains_key("main"),
                 "main channel is required; set --mcp.server-url or --mcp.command"
             );
         }
-        for channel in &self.config.control_plane.poll_channels {
-            anyhow::ensure!(
-                self.bindings.contains_key(channel),
-                "channel {channel} has no binding"
-            );
+        if let Some(channels) = &self.config.control_plane.poll_channels {
+            for channel in channels {
+                anyhow::ensure!(
+                    self.bindings.contains_key(channel),
+                    "channel {channel} has no binding"
+                );
+            }
         }
         self.control.set_channels(channels(&self.bindings))?;
         Ok(())
@@ -247,7 +249,10 @@ impl Tunnel {
 
     pub async fn diagnose(mut self) -> Report {
         let mut checks = Vec::new();
-        match self.config.validate() {
+        match self
+            .config
+            .validate_with_channels(self.bindings.keys().cloned())
+        {
             Err(error) => checks.push(Check::fail("config_validation", format!("{error:#}"))),
             Ok(()) => {
                 match self.prepare(true).await {
@@ -370,7 +375,8 @@ impl Tunnel {
 
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
         let result = async {
-            self.config.validate()?;
+            self.config
+                .validate_with_channels(self.bindings.keys().cloned())?;
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 result = self.prepare(false) => result?,
