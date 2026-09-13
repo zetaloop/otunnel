@@ -14,7 +14,15 @@ async fn main() -> std::process::ExitCode {
             {
                 println!(
                     "{}",
-                    serde_json::json!({"checks":[{"name":"configuration","passed":false,"detail":format!("{error:#}")}],"channels":{}})
+                    serde_json::to_string(&otunnel::diagnostic::Report::new(
+                        vec![otunnel::diagnostic::Check::fail(
+                            "config_validation",
+                            format!("{error:#}")
+                        )],
+                        Default::default(),
+                        String::new(),
+                    ))
+                    .expect("diagnostic report")
                 );
             } else {
                 eprintln!("otunnel: {error:#}");

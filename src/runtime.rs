@@ -64,22 +64,7 @@ pub struct Activity {
     pub last_failed: bool,
 }
 
-#[derive(Serialize)]
-pub struct Check {
-    pub name: String,
-    pub passed: bool,
-    pub detail: String,
-}
-#[derive(Serialize)]
-pub struct Report {
-    pub checks: Vec<Check>,
-    pub channels: BTreeMap<String, Probe>,
-}
-impl Report {
-    pub fn passed(&self) -> bool {
-        self.checks.iter().all(|check| check.passed)
-    }
-}
+pub use crate::diagnostic::{Check, Report};
 
 /// A configured tunnel running on the caller's Tokio runtime.
 /// Use `bind` to attach a transport already owned by the host application.
@@ -175,7 +160,9 @@ impl Tunnel {
     }
 
     async fn prepare(&mut self, diagnostic: bool) -> Result<()> {
-        if self.config.cloudflared.managed || self.config.cloudflared.token.is_some() {
+        if !diagnostic
+            && (self.config.cloudflared.managed || self.config.cloudflared.token.is_some())
+        {
             let companion =
                 crate::cloudflare::Companion::new(&self.config.cloudflared, &self.control).await?;
             self.state
@@ -186,7 +173,14 @@ impl Tunnel {
         let mut pipes = Vec::new();
         for command in &self.config.mcp.commands {
             let enabled = self.config.enabled(&command.channel);
-            let mut process = Process::spawn(&command.command, enabled)?;
+            let output = if enabled {
+                std::process::Stdio::piped()
+            } else if diagnostic {
+                std::process::Stdio::from(std::io::stderr())
+            } else {
+                std::process::Stdio::inherit()
+            };
+            let mut process = Process::spawn(&command.command, output)?;
             if let Some(pid) = process.id() {
                 self.state.send_modify(|state| {
                     state.process_ids.insert(command.channel.clone(), pid);
@@ -231,32 +225,6 @@ impl Tunnel {
                 })
                 .collect();
         });
-        if diagnostic {
-            for (name, transport) in &self.bindings {
-                if !transport.available() {
-                    continue;
-                }
-                let mut probe = startup::probe(
-                    transport.as_ref(),
-                    self.config.mcp.startup_wait_timeout.0,
-                    true,
-                )
-                .await?;
-                match timeout(Duration::from_secs(5), transport.discover()).await {
-                    Ok(Ok(reply)) => probe.oauth_status = Some(reply.status),
-                    result => {
-                        probe.oauth_error = Some(match result {
-                            Ok(Err(error)) => format!("{error:#}"),
-                            Err(error) => error.to_string(),
-                            Ok(Ok(_)) => unreachable!(),
-                        })
-                    }
-                }
-                self.state.send_modify(|state| {
-                    state.channels.insert(name.clone(), probe);
-                });
-            }
-        }
         if self.config.enabled("harpoon") && !self.bindings.contains_key("harpoon") {
             self.bindings.insert("harpoon".into(), self.harpoon.clone());
             if !self.harpoon.is_empty() {
@@ -282,48 +250,125 @@ impl Tunnel {
 
     pub async fn diagnose(mut self) -> Report {
         let mut checks = Vec::new();
-        let configuration = self.config.validate();
-        checks.push(Check {
-            name: "configuration".into(),
-            passed: configuration.is_ok(),
-            detail: configuration.err().map_or_else(
-                || "configuration loaded".into(),
-                |error| format!("{error:#}"),
-            ),
-        });
-        match self.prepare(true).await {
-            Ok(()) => checks.push(Check {
-                name: "mcp".into(),
-                passed: true,
-                detail: "MCP initialization and tool discovery completed".into(),
-            }),
-            Err(error) => checks.push(Check {
-                name: "mcp".into(),
-                passed: false,
-                detail: format!("{error:#}"),
-            }),
-        }
-        match self.control.metadata().await {
-            Ok(_) => checks.push(Check {
-                name: "control_plane".into(),
-                passed: true,
-                detail: "tunnel metadata received".into(),
-            }),
-            Err(error) => checks.push(Check {
-                name: "control_plane".into(),
-                passed: false,
-                detail: format!("{error:#}"),
-            }),
+        match self.config.validate() {
+            Err(error) => checks.push(Check::fail("config_validation", format!("{error:#}"))),
+            Ok(()) => {
+                match self.prepare(true).await {
+                    Err(error) => checks.push(Check::fail("mcp_target", format!("{error:#}"))),
+                    Ok(()) => {
+                        for (channel, transport) in &self.bindings {
+                            if !transport.available() {
+                                continue;
+                            }
+                            let id = |name: &str| {
+                                if channel == "main" {
+                                    name.to_owned()
+                                } else {
+                                    format!("{name}.{channel}")
+                                }
+                            };
+                            let target = self
+                                .config
+                                .mcp
+                                .server_urls
+                                .iter()
+                                .find(|server| &server.channel == channel)
+                                .map(|server| server.url.clone())
+                                .or_else(|| {
+                                    self.config
+                                        .mcp
+                                        .commands
+                                        .iter()
+                                        .find(|command| &command.channel == channel)
+                                        .map(|command| command.command.clone())
+                                })
+                                .unwrap_or_else(|| channel.clone());
+                            checks.push(Check::pass(id("mcp_target"), target));
+                            match startup::probe(
+                                transport.as_ref(),
+                                self.config.mcp.startup_wait_timeout.0,
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(probe) => {
+                                    checks.push(Check::pass(
+                                        id("mcp_server_reachable"),
+                                        if probe.authentication_required {
+                                            "MCP endpoint requires authentication"
+                                        } else {
+                                            "MCP initialization completed"
+                                        },
+                                    ));
+                                    if let Some(count) = probe.tools {
+                                        checks.push(Check::pass(
+                                            id("mcp_tools"),
+                                            format!("{count} tools discovered"),
+                                        ));
+                                    }
+                                    self.state.send_modify(|state| {
+                                        state.channels.insert(channel.clone(), probe);
+                                    });
+                                }
+                                Err(error) => checks.push(Check::fail(
+                                    id("mcp_server_reachable"),
+                                    format!("{error:#}"),
+                                )),
+                            }
+                            let result = timeout(Duration::from_secs(5), transport.discover())
+                                .await
+                                .context("OAuth discovery timed out")
+                                .and_then(|result| result);
+                            let check = match result {
+                                Ok(reply) if reply.status == 404 && reply.message.is_none() => {
+                                    Check::skip(
+                                        id("oauth_metadata"),
+                                        "transport does not expose OAuth metadata",
+                                    )
+                                }
+                                Ok(reply) if (200..300).contains(&reply.status) => Check::pass(
+                                    id("oauth_metadata"),
+                                    "protected resource metadata discovered",
+                                ),
+                                Ok(reply) => Check::fail(
+                                    id("oauth_metadata"),
+                                    format!("OAuth discovery returned HTTP {}", reply.status),
+                                ),
+                                Err(error)
+                                    if error
+                                        .downcast_ref::<crate::oauth::DiscoveryError>()
+                                        .is_some_and(|error| error.optional) =>
+                                {
+                                    Check::skip(
+                                        id("oauth_metadata"),
+                                        "server does not advertise OAuth metadata",
+                                    )
+                                }
+                                Err(error) => {
+                                    Check::fail(id("oauth_metadata"), format!("{error:#}"))
+                                }
+                            };
+                            checks.push(check);
+                        }
+                    }
+                }
+                match self.control.metadata().await {
+                    Ok(_) => checks.push(Check::pass(
+                        "control_plane_connection",
+                        "tunnel metadata received",
+                    )),
+                    Err(error) => checks.push(Check::fail(
+                        "control_plane_connection",
+                        format!("{error:#}"),
+                    )),
+                }
+            }
         }
         let channels = self.state.borrow().channels.clone();
         if let Err(error) = self.shutdown().await {
-            checks.push(Check {
-                name: "shutdown".into(),
-                passed: false,
-                detail: format!("{error:#}"),
-            });
+            checks.push(Check::fail("shutdown", format!("{error:#}")));
         }
-        Report { checks, channels }
+        Report::new(checks, channels, String::new())
     }
 
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {

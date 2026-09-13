@@ -47,18 +47,14 @@ pub struct Process {
     child: Box<dyn ChildWrapper>,
 }
 impl Process {
-    pub fn spawn(invocation: &str, piped: bool) -> Result<Self> {
+    pub fn spawn(invocation: &str, output: Stdio) -> Result<Self> {
         let args = crate::config::command_args(invocation)?;
         let mut command = Command::new(&args[0]);
         command
             .args(&args[1..])
             .stdin(Stdio::piped())
+            .stdout(output)
             .stderr(Stdio::inherit());
-        command.stdout(if piped {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        });
         Self::launch(command)
     }
     pub fn launch(command: Command) -> Result<Self> {

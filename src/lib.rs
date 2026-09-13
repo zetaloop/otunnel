@@ -8,6 +8,7 @@ pub mod admin;
 mod cloudflare;
 pub mod config;
 pub mod control;
+pub mod diagnostic;
 pub mod harpoon;
 #[cfg(feature = "cli")]
 pub mod health;

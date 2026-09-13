@@ -1,5 +1,6 @@
 mod admin;
 mod cloudflared;
+mod doctor;
 mod health;
 mod management;
 mod profiles;
@@ -17,7 +18,6 @@ use otunnel::{
     CancellationToken, Tunnel,
     config::{Config, Log},
     health::Server,
-    runtime::Check,
 };
 use serde_json::{Value, json};
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
@@ -513,7 +513,8 @@ pub fn command() -> Command {
                 Command::new("doctor")
                     .about("Diagnose the configured transports, services, and control plane"),
             )
-            .arg(flag("json").help("Emit a JSON report")),
+            .arg(flag("json").help("Emit a JSON report"))
+            .arg(flag("explain").help("Explain failed checks and their evidence")),
         )
         .subcommand(health::command())
         .subcommand(cloudflared::command())
@@ -856,6 +857,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
     }
     match name {
         "health" => return health::execute(matches).await,
+        "doctor" => return doctor::execute(matches).await,
         "cloudflared" => return cloudflared::execute(matches),
         "admin" => return admin::execute(matches).await,
         "admin-profiles" => return management::profiles(matches),
@@ -912,54 +914,6 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
             drop(url_file);
             result.and(health)?;
             Ok(0)
-        }
-        "doctor" => {
-            let tunnel = Tunnel::new(config.clone())?;
-            let health =
-                if config.health.unix_socket.is_some() || !config.health.listen_addr.is_empty() {
-                    match Server::bind(&config, tunnel.status(), tunnel.harpoon()).await {
-                        Ok(server) => Some(Ok(server)),
-                        Err(error) => Some(Err(error)),
-                    }
-                } else {
-                    None
-                };
-            let mut report = tunnel.diagnose().await;
-            if let Some(health) = health {
-                let (passed, detail) = match health {
-                    Ok(server) => (true, format!("bound {}", server.url())),
-                    Err(error) => (false, format!("{error:#}")),
-                };
-                report.checks.push(Check {
-                    name: "health_listener".into(),
-                    passed,
-                    detail,
-                });
-            }
-            if matches.get_flag("json") {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                for check in &report.checks {
-                    println!(
-                        "CHECK {:<24} {} {}",
-                        check.name,
-                        if check.passed { "PASS" } else { "FAIL" },
-                        check.detail
-                    );
-                }
-                for (name, channel) in &report.channels {
-                    println!(
-                        "CHANNEL {name} HTTP {} tools={} oauth={}",
-                        channel.status,
-                        channel
-                            .tools
-                            .map_or_else(|| "-".into(), |count| count.to_string()),
-                        channel.authentication_required
-                    );
-                }
-                println!("RESULT {}", if report.passed() { "pass" } else { "fail" });
-            }
-            Ok(if report.passed() { 0 } else { 2 })
         }
         _ => unreachable!(),
     }
