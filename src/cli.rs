@@ -1,4 +1,5 @@
 mod admin;
+mod cloudflared;
 mod health;
 mod management;
 mod profiles;
@@ -515,6 +516,7 @@ pub fn command() -> Command {
             .arg(flag("json").help("Emit a JSON report")),
         )
         .subcommand(health::command())
+        .subcommand(cloudflared::command())
         .subcommand(admin::command())
         .subcommand(management::profiles_command())
         .subcommand(management::runtimes_command())
@@ -782,6 +784,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
     }
     match name {
         "health" => return health::execute(matches).await,
+        "cloudflared" => return cloudflared::execute(matches),
         "admin" => return admin::execute(matches).await,
         "admin-profiles" => return management::profiles(matches),
         "runtimes" => return management::runtimes(matches).await,
