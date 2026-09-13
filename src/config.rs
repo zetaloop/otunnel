@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
+use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // YAML null has the same effect as an omitted setting.
@@ -86,6 +87,15 @@ impl Config {
                 .is_none_or(|version| matches!(version, 1 | 2)),
             "unsupported config_version"
         );
+        anyhow::ensure!(
+            config.config_version == Some(2)
+                || config
+                    .harpoon
+                    .targets
+                    .iter()
+                    .all(|target| target.template.is_none()),
+            "Harpoon templates require config_version: 2"
+        );
         if config.config_version == Some(2) {
             // A version-two profile is a single YAML document, including empty trailing documents.
             serde_saphyr::from_str::<Self>(text)?;
@@ -106,6 +116,21 @@ impl Config {
         }
         if self.control_plane.max_inflight_requests == 0 || self.mcp.max_concurrent_requests == 0 {
             bail!("request concurrency must be positive");
+        }
+        if let Some(limit) = self.harpoon.max_response_bytes {
+            anyhow::ensure!(limit > 0, "harpoon.max-response-bytes must be positive");
+            anyhow::ensure!(
+                limit <= 100 * 1024,
+                "harpoon.max-response-bytes must be less than or equal to 102400"
+            );
+        }
+        anyhow::ensure!(
+            self.harpoon.max_redirects <= 5,
+            "harpoon.max-redirects must be less than or equal to 5"
+        );
+        for pattern in &self.harpoon.hosts_include_regex {
+            Regex::new(&format!("(?i:{})", pattern.trim()))
+                .with_context(|| format!("invalid harpoon host regex {pattern:?}"))?;
         }
         let mut channels = BTreeSet::new();
         for name in self

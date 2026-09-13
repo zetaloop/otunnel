@@ -45,6 +45,7 @@ httpdate = "1.0.3"
 humantime = "2.4.0"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
+indexmap = "2.14.2"
 percent-encoding = "2.3.2"
 process-wrap = { version = "10.0.0", features = ["tokio1"] }
 rand = "0.10.2"
@@ -54,7 +55,6 @@ rustls = "0.23.44"
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 same-file = { version = "1.0.6", optional = true }
-schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = "1.2.0"
 serde_json = { version = "1.0.151", features = ["arbitrary_precision", "raw_value"] }

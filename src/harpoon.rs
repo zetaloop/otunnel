@@ -1,20 +1,18 @@
 use std::{
-    collections::BTreeMap,
     net::IpAddr,
     sync::{Arc, LazyLock, RwLock},
-    time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD};
-use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use indexmap::IndexMap;
+use percent_encoding::percent_decode_str;
 use regex::Regex;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json, value::to_raw_value};
+use serde::Serialize;
+use serde_json::{
+    Value, json,
+    value::{RawValue, to_raw_value},
+};
 use url::Url;
 
 use crate::{
@@ -24,12 +22,19 @@ use crate::{
     transport::{Sink, Transport},
 };
 
-#[derive(Clone, Serialize, JsonSchema)]
+mod call;
+pub(crate) mod headers;
+
+#[derive(Clone, Serialize)]
 pub struct TargetInfo {
     pub label: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub category: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub source: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     pub allowed_methods: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,6 +50,7 @@ pub(crate) struct Target {
     pub info: TargetInfo,
     pub url: Url,
     pub original_url: String,
+    pub unix_socket: Option<String>,
     pub client: Http,
     pub template: Option<Arc<crate::template::Template>>,
 }
@@ -54,59 +60,7 @@ pub struct Harpoon {
     ca_bundle: Option<String>,
     proxy: Option<String>,
     patterns: Vec<Regex>,
-    targets: RwLock<BTreeMap<String, Target>>,
-}
-
-#[derive(Default, Deserialize, JsonSchema)]
-struct ListTargets {
-    #[serde(default)]
-    categories: Vec<String>,
-    #[serde(default)]
-    sources: Vec<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-}
-#[derive(Serialize, JsonSchema)]
-struct TargetList {
-    targets: Vec<TargetInfo>,
-}
-#[derive(Deserialize, JsonSchema)]
-struct CallTarget {
-    label: String,
-    method: String,
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-    #[serde(default)]
-    body: String,
-    timeout_ms: Option<u64>,
-    max_response_bytes: Option<usize>,
-    follow_redirects: Option<bool>,
-    max_redirects: Option<usize>,
-}
-#[derive(Deserialize, JsonSchema)]
-struct CallTemplate {
-    label: String,
-    parameters: BTreeMap<String, String>,
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-    timeout_ms: Option<u64>,
-    max_response_bytes: Option<usize>,
-}
-#[derive(Serialize, JsonSchema)]
-struct CallResponse {
-    status_code: u16,
-    headers: protocol::Headers,
-    body_base64: String,
-    body_size_bytes: usize,
-    truncated: bool,
-}
-#[derive(Deserialize, JsonSchema)]
-struct AudienceQuery {
-    label: String,
-}
-#[derive(Serialize, JsonSchema)]
-struct Audience {
-    audience: String,
+    targets: RwLock<IndexMap<String, Target>>,
 }
 
 impl Harpoon {
@@ -123,9 +77,11 @@ impl Harpoon {
                 .harpoon
                 .hosts_include_regex
                 .iter()
+                .map(|pattern| pattern.trim())
+                .filter(|pattern| !pattern.is_empty())
                 .map(|pattern| Regex::new(&format!("(?i:{pattern})")))
                 .collect::<std::result::Result<_, _>>()?,
-            targets: RwLock::new(BTreeMap::new()),
+            targets: RwLock::new(IndexMap::new()),
         };
         for target in &config.harpoon.targets {
             harpoon.register(target)?;
@@ -141,27 +97,22 @@ impl Harpoon {
             .transpose()?
             .map(Arc::new);
         anyhow::ensure!(
-            template.is_none() || target.url.is_empty(),
-            "Harpoon target selects either a URL or a template"
+            template.is_none()
+                || target.url.is_empty()
+                    && target.unix_socket.as_deref().unwrap_or_default().is_empty(),
+            "Harpoon target cannot combine a template with an exact URL or socket"
         );
-        let url = match &template {
-            Some(template) => template.origin().clone(),
-            None => Url::parse(&config::resolve(&target.url)?)?,
+        let original_url = match &template {
+            Some(template) => template.origin().to_string(),
+            None => config::resolve(&target.url)?,
         };
-        let client = Http::new(
-            url.clone(),
-            Options {
-                proxy: self.proxy.as_deref(),
-                ca_bundle: self.ca_bundle.as_deref(),
-                socket: target.unix_socket.as_deref(),
-                ..Default::default()
-            },
-        )?;
+        let url = Url::parse(&original_url)?;
+        let client = self.client(&url, target.unix_socket.as_deref())?;
         self.insert(Target {
             info: TargetInfo {
-                label: target.label.clone(),
-                description: target.description.clone(),
-                category: "manual".into(),
+                label: target.label.trim().into(),
+                description: target.description.trim().into(),
+                category: "config".into(),
                 source: "config".into(),
                 tags: Vec::new(),
                 allowed_methods: if template.is_some() {
@@ -172,31 +123,103 @@ impl Harpoon {
                 template_version: template.as_ref().map(|_| 1),
                 parameters_schema: template.as_ref().map(|template| template.schema()),
                 invocation: template.as_ref().map(|template| {
-                    template.invocation(&target.label, json!(schemars::schema_for!(CallTemplate)))
+                    template.invocation(target.label.trim(), self.call_schema(true))
                 }),
             },
-            original_url: target.url.clone(),
+            original_url,
+            unix_socket: target.unix_socket.clone(),
             url,
             client,
             template,
         })
     }
 
-    pub(crate) fn insert(&self, target: Target) -> Result<()> {
+    pub(crate) fn client(&self, url: &Url, socket: Option<&str>) -> Result<Http> {
+        Http::new(
+            url.clone(),
+            Options {
+                proxy: self.proxy.as_deref(),
+                ca_bundle: self.ca_bundle.as_deref(),
+                socket,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub(crate) fn insert(&self, mut target: Target) -> Result<()> {
+        target.info.label = target.info.label.trim().into();
+        anyhow::ensure!(
+            valid_label(&target.info.label),
+            "invalid Harpoon target label"
+        );
         anyhow::ensure!(
             matches!(target.url.scheme(), "http" | "https"),
             "Harpoon targets must use HTTP or HTTPS"
         );
+        anyhow::ensure!(
+            self.config.allow_plaintext_http || target.url.scheme() == "https",
+            "Harpoon target base URL must use https"
+        );
+        let key = url_key(&target.original_url)?;
+        target.unix_socket = target
+            .unix_socket
+            .map(|value| value.trim().into())
+            .filter(|value: &String| !value.is_empty());
+        target.info.description = target.info.description.trim().into();
+        let category = target.info.category.trim().to_ascii_lowercase();
+        target.info.category = if category.is_empty() {
+            target.info.source.trim().to_ascii_lowercase()
+        } else {
+            category
+        };
+        target.info.source = target.info.category.clone();
+        target.info.tags = target
+            .info
+            .tags
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
+        target.info.tags.sort();
+        target.info.tags.dedup();
         let mut targets = self.targets.write().expect("target registry lock poisoned");
-        if let Some(existing) = targets.get(&target.info.label) {
-            anyhow::ensure!(
-                existing.info.source == "oauth" && target.info.source == "oauth",
-                "duplicate Harpoon target {}",
-                target.info.label
-            );
+        anyhow::ensure!(
+            !targets.contains_key(&target.info.label),
+            "duplicate Harpoon target {}",
+            target.info.label
+        );
+        anyhow::ensure!(
+            targets.len() < 10000,
+            "Harpoon registry limit 10000 exceeded"
+        );
+        if target.template.is_none() {
+            for existing in targets.values().filter(|target| target.template.is_none()) {
+                anyhow::ensure!(
+                    url_key(&existing.original_url)? != key
+                        || existing.unix_socket == target.unix_socket,
+                    "duplicate Harpoon target URL uses a different transport"
+                );
+            }
         }
         targets.insert(target.info.label.clone(), target);
         Ok(())
+    }
+
+    pub(crate) fn label(&self, base: &str) -> Result<String> {
+        let targets = self.targets.read().expect("target registry lock poisoned");
+        for index in 0..10000 {
+            let candidate = if index == 0 {
+                base.chars().take(64).collect::<String>()
+            } else {
+                let suffix = format!("-{index}");
+                let prefix = base.chars().take(64 - suffix.len()).collect::<String>();
+                format!("{}{suffix}", prefix.trim_end_matches(['-', '_']))
+            };
+            if !targets.contains_key(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        anyhow::bail!("Harpoon target label namespace is exhausted")
     }
 
     pub fn targets(&self) -> Vec<TargetInfo> {
@@ -225,24 +248,26 @@ impl Harpoon {
         if self.config.hosts_include_loopback && host == "localhost" {
             return true;
         }
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Ok(mut ip) = host.parse::<IpAddr>() {
+            if let IpAddr::V6(value) = ip
+                && let Some(value) = value.to_ipv4_mapped()
+            {
+                ip = IpAddr::V4(value);
+            }
             if self.config.hosts_include_loopback && ip.is_loopback() {
                 return true;
             }
             if self.config.hosts_include_private
                 && match ip {
                     IpAddr::V4(ip) => ip.is_private(),
-                    IpAddr::V6(ip) => {
-                        ip.is_unique_local()
-                            || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_private())
-                    }
+                    IpAddr::V6(ip) => ip.is_unique_local(),
                 }
             {
                 return true;
             }
         }
         self.config.hosts_include_suffix.iter().any(|suffix| {
-            let suffix = suffix.trim_matches('.').to_ascii_lowercase();
+            let suffix = suffix.trim().trim_start_matches('.').to_ascii_lowercase();
             !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
         }) || self.patterns.iter().any(|pattern| pattern.is_match(&host))
     }
@@ -251,19 +276,23 @@ impl Harpoon {
         self.targets
             .read()
             .expect("target registry lock poisoned")
-            .get(label)
+            .get(label.trim())
             .cloned()
-            .with_context(|| format!("unknown Harpoon target {label}"))
+            .context("unknown target")
     }
 
     fn destination(&self, url: &Url) -> Result<Target> {
+        let key = url_key(url.as_str())?;
         self.targets
             .read()
             .expect("target registry lock poisoned")
             .values()
-            .find(|target| target.template.is_none() && target.url == *url)
+            .find(|target| {
+                target.template.is_none()
+                    && url_key(&target.original_url).is_ok_and(|value| value == key)
+            })
             .cloned()
-            .context("redirect destination is not a registered Harpoon target")
+            .context("redirect blocked")
     }
 
     pub(crate) fn rewrite(&self, value: &mut Value) -> bool {
@@ -292,268 +321,146 @@ impl Harpoon {
     }
 
     fn tools(&self) -> Result<Value> {
-        let mut tools = vec![
-            tool::<ListTargets, TargetList>(
-                "list_targets",
-                "List available HTTP targets by label and OAuth role.",
-                true,
-            )?,
-            tool::<CallTarget, CallResponse>(
-                "call_target",
-                "Send an HTTP request to a configured target. Response bytes are returned as base64.",
-                false,
-            )?,
-            tool::<AudienceQuery, Audience>(
-                "get_oauth_target_audience",
-                "Resolve the original token endpoint URL for a private_key_jwt audience.",
-                true,
-            )?,
-        ];
-        if self
+        let templates = self
             .targets
             .read()
             .expect("target registry lock poisoned")
             .values()
-            .any(|target| target.template.is_some())
-        {
-            tools.push(tool::<CallTemplate, CallResponse>(
+            .any(|target| target.template.is_some());
+        let mut tools = vec![tool(
+            "call_target",
+            "Call Harpoon target",
+            "Call an allowlisted HTTP target by label.",
+            self.call_schema(false),
+            self.response_schema(),
+            false,
+            Some(true),
+        )];
+        if templates {
+            tools.push(tool(
                 "call_target_template",
-                "Invoke a configured GET operation using its declared parameters and headers.",
+                "Call Harpoon target template",
+                "Call a version-1 GET target template using only its declared string parameters and permitted headers. Discover the tool name, complete input schema, and available examples in each list_targets entry's invocation. The target fixes the destination and disables redirects.",
+                self.call_schema(true),
+                self.response_schema(),
                 true,
-            )?);
+                None,
+            ));
         }
-        Ok(json!({"tools":tools}))
+        tools.push(tool(
+            "get_oauth_target_audience",
+            "Get OAuth target audience",
+            "Resolve the exact private_key_jwt audience for an OAuth token endpoint target.",
+            self.audience_input_schema(),
+            self.audience_output_schema(),
+            true,
+            Some(false),
+        ));
+        tools.push(tool(
+            "list_targets",
+            "List Harpoon targets",
+            "List available Harpoon targets by label.",
+            self.list_input_schema(),
+            self.list_output_schema(templates),
+            true,
+            Some(false),
+        ));
+        Ok(json!({"ttlMs":0,"cacheScope":"public","tools":tools}))
     }
+}
 
-    async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
-        match name {
-            "list_targets" => {
-                let filter: ListTargets = serde_json::from_value(arguments)?;
-                let targets = self
-                    .targets()
-                    .into_iter()
-                    .filter(|target| {
-                        (filter.categories.is_empty()
-                            || filter
-                                .categories
-                                .iter()
-                                .any(|value| value.eq_ignore_ascii_case(&target.category)))
-                            && (filter.sources.is_empty()
-                                || filter
-                                    .sources
-                                    .iter()
-                                    .any(|value| value.eq_ignore_ascii_case(&target.source)))
-                            && filter.tags.iter().all(|value| {
-                                target
-                                    .tags
-                                    .iter()
-                                    .any(|tag| value.eq_ignore_ascii_case(tag))
-                            })
-                    })
-                    .collect();
-                Ok(serde_json::to_value(TargetList { targets })?)
-            }
-            "get_oauth_target_audience" => {
-                let query: AudienceQuery = serde_json::from_value(arguments)?;
-                let target = self.target(&query.label)?;
-                anyhow::ensure!(
-                    target.info.category == "oauth"
-                        && target.info.tags.iter().any(|tag| tag == "token-endpoint"),
-                    "target is not an OAuth token endpoint"
-                );
-                Ok(serde_json::to_value(Audience {
-                    audience: target.original_url,
-                })?)
-            }
-            "call_target" | "call_target_template" => {
-                let (call, parameters) = if name == "call_target_template" {
-                    let call: CallTemplate = serde_json::from_value(arguments)?;
-                    (
-                        CallTarget {
-                            label: call.label,
-                            method: "GET".into(),
-                            headers: call.headers,
-                            body: String::new(),
-                            timeout_ms: call.timeout_ms,
-                            max_response_bytes: call.max_response_bytes,
-                            follow_redirects: Some(false),
-                            max_redirects: Some(0),
-                        },
-                        Some(call.parameters),
-                    )
-                } else {
-                    (serde_json::from_value::<CallTarget>(arguments)?, None)
-                };
-                let duration = Duration::from_millis(call.timeout_ms.unwrap_or(30_000));
-                Ok(serde_json::to_value(
-                    tokio::time::timeout(duration, self.request(call, parameters))
-                        .await
-                        .context("Harpoon request timed out")??,
-                )?)
-            }
-            _ => bail!("unknown Harpoon tool {name}"),
-        }
-    }
+pub(crate) fn valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 64
+        && label.as_bytes()[0].is_ascii_alphanumeric()
+        && label
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_-".contains(&c))
+}
 
-    async fn request(
-        &self,
-        call: CallTarget,
-        parameters: Option<BTreeMap<String, String>>,
-    ) -> Result<CallResponse> {
-        let mut target = self.target(&call.label)?;
-        let mut method = Method::from_bytes(call.method.to_ascii_uppercase().as_bytes())?;
+fn url_key(raw: &str) -> Result<String> {
+    let (scheme, rest) = raw
+        .split_once("://")
+        .context("target URL must include scheme and host")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    anyhow::ensure!(
+        !authority.is_empty(),
+        "target URL must include scheme and host"
+    );
+    let suffix = &rest[end..];
+    let path = suffix.split(['?', '#']).next().unwrap_or_default();
+    let path = percent_decode_str(path).decode_utf8()?;
+    for part in path.split('/') {
+        let part = percent_decode_str(part).decode_utf8()?;
         anyhow::ensure!(
-            matches!(method, Method::GET | Method::POST | Method::PUT),
-            "unsupported Harpoon method"
+            !matches!(part.as_ref(), "." | ".."),
+            "target URL contains invalid path segments"
         );
-        let mut headers = HeaderMap::new();
-        for (name, value) in &call.headers {
-            headers.insert(HeaderName::try_from(name)?, HeaderValue::try_from(value)?);
-        }
-        match (&target.template, parameters) {
-            (Some(template), Some(parameters)) => {
-                (target.url, headers) = template.render(&parameters, headers)?;
-            }
-            (None, None) => {}
-            _ => bail!("template targets use call_target_template with declared parameters"),
-        }
-        let nominated: Vec<_> = headers
-            .get_all("connection")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .map(|v| v.trim().to_owned())
-            .collect();
-        for name in nominated {
-            headers.remove(name);
-        }
-        for name in [
-            "connection",
-            "content-length",
-            "host",
-            "transfer-encoding",
-            "keep-alive",
-            "proxy-connection",
-            "proxy-authorization",
-            "te",
-            "trailer",
-            "upgrade",
-        ] {
-            headers.remove(name);
-        }
-        let mut body = Bytes::from(call.body);
-        let redirects = if call.follow_redirects.unwrap_or(true) {
-            call.max_redirects
-                .unwrap_or(self.config.max_redirects)
-                .min(self.config.max_redirects)
-        } else {
-            0
-        };
-        let limit = match (call.max_response_bytes, self.config.max_response_bytes) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        for hop in 0..=redirects {
-            let mut response = target
-                .client
-                .send(method.clone(), &target.url, headers.clone(), body.clone())
-                .await?;
-            if hop < redirects
-                && response.status.is_redirection()
-                && let Some(location) = response.headers.get("location")
-            {
-                let next = target.url.join(location.to_str()?)?;
-                if next.origin() != target.url.origin() {
-                    headers.remove("authorization");
-                    headers.remove("cookie");
-                }
-                if response.status == StatusCode::SEE_OTHER
-                    || (method == Method::POST
-                        && matches!(
-                            response.status,
-                            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
-                        ))
-                {
-                    method = Method::GET;
-                    body = Bytes::new();
-                    headers.remove("content-type");
-                }
-                target = self.destination(&next)?;
-                continue;
-            }
-            let status_code = response.status.as_u16();
-            let mut response_headers = protocol::wire_headers(&response.headers, false);
-            let mut bytes = BytesMut::new();
-            while let Some(chunk) = response.body.next().await {
-                let chunk = chunk?;
-                anyhow::ensure!(
-                    limit.is_none_or(|limit| chunk.len() <= limit.saturating_sub(bytes.len())),
-                    "Harpoon response exceeds configured size limit"
-                );
-                bytes.extend_from_slice(&chunk);
-            }
-            let mut bytes = bytes.freeze();
-            if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes)
-                && self.rewrite(&mut value)
-            {
-                bytes = Bytes::from(serde_json::to_vec(&value)?);
-                response_headers.remove("content-length");
-            }
-            self.rewrite_headers(&mut response_headers);
-            return Ok(CallResponse {
-                status_code,
-                headers: response_headers,
-                body_base64: STANDARD.encode(&bytes),
-                body_size_bytes: bytes.len(),
-                truncated: false,
-            });
-        }
-        unreachable!()
     }
+    let authority = match authority.rsplit_once('@') {
+        Some((user, host)) => format!("{user}@{}", host.to_ascii_lowercase()),
+        None => authority.to_ascii_lowercase(),
+    };
+    Ok(format!(
+        "{}://{authority}{suffix}",
+        scheme.to_ascii_lowercase()
+    ))
 }
 
-fn tool<I: JsonSchema, O: JsonSchema>(
+fn tool(
     name: &str,
+    title: &str,
     description: &str,
+    input: Value,
+    output: Value,
     read_only: bool,
-) -> Result<Value> {
-    Ok(
-        json!({"name":name,"description":description,"inputSchema":schemars::schema_for!(I),"outputSchema":schemars::schema_for!(O),
-        "annotations":{"readOnlyHint":read_only,"idempotentHint":read_only,"openWorldHint":!read_only}}),
-    )
+    open_world: Option<bool>,
+) -> Value {
+    let mut annotations = json!({"readOnlyHint":read_only,"idempotentHint":read_only});
+    if let Some(open_world) = open_world {
+        annotations["openWorldHint"] = json!(open_world);
+    }
+    json!({"name":name,"title":title,"description":description,"inputSchema":input,"outputSchema":output,"annotations":annotations})
 }
 
-fn rewrite_url(value: &str, key: &str, targets: &BTreeMap<String, Target>) -> Option<String> {
-    let url = Url::parse(value).ok()?;
-    let matches: Vec<_> = targets
+fn rewrite_url(value: &str, key: &str, targets: &IndexMap<String, Target>) -> Option<String> {
+    let url = url_key(value).ok()?;
+    let candidates: Vec<_> = targets
         .values()
-        .filter(|target| target.template.is_none() && target.url == url)
+        .filter(|target| {
+            target.template.is_none()
+                && url_key(&target.original_url).is_ok_and(|candidate| candidate == url)
+        })
         .collect();
     if key == "resource"
-        && matches.iter().any(|target| {
-            target
-                .info
-                .tags
+        && candidates.iter().any(|target| {
+            ["protected-resource-metadata", "resource"]
                 .iter()
-                .any(|tag| tag == "protected-resource-metadata")
+                .all(|tag| target.info.tags.iter().any(|value| value == tag))
         })
     {
         return None;
     }
     let role = match key {
         "authorization_servers" => "authorization-server",
+        "introspection_endpoint" => "introspection-endpoint",
+        "issuer" => "issuer",
         "jwks_uri" => "jwks-uri",
-        _ => key,
+        "registration_endpoint" => "registration-endpoint",
+        "revocation_endpoint" => "revocation-endpoint",
+        "token_endpoint" => "token-endpoint",
+        _ => "",
     };
-    let role = role.replace('_', "-");
-    let target = matches
+    let target = candidates
         .iter()
-        .find(|target| target.info.tags.contains(&role))
+        .find(|target| target.info.tags.iter().any(|tag| tag == role))
         .copied()
-        .or_else(|| matches.first().copied())?;
+        .or_else(|| candidates.first().copied())?;
     Some(format!("harpoon://{}", target.info.label))
 }
-fn rewrite_value(value: &mut Value, key: &str, targets: &BTreeMap<String, Target>) -> bool {
+
+fn rewrite_value(value: &mut Value, key: &str, targets: &IndexMap<String, Target>) -> bool {
     let mut changed = false;
     match value {
         Value::Object(object) => {
@@ -598,23 +505,28 @@ impl Transport for Harpoon {
             Some("tools/call") => {
                 let params = protocol::field(&request.message, "params")
                     .context("tools/call has no parameters")?;
-                let params: Value = serde_json::from_str(params.get())?;
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("tool name is missing")?;
-                match self
-                    .call(
-                        name,
-                        params
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or_else(|| json!({})),
-                    )
-                    .await
-                {
+                let name = protocol::field(&params, "name").context("tool name is missing")?;
+                let name: String = serde_json::from_str(name.get())?;
+                let empty = RawValue::from_string("{}".into())?;
+                let arguments = protocol::field(&params, "arguments").unwrap_or(empty);
+                match self.call(&name, &arguments).await {
                     Ok(value) => {
-                        json!({"content":[{"type":"text","text":serde_json::to_string(&value)?}],"structuredContent":value})
+                        let mut text = value.clone();
+                        if name == "call_target" {
+                            let fields = text.as_object_mut().expect("call result");
+                            fields.remove("truncated");
+                            if fields
+                                .get("headers")
+                                .and_then(Value::as_object)
+                                .is_some_and(|value| value.is_empty())
+                            {
+                                fields.remove("headers");
+                            }
+                            if fields.get("body_base64").and_then(Value::as_str) == Some("") {
+                                fields.remove("body_base64");
+                            }
+                        }
+                        json!({"content":[{"type":"text","text":serde_json::to_string(&text)?}],"structuredContent":value})
                     }
                     Err(error) => {
                         json!({"isError":true,"content":[{"type":"text","text":format!("{error:#}")}]})
