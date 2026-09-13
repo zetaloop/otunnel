@@ -14,6 +14,23 @@ use crate::{
     transport::HttpTransport,
 };
 
+#[derive(Debug)]
+pub(crate) struct DiscoveryError {
+    pub optional: bool,
+    pub retry: bool,
+    error: anyhow::Error,
+}
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.error)
+    }
+}
+impl std::error::Error for DiscoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 struct Document {
     url: Url,
     value: Value,
@@ -136,7 +153,7 @@ fn resource_metadata(header: &str) -> Option<&str> {
     None
 }
 
-async fn discovery_candidates(transport: &HttpTransport) -> Vec<Url> {
+async fn discovery_candidates(transport: &HttpTransport) -> (Vec<Url>, bool) {
     let probe = tokio::time::timeout(Duration::from_secs(1), async {
         let incoming = HeaderMap::new();
         for method in [Method::POST, Method::GET] {
@@ -175,6 +192,7 @@ async fn discovery_candidates(transport: &HttpTransport) -> Vec<Url> {
     .ok()
     .flatten();
 
+    let advertised = probe.is_some();
     let mut candidates = Vec::new();
     if let Some(url) = probe {
         candidates.push(url);
@@ -198,7 +216,7 @@ async fn discovery_candidates(transport: &HttpTransport) -> Vec<Url> {
 
     let mut seen = BTreeSet::new();
     candidates.retain(|url| seen.insert(url.as_str().to_owned()));
-    candidates
+    (candidates, advertised)
 }
 
 async fn request_document(transport: &HttpTransport, url: &Url) -> Result<Fetched> {
@@ -235,7 +253,8 @@ async fn request_document(transport: &HttpTransport, url: &Url) -> Result<Fetche
 }
 
 pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
-    let mut resource = fetch_resource(transport, discovery_candidates(transport).await).await?;
+    let (candidates, advertised) = discovery_candidates(transport).await;
+    let mut resource = fetch_resource(transport, candidates, advertised).await?;
     if let Some(registry) = &transport.harpoon {
         let group = auth_group(&resource.url);
         let resource_url = resource
@@ -381,81 +400,88 @@ fn register(
     })
 }
 
-async fn fetch_resource(transport: &HttpTransport, candidates: Vec<Url>) -> Result<Document> {
+async fn fetch_resource(
+    transport: &HttpTransport,
+    candidates: Vec<Url>,
+    advertised: bool,
+) -> Result<Document> {
     let count = candidates.len();
-    let mut failure = None;
+    let mut missing = count > 0 && !advertised;
+    let mut timed_out = count > 0;
+    let mut failure = anyhow::anyhow!("OAuth discovery has no metadata candidates");
     for (index, url) in candidates.into_iter().enumerate() {
         let fetched = match request_document(transport, &url).await {
             Ok(fetched) => fetched,
             Err(error) => {
-                failure = Some(error.context(format!("OAuth discovery GET {url}")));
+                missing = false;
+                timed_out &= error.is::<tokio::time::error::Elapsed>()
+                    || error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(reqwest::Error::is_timeout)
+                    });
+                failure = error.context(format!("OAuth discovery GET {url}"));
                 continue;
             }
         };
-        let fallback = matches!(fetched.status, 404 | 500..=599) && index + 1 < count;
-        if fetched.too_large {
-            let error = anyhow::anyhow!(
+        missing &= fetched.status == 404;
+        timed_out = false;
+        let next = matches!(fetched.status, 404 | 500..=599) && index + 1 < count;
+        let result = (|| {
+            anyhow::ensure!(
+                !fetched.too_large,
                 "OAuth discovery response body from {url} exceeds {METADATA_LIMIT} bytes"
             );
-            if fallback {
-                failure = Some(error);
-                continue;
-            }
-            return Err(error);
-        }
-        if fetched.body.is_empty() {
-            let error = anyhow::anyhow!(
+            anyhow::ensure!(
+                !fetched.body.is_empty(),
                 "OAuth discovery empty body from {url} (status {})",
                 fetched.status
             );
-            if fallback {
-                failure = Some(error);
-                continue;
-            }
-            return Err(error);
-        }
-        if fallback {
-            failure = Some(anyhow::anyhow!(
+            anyhow::ensure!(
+                !next,
                 "OAuth discovery status {} from {url}",
                 fetched.status
-            ));
-            continue;
-        }
-        let value: Value = match serde_json::from_slice(&fetched.body) {
-            Ok(value) => value,
-            Err(error) => {
-                let error = anyhow::Error::new(error)
-                    .context(format!("OAuth discovery invalid metadata from {url}"));
-                if fetched.status >= 500 && index + 1 < count {
-                    failure = Some(error);
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        anyhow::ensure!(
-            value
-                .get("resource")
+            );
+            let value: Value = serde_json::from_slice(&fetched.body)
+                .context("OAuth discovery invalid metadata")?;
+            anyhow::ensure!(
+                value
+                    .get("resource")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty()),
+                "protected resource metadata is missing resource"
+            );
+            if let Some(issuer) = value
+                .pointer("/authorization_servers/0")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty()),
-            "protected resource metadata is missing resource"
-        );
-        if let Some(issuer) = value
-            .pointer("/authorization_servers/0")
-            .and_then(Value::as_str)
-        {
-            issuer
-                .parse::<http::Uri>()
-                .context("protected resource metadata has an invalid authorization server")?;
+            {
+                issuer
+                    .parse::<http::Uri>()
+                    .context("protected resource metadata has an invalid authorization server")?;
+            }
+            Ok::<_, anyhow::Error>(Document {
+                url,
+                value,
+                headers: fetched.headers,
+                status: fetched.status,
+            })
+        })();
+        match result {
+            Ok(document) => return Ok(document),
+            Err(error) => {
+                failure = error;
+                if !next {
+                    break;
+                }
+            }
         }
-        return Ok(Document {
-            url,
-            value,
-            headers: fetched.headers,
-            status: fetched.status,
-        });
     }
-    Err(failure.unwrap_or_else(|| anyhow::anyhow!("OAuth discovery has no metadata candidates")))
+    Err(DiscoveryError {
+        optional: missing,
+        retry: timed_out,
+        error: failure,
+    }
+    .into())
 }
 
 fn authorization_candidates(issuer: &Url) -> Result<Vec<Url>> {

@@ -145,7 +145,7 @@ async fn monitor(
                 state.send_if_modified(|state| {
                     if state.cloudflare_ready == Some(ready) { return false; }
                     state.cloudflare_ready = Some(ready);
-                    state.ready = state.connected && ready;
+                    state.refresh_readiness();
                     true
                 });
             }

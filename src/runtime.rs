@@ -23,9 +23,15 @@ use crate::{
     transport::{self, HttpTransport, Pipe, Probe, Sink, Transport},
 };
 
+mod startup;
+pub use startup::Startup;
+
 #[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
     pub ready: bool,
+    pub mcp_probe: Startup,
+    pub oauth: Startup,
+    pub metadata_error: Option<String>,
     pub connected: bool,
     pub control: crate::control::Observation,
     pub lifecycle: &'static str,
@@ -64,6 +70,7 @@ pub struct Tunnel {
     harpoon: Arc<crate::harpoon::Harpoon>,
     bindings: BTreeMap<String, Arc<dyn Transport>>,
     children: JoinSet<Result<()>>,
+    observers: JoinSet<()>,
     stop: CancellationToken,
     state: watch::Sender<Snapshot>,
 }
@@ -102,6 +109,7 @@ impl Tunnel {
             harpoon,
             bindings: BTreeMap::new(),
             children: JoinSet::new(),
+            observers: JoinSet::new(),
             stop: CancellationToken::new(),
             state,
         })
@@ -139,12 +147,6 @@ impl Tunnel {
             self.children
                 .spawn(companion.supervise(self.stop.clone(), self.state.clone()));
         }
-        let wait = self.config.mcp.startup_wait_timeout.0;
-        let probe_timeout = if wait.is_zero() {
-            Duration::from_secs(2)
-        } else {
-            wait
-        };
         let mut pipes = Vec::new();
         for command in &self.config.mcp.commands {
             let enabled = self.config.enabled(&command.channel);
@@ -179,75 +181,36 @@ impl Tunnel {
                 .send_initialized_notification(self.config.mcp.stdio_send_initialized_notification);
             self.bindings.insert(channel, Arc::new(pipe));
         }
-        for (name, transport) in &self.bindings {
-            if !transport.available() {
-                continue;
-            }
-            if !diagnostic && !transport.startup_probe() {
+        if diagnostic {
+            for (name, transport) in &self.bindings {
+                if !transport.available() {
+                    continue;
+                }
+                let mut probe = startup::probe(
+                    transport.as_ref(),
+                    self.config.mcp.startup_wait_timeout.0,
+                    true,
+                )
+                .await?;
+                match timeout(Duration::from_secs(5), transport.discover()).await {
+                    Ok(Ok(reply)) => probe.oauth_status = Some(reply.status),
+                    result => {
+                        probe.oauth_error = Some(match result {
+                            Ok(Err(error)) => format!("{error:#}"),
+                            Err(error) => error.to_string(),
+                            Ok(Ok(_)) => unreachable!(),
+                        })
+                    }
+                }
                 self.state.send_modify(|state| {
-                    state.channels.insert(
-                        name.clone(),
-                        transport::Probe {
-                            status: 200,
-                            authentication_required: false,
-                            server: None,
-                            tools: None,
-                            oauth_status: None,
-                            oauth_error: None,
-                        },
-                    );
+                    state.channels.insert(name.clone(), probe);
                 });
-                continue;
             }
-            let deadline = Instant::now() + probe_timeout;
-            let probe = async {
-                loop {
-                    match transport::probe(transport.as_ref()).await {
-                        Ok(probe) => return Ok(probe),
-                        Err(error) if !wait.is_zero() && crate::net::connecting(&error) => {
-                            tracing::debug!(channel = %name, %error, "MCP service is starting");
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            };
-            let mut result = tokio::select! {
-                result = timeout_at(deadline, probe) => result.with_context(|| format!("channel {name} startup timed out"))?,
-                result = self.children.join_next(), if !self.children.is_empty() => {
-                    result.context("child supervisor stopped")???;
-                    bail!("MCP child stopped during startup");
-                }
-            }.with_context(|| format!("probe channel {name}"))?;
-            let discovery = timeout_at(deadline, transport.discover())
-                .await
-                .context("OAuth discovery timed out")
-                .and_then(|result| result);
-            match discovery {
-                Ok(reply) => {
-                    result.oauth_status = Some(reply.status);
-                    anyhow::ensure!(
-                        !result.authentication_required || (200..300).contains(&reply.status),
-                        "channel {name} requires authentication but OAuth discovery returned HTTP {}",
-                        reply.status
-                    );
-                }
-                Err(error) => {
-                    if result.authentication_required {
-                        return Err(error.context(format!("OAuth discovery for channel {name}")));
-                    }
-                    tracing::debug!(channel = %name, %error, "optional OAuth discovery unavailable");
-                    result.oauth_error = Some(format!("{error:#}"));
-                }
-            }
-            self.state.send_modify(|state| {
-                state.channels.insert(name.clone(), result);
-            });
         }
         if self.config.enabled("harpoon") && !self.bindings.contains_key("harpoon") {
             self.bindings.insert("harpoon".into(), self.harpoon.clone());
             if !self.harpoon.is_empty() {
-                let probe = transport::probe(self.harpoon.as_ref()).await?;
+                let probe = transport::probe(self.harpoon.as_ref(), diagnostic).await?;
                 self.state.send_modify(|state| {
                     state.channels.insert("harpoon".into(), probe);
                 });
@@ -264,13 +227,6 @@ impl Tunnel {
             );
         }
         self.control.set_channels(channels(&self.bindings))?;
-        if self.state.borrow().cloudflare_ready == Some(false) {
-            let mut status = self.state.subscribe();
-            tokio::select! {
-                result = status.wait_for(|state| state.cloudflare_ready == Some(true)) => { result?; }
-                result = self.children.join_next() => { result.context("companion supervisor stopped")???; }
-            }
-        }
         Ok(())
     }
 
@@ -327,15 +283,10 @@ impl Tunnel {
                 () = shutdown.cancelled() => return Ok(()),
                 result = self.prepare(false) => result?,
             }
-            tokio::select! {
-                () = shutdown.cancelled() => return Ok(()),
-                result = self.control.metadata() => { result?; }
-            }
+            self.observe();
             self.state.send_modify(|state| {
-                state.connected = true;
-                state.control = self.control.connection().borrow().clone();
                 state.lifecycle = "running";
-                state.ready = state.cloudflare_ready.unwrap_or(true);
+                state.refresh_readiness();
             });
             tracing::info!(channels = self.bindings.len(), "tunnel connected");
             self.dispatch(&shutdown).await
@@ -475,6 +426,11 @@ impl Tunnel {
     async fn shutdown(&mut self) -> Result<()> {
         self.stop.cancel();
         let mut failure = None;
+        while let Some(result) = self.observers.join_next().await {
+            if let Err(error) = result {
+                failure.get_or_insert(error.into());
+            }
+        }
         for transport in self.bindings.values() {
             if let Err(error) = transport.close().await {
                 failure.get_or_insert(error);

@@ -113,7 +113,7 @@ pub(crate) async fn negotiate(transport: &dyn Transport) -> Result<(Reply, bool)
     Ok((exchange(transport, request).await?, false))
 }
 
-pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
+pub async fn probe(transport: &dyn Transport, list_tools: bool) -> Result<Probe> {
     let (reply, stateless) = negotiate(transport).await?;
     let mut probe = Probe {
         status: reply.status,
@@ -169,7 +169,7 @@ pub async fn probe(transport: &dyn Transport) -> Result<Probe> {
             initialized.discovery = true;
             exchange(transport, initialized).await?;
         }
-        if value.pointer("/capabilities/tools").is_some() {
+        if list_tools && value.pointer("/capabilities/tools").is_some() {
             let mut cursor: Option<String> = None;
             let mut count = 0;
             loop {
