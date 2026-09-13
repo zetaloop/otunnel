@@ -1,7 +1,8 @@
-use std::sync::LazyLock;
+use std::{collections::BTreeSet, sync::LazyLock, time::Duration};
 
-use anyhow::{Context, Result, bail};
-use bytes::Bytes;
+use anyhow::{Context, Result};
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use http::{HeaderMap, Method};
 use regex::Regex;
 use serde_json::{Value, value::to_raw_value};
@@ -20,139 +21,302 @@ struct Document {
     status: u16,
 }
 
-pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
-    let challenge = transport
-        .challenge
-        .read()
-        .expect("authentication lock poisoned")
-        .clone();
-    let challenge = match challenge {
-        Some(headers) => headers,
-        None => {
-            transport
-                .client
-                .send(
-                    Method::POST,
-                    &transport.url,
-                    transport.discovery_headers.clone(),
-                    Bytes::new(),
-                )
-                .await?
-                .headers
+const METADATA_LIMIT: usize = 1024 * 1024;
+
+struct Fetched {
+    status: u16,
+    headers: HeaderMap,
+    body: Bytes,
+    too_large: bool,
+}
+
+#[derive(Clone)]
+struct Record {
+    raw: String,
+    role: &'static str,
+    description: &'static str,
+    index: usize,
+    group: Option<String>,
+}
+
+impl Record {
+    fn new(raw: impl Into<String>, role: &'static str, description: &'static str) -> Self {
+        Self {
+            raw: raw.into(),
+            role,
+            description,
+            index: 0,
+            group: None,
         }
-    };
-    let mut candidates = Vec::new();
+    }
+
+    fn group(mut self, group: &str) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+}
+
+fn auth_group(source: &Url) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(source.as_str().as_bytes());
+    let id = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("auth-server:{id}:0")
+}
+
+fn role_tags(role: &str) -> Vec<String> {
+    match role {
+        "prmd-resource" => vec!["protected-resource-metadata".into(), "resource".into()],
+        "prmd-auth-server" => {
+            vec![
+                "authorization-server".into(),
+                "protected-resource-metadata".into(),
+            ]
+        }
+        "prmd-source" => vec!["protected-resource-metadata".into(), "source-url".into()],
+        "auth-server-metadata" => vec!["auth-server-metadata".into()],
+        role => vec!["auth-server-metadata".into(), role.into()],
+    }
+}
+
+fn http_url(raw: &str) -> Option<Url> {
+    let url = Url::parse(raw).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then_some(url)
+}
+
+fn resource_metadata(header: &str) -> Option<&str> {
     static PARAMETER: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)(?:^|[\s,])resource_metadata\s*=\s*(?:"([^"]*)"|([^,\s]+))"#)
             .expect("authentication parameter pattern")
     });
-    for header in challenge.get_all("www-authenticate") {
-        if let Ok(value) = header.to_str() {
-            for capture in PARAMETER.captures_iter(value) {
-                let raw = capture
-                    .get(1)
-                    .or_else(|| capture.get(2))
-                    .expect("metadata parameter capture")
-                    .as_str();
-                let url = transport.url.join(raw)?;
-                if url.origin() == transport.url.origin() {
-                    candidates.push(url);
-                }
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in header.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                segments.push(&header[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&header[start..]);
+    let mut scheme = "";
+    for segment in segments {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parameters = trimmed;
+        if let Some(split) = trimmed.find(char::is_whitespace) {
+            let candidate = &trimmed[..split];
+            if !candidate.contains('=') {
+                scheme = candidate;
+                parameters = trimmed[split..].trim();
             }
         }
-    }
-    let path = transport.url.path().trim_matches('/');
-    if !path.is_empty() {
-        candidates.push(
-            transport
-                .url
-                .join(&format!("/.well-known/oauth-protected-resource/{path}"))?,
-        );
-    }
-    candidates.push(
-        transport
-            .url
-            .join("/.well-known/oauth-protected-resource")?,
-    );
-    let Some(mut resource) = fetch(transport, candidates, "resource").await? else {
-        return Ok(Reply::ack(404, "oauth_discovery_response"));
-    };
-    if let Some(registry) = &transport.harpoon {
-        register(
-            transport,
-            &resource.url,
-            resource.url.as_str(),
-            "protected-resource-metadata",
-            &["protected-resource-metadata", "source"],
-        )?;
-        if let Some(url) = resource.value.get("resource").and_then(Value::as_str) {
-            register(
-                transport,
-                &transport.url,
-                url,
-                "resource",
-                &["protected-resource-metadata", "resource"],
-            )?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            continue;
         }
-        if let Some(issuer) = resource
+        if let Some(capture) = PARAMETER.captures(parameters) {
+            return capture
+                .get(1)
+                .or_else(|| capture.get(2))
+                .map(|value| value.as_str());
+        }
+    }
+    None
+}
+
+async fn discovery_candidates(transport: &HttpTransport) -> Vec<Url> {
+    let probe = tokio::time::timeout(Duration::from_secs(1), async {
+        let incoming = HeaderMap::new();
+        for method in [Method::POST, Method::GET] {
+            let mut headers = HeaderMap::new();
+            headers.insert("accept", "application/json".parse().expect("static header"));
+            let Ok(response) = transport
+                .send(
+                    method,
+                    transport.url.clone(),
+                    headers,
+                    Bytes::new(),
+                    &incoming,
+                    true,
+                )
+                .await
+            else {
+                continue;
+            };
+            if response.status != http::StatusCode::UNAUTHORIZED {
+                continue;
+            }
+            let challenge = response
+                .headers
+                .get_all("www-authenticate")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Some(url) = resource_metadata(&challenge).and_then(http_url) {
+                return Some(url);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let mut candidates = Vec::new();
+    if let Some(url) = probe {
+        candidates.push(url);
+    }
+    let mut root = transport.url.clone();
+    let _ = root.set_username("");
+    let _ = root.set_password(None);
+    root.set_query(None);
+    root.set_fragment(None);
+    let suffix = transport.url.path().trim_matches('/');
+    if !suffix.is_empty() {
+        if suffix.starts_with(".well-known/oauth-protected-resource") {
+            root.set_path(&format!("/{suffix}"));
+        } else {
+            root.set_path(&format!("/.well-known/oauth-protected-resource/{suffix}"));
+        }
+        candidates.push(root.clone());
+    }
+    root.set_path("/.well-known/oauth-protected-resource");
+    candidates.push(root);
+
+    let mut seen = BTreeSet::new();
+    candidates.retain(|url| seen.insert(url.as_str().to_owned()));
+    candidates
+}
+
+async fn request_document(transport: &HttpTransport, url: &Url) -> Result<Fetched> {
+    let mut headers = HeaderMap::new();
+    headers.insert("accept", "application/json".parse()?);
+    let mut response = transport
+        .send(
+            Method::GET,
+            url.clone(),
+            headers,
+            Bytes::new(),
+            &HeaderMap::new(),
+            true,
+        )
+        .await?;
+    let status = response.status.as_u16();
+    let headers = response.headers.clone();
+    let mut body = BytesMut::new();
+    while let Some(chunk) = response.body.next().await {
+        let chunk = chunk?;
+        let remaining = (METADATA_LIMIT + 1).saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body.len() > METADATA_LIMIT {
+            break;
+        }
+    }
+    let too_large = body.len() > METADATA_LIMIT;
+    Ok(Fetched {
+        status,
+        headers,
+        body: body.freeze(),
+        too_large,
+    })
+}
+
+pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
+    let mut resource = fetch_resource(transport, discovery_candidates(transport).await).await?;
+    if let Some(registry) = &transport.harpoon {
+        let group = auth_group(&resource.url);
+        let resource_url = resource
+            .value
+            .get("resource")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let issuer = resource
             .value
             .pointer("/authorization_servers/0")
             .and_then(Value::as_str)
-        {
-            let issuer_url =
-                Url::parse(issuer).context("OAuth authorization server URL is invalid")?;
-            register(
-                transport,
-                &issuer_url,
-                issuer,
-                "authorization-server",
-                &["protected-resource-metadata", "authorization-server"],
-            )?;
-            let mut urls = Vec::new();
-            let path = issuer_url.path().trim_matches('/');
-            for document in ["oauth-authorization-server", "openid-configuration"] {
-                if !path.is_empty() {
-                    urls.push(issuer_url.join(&format!("/{path}/.well-known/{document}"))?);
-                    urls.push(issuer_url.join(&format!("/.well-known/{document}/{path}"))?);
-                } else {
-                    urls.push(issuer_url.join(&format!("/.well-known/{document}"))?);
-                }
-            }
-            match fetch(transport, urls, "issuer").await {
-                Ok(Some(metadata)) => {
-                    register(
-                        transport,
-                        &issuer_url,
-                        metadata.url.as_str(),
-                        "auth-server-metadata",
-                        &["auth-server-metadata", "metadata"],
-                    )?;
-                    for key in [
-                        "issuer",
-                        "token_endpoint",
-                        "jwks_uri",
-                        "introspection_endpoint",
-                        "registration_endpoint",
-                        "revocation_endpoint",
+            .map(str::to_owned);
+        let mut records = Vec::new();
+        if let Some(url) = resource_url {
+            records.push(Record::new(url, "prmd-resource", "PRMD resource"));
+        }
+        if let Some(url) = issuer.clone() {
+            records.push(
+                Record::new(url, "prmd-auth-server", "PRMD authorization server").group(&group),
+            );
+        }
+        records.push(Record::new(
+            resource.url.as_str(),
+            "prmd-source",
+            "PRMD source URL",
+        ));
+        if let Some(issuer_url) = issuer.as_deref().and_then(http_url) {
+            match fetch_authorization(transport, &issuer_url).await {
+                Ok(metadata) => {
+                    records.push(
+                        Record::new(
+                            metadata.url.as_str(),
+                            "auth-server-metadata",
+                            "Auth server metadata URL",
+                        )
+                        .group(&group),
+                    );
+                    for (key, role, description) in [
+                        ("issuer", "issuer", "Auth server issuer"),
+                        (
+                            "token_endpoint",
+                            "token-endpoint",
+                            "Auth server token endpoint",
+                        ),
+                        ("jwks_uri", "jwks-uri", "Auth server JWKS URI"),
+                        (
+                            "introspection_endpoint",
+                            "introspection-endpoint",
+                            "Auth server introspection endpoint",
+                        ),
+                        (
+                            "registration_endpoint",
+                            "registration-endpoint",
+                            "Auth server registration endpoint",
+                        ),
+                        (
+                            "revocation_endpoint",
+                            "revocation-endpoint",
+                            "Auth server revocation endpoint",
+                        ),
                     ] {
                         if let Some(url) = metadata.value.get(key).and_then(Value::as_str) {
-                            let role = key.replace('_', "-");
-                            register(
-                                transport,
-                                &issuer_url,
-                                url,
-                                &role,
-                                &["auth-server-metadata", &role],
-                            )?;
+                            records.push(Record::new(url, role, description).group(&group));
                         }
                     }
-                }
-                Ok(None) => {
-                    tracing::warn!(channel = %transport.channel, "OAuth authorization server metadata was not found")
                 }
                 Err(error) => {
                     tracing::warn!(channel = %transport.channel, %error, "OAuth authorization server discovery failed")
                 }
+            }
+        }
+        let trusted_origins: BTreeSet<_> = records
+            .iter()
+            .filter(|record| matches!(record.role, "prmd-resource" | "prmd-source"))
+            .filter_map(|record| http_url(&record.raw))
+            .filter(|url| url.origin() == transport.url.origin())
+            .map(|url| url.origin().ascii_serialization())
+            .collect();
+        for record in records {
+            if let Err(error) = register(transport, record, &trusted_origins) {
+                tracing::warn!(channel = %transport.channel, %error, "Harpoon OAuth target registration skipped");
             }
         }
         registry.rewrite(&mut resource.value);
@@ -171,28 +335,36 @@ pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
 
 fn register(
     transport: &HttpTransport,
-    origin: &Url,
-    raw: &str,
-    role: &str,
-    tags: &[&str],
+    record: Record,
+    trusted_origins: &BTreeSet<String>,
 ) -> Result<()> {
     let registry = transport
         .harpoon
         .as_ref()
         .context("Harpoon registry is unavailable")?;
-    let url = Url::parse(raw)?;
-    if url.origin() != transport.url.origin() && !registry.private(&url) {
+    let Some(url) = http_url(&record.raw) else {
+        return Ok(());
+    };
+    let origin = url.origin().ascii_serialization();
+    let trusted = trusted_origins.contains(&origin);
+    if origin != transport.url.origin().ascii_serialization() && !trusted {
         return Ok(());
     }
-    if url.origin() != origin.origin() && url.origin() != transport.url.origin() {
+    if !trusted && !registry.private(&url) {
         return Ok(());
     }
-    let mut tags: Vec<String> = tags.iter().map(|tag| (*tag).into()).collect();
-    tags.push(format!("group=auth-server-{}", transport.channel));
+    let mut tags = role_tags(record.role);
+    if let Some(group) = record.group {
+        tags.push(format!("group={group}"));
+    }
+    let unix_socket = (url.origin() == transport.url.origin())
+        .then(|| transport.unix_socket.clone())
+        .flatten();
+    let client = registry.client(&url, unix_socket.as_deref())?;
     registry.insert(Target {
         info: TargetInfo {
-            label: format!("oauth-{}-{role}", transport.channel),
-            description: format!("OAuth {role}"),
+            label: registry.label(&format!("oauth-{}-{}", record.role, record.index))?,
+            description: record.description.into(),
             category: "oauth".into(),
             source: "oauth".into(),
             tags,
@@ -202,87 +374,168 @@ fn register(
             invocation: None,
         },
         url,
-        original_url: raw.into(),
-        client: transport.client.clone(),
+        original_url: record.raw,
+        client,
+        unix_socket,
         template: None,
     })
 }
 
-async fn fetch(
-    transport: &HttpTransport,
-    candidates: Vec<Url>,
-    required: &str,
-) -> Result<Option<Document>> {
-    let mut visited = std::collections::BTreeSet::new();
+async fn fetch_resource(transport: &HttpTransport, candidates: Vec<Url>) -> Result<Document> {
+    let count = candidates.len();
     let mut failure = None;
-    for url in candidates {
-        if !visited.insert(url.to_string()) {
+    for (index, url) in candidates.into_iter().enumerate() {
+        let fetched = match request_document(transport, &url).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                failure = Some(error.context(format!("OAuth discovery GET {url}")));
+                continue;
+            }
+        };
+        let fallback = matches!(fetched.status, 404 | 500..=599) && index + 1 < count;
+        if fetched.too_large {
+            let error = anyhow::anyhow!(
+                "OAuth discovery response body from {url} exceeds {METADATA_LIMIT} bytes"
+            );
+            if fallback {
+                failure = Some(error);
+                continue;
+            }
+            return Err(error);
+        }
+        if fetched.body.is_empty() {
+            let error = anyhow::anyhow!(
+                "OAuth discovery empty body from {url} (status {})",
+                fetched.status
+            );
+            if fallback {
+                failure = Some(error);
+                continue;
+            }
+            return Err(error);
+        }
+        if fallback {
+            failure = Some(anyhow::anyhow!(
+                "OAuth discovery status {} from {url}",
+                fetched.status
+            ));
             continue;
         }
-        let result = async {
-            let mut current = url.clone();
-            for hop in 0..=10 {
-                let mut headers = if current.origin() == transport.url.origin() {
-                    transport.discovery_headers.clone()
-                } else {
-                    HeaderMap::new()
-                };
-                headers.insert("accept", "application/json".parse()?);
-                let response = transport
-                    .client
-                    .send(Method::GET, &current, headers, Bytes::new())
-                    .await?;
-                if response.status.is_redirection()
-                    && let Some(location) = response.headers.get("location")
-                {
-                    anyhow::ensure!(hop < 10, "OAuth discovery exceeded its redirect limit");
-                    let next = current.join(location.to_str()?)?;
-                    anyhow::ensure!(
-                        next.origin() == url.origin(),
-                        "OAuth metadata redirected to a different origin"
-                    );
-                    current = next;
+        let value: Value = match serde_json::from_slice(&fetched.body) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = anyhow::Error::new(error)
+                    .context(format!("OAuth discovery invalid metadata from {url}"));
+                if fetched.status >= 500 && index + 1 < count {
+                    failure = Some(error);
                     continue;
                 }
-                if matches!(response.status.as_u16(), 404 | 405) {
-                    return Ok(None);
-                }
-                anyhow::ensure!(
-                    response.status.is_success(),
-                    "OAuth metadata returned HTTP {}",
-                    response.status
-                );
-                let headers = response.headers.clone();
-                let status = response.status.as_u16();
-                let value: Value = serde_json::from_slice(&response.bytes().await?)
-                    .context("OAuth metadata is not JSON")?;
-                anyhow::ensure!(
-                    value
-                        .get(required)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty()),
-                    "OAuth metadata has no {required}"
-                );
-                return Ok::<_, anyhow::Error>(Some(Document {
-                    url: current,
-                    value,
-                    headers,
-                    status,
-                }));
+                return Err(error);
             }
-            bail!("OAuth discovery could not resolve a document")
+        };
+        anyhow::ensure!(
+            value
+                .get("resource")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            "protected resource metadata is missing resource"
+        );
+        if let Some(issuer) = value
+            .pointer("/authorization_servers/0")
+            .and_then(Value::as_str)
+        {
+            issuer
+                .parse::<http::Uri>()
+                .context("protected resource metadata has an invalid authorization server")?;
         }
-        .await;
-        match result {
-            Ok(Some(document)) => return Ok(Some(document)),
-            Ok(None) => {}
+        return Ok(Document {
+            url,
+            value,
+            headers: fetched.headers,
+            status: fetched.status,
+        });
+    }
+    Err(failure.unwrap_or_else(|| anyhow::anyhow!("OAuth discovery has no metadata candidates")))
+}
+
+fn authorization_candidates(issuer: &Url) -> Result<Vec<Url>> {
+    let path = issuer.path().trim_matches('/');
+    let mut candidates = Vec::new();
+    for document in ["oauth-authorization-server", "openid-configuration"] {
+        if path.is_empty() {
+            candidates.push(issuer.join(&format!("/.well-known/{document}"))?);
+        } else {
+            candidates.push(issuer.join(&format!("/{path}/.well-known/{document}"))?);
+            candidates.push(issuer.join(&format!("/.well-known/{document}/{path}"))?);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    candidates.retain(|url| seen.insert(url.as_str().to_owned()));
+    Ok(candidates)
+}
+
+async fn fetch_authorization(transport: &HttpTransport, issuer: &Url) -> Result<Document> {
+    let mut fallback = None;
+    let mut failure = None;
+    for url in authorization_candidates(issuer)? {
+        let fetched = match request_document(transport, &url).await {
+            Ok(fetched) => fetched,
             Err(error) => {
-                failure = Some(error);
+                failure = Some(error.context(format!("OAuth authorization metadata GET {url}")));
+                continue;
             }
+        };
+        let result = (|| {
+            anyhow::ensure!(
+                fetched.status == 200,
+                "OAuth authorization metadata returned HTTP {}",
+                fetched.status
+            );
+            anyhow::ensure!(
+                !fetched.too_large,
+                "OAuth authorization metadata exceeds {METADATA_LIMIT} bytes"
+            );
+            let content_type = fetched
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json")),
+                "OAuth authorization metadata has bad content type {content_type:?}"
+            );
+            let value: Value = serde_json::from_slice(&fetched.body)
+                .context("OAuth authorization metadata is not JSON")?;
+            anyhow::ensure!(
+                value
+                    .get("issuer")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty()),
+                "OAuth authorization metadata has no issuer"
+            );
+            Ok::<_, anyhow::Error>(Document {
+                url,
+                value,
+                headers: fetched.headers,
+                status: fetched.status,
+            })
+        })();
+        match result {
+            Ok(document) => {
+                if document.value["issuer"] == issuer.as_str() {
+                    return Ok(document);
+                }
+                if fallback.is_none() {
+                    fallback = Some(document);
+                }
+            }
+            Err(error) => failure = Some(error),
         }
     }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(None),
-    }
+    fallback.ok_or_else(|| {
+        failure.unwrap_or_else(|| anyhow::anyhow!("OAuth authorization metadata was not found"))
+    })
 }

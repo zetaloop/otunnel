@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -27,10 +27,10 @@ pub struct HttpTransport {
     pub(crate) channel: String,
     pub(crate) client: Http,
     pub(crate) url: Url,
+    pub(crate) unix_socket: Option<String>,
     headers: HeaderMap,
     pub(crate) discovery_headers: HeaderMap,
     pub(crate) harpoon: Option<Arc<crate::harpoon::Harpoon>>,
-    pub(crate) challenge: Arc<RwLock<Option<HeaderMap>>>,
     stateless: Arc<AtomicBool>,
 }
 impl HttpTransport {
@@ -55,12 +55,12 @@ impl HttpTransport {
         discovery_headers.extend(config::headers(&mcp.discovery_extra_headers)?);
         Ok(Self {
             channel: server.channel.clone(),
+            unix_socket: server.unix_socket.clone(),
             client,
             url,
             headers: config::headers(&mcp.extra_headers)?,
             discovery_headers,
             harpoon: None,
-            challenge: Arc::new(RwLock::new(None)),
             stateless: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -196,17 +196,6 @@ impl Transport for HttpTransport {
                 request.discovery,
             )
             .await?;
-        if response.status == http::StatusCode::UNAUTHORIZED
-            || matches!(
-                view(&request.message)?.method.as_deref(),
-                Some("initialize" | "server/discover")
-            )
-        {
-            *self
-                .challenge
-                .write()
-                .expect("authentication lock poisoned") = Some(response.headers.clone());
-        }
         let Some(id) = id else {
             let mut reply = Reply::ack(response.status.as_u16(), "notify_ack");
             reply.headers = wire_headers(&response.headers, true);
