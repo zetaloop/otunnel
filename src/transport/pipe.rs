@@ -20,10 +20,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{Sink, Transport};
+use super::{
+    Sink, Transport,
+    observation::{Observation, Token},
+};
 use crate::protocol::{self, Json, Reply, Request, field, replace, view};
 
 struct Pending {
+    observation: Option<Token>,
     scope: String,
     original: Json,
     progress: Option<Json>,
@@ -34,6 +38,7 @@ struct Frame {
     written: Option<oneshot::Sender<Result<()>>>,
 }
 struct State {
+    observation: Mutex<Observation>,
     pending: Mutex<BTreeMap<u64, Pending>>,
     writer: mpsc::UnboundedSender<Frame>,
     next: AtomicU64,
@@ -58,6 +63,7 @@ impl Pipe {
     {
         let (sender, mut receiver) = mpsc::unbounded_channel::<Frame>();
         let state = Arc::new(State {
+            observation: Mutex::new(Observation::new()),
             pending: Mutex::new(BTreeMap::new()),
             writer: sender,
             next: AtomicU64::new(1),
@@ -194,6 +200,12 @@ impl Pipe {
             .insert(
                 alias,
                 Pending {
+                    observation: self
+                        .state
+                        .observation
+                        .lock()
+                        .expect("observation mutex poisoned")
+                        .begin(&request.message),
                     scope,
                     original: id,
                     progress,
@@ -256,6 +268,10 @@ impl State {
         receiver.await.context("MCP writer stopped")?
     }
     fn fail(&self, error: &dyn std::fmt::Display) {
+        self.observation
+            .lock()
+            .expect("observation mutex poisoned")
+            .closed();
         *self.error.lock().expect("error mutex poisoned") = Some(error.to_string());
         self.stop.cancel();
     }
@@ -319,6 +335,12 @@ impl State {
                 .expect("routing mutex poisoned")
                 .remove(&alias)
             {
+                if let Some(token) = call.observation {
+                    self.observation
+                        .lock()
+                        .expect("observation mutex poisoned")
+                        .receive(token, &message);
+                }
                 let mut message = replace(&message, &["id"], &call.original)?;
                 if field(&message, "result")
                     .and_then(|result| field(&result, "_meta"))
@@ -432,6 +454,15 @@ impl Transport for Pipe {
     }
     fn stateless(&self) -> bool {
         self.stateless.load(Ordering::Acquire)
+    }
+    fn observation(&self) -> Option<serde_json::Value> {
+        Some(
+            self.state
+                .observation
+                .lock()
+                .expect("observation mutex poisoned")
+                .snapshot(),
+        )
     }
     fn startup_probe(&self) -> bool {
         false

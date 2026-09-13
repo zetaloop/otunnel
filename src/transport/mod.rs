@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::protocol::{self, Reply, Request};
 
 mod http;
+mod observation;
 mod pipe;
 #[cfg(feature = "cli")]
 mod server;
@@ -37,6 +38,9 @@ pub trait Transport: Send + Sync {
     }
     async fn closed(&self) -> Result<()> {
         std::future::pending().await
+    }
+    fn observation(&self) -> Option<Value> {
+        None
     }
     fn startup_probe(&self) -> bool {
         true

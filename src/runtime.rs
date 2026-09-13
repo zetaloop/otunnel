@@ -38,6 +38,7 @@ pub struct Snapshot {
     pub cloudflare_ready: Option<bool>,
     pub started_at: u64,
     pub channels: BTreeMap<String, Probe>,
+    pub evidence: BTreeMap<String, serde_json::Value>,
     pub in_flight: usize,
     pub completed: u64,
     pub expired: u64,
@@ -181,6 +182,15 @@ impl Tunnel {
                 .send_initialized_notification(self.config.mcp.stdio_send_initialized_notification);
             self.bindings.insert(channel, Arc::new(pipe));
         }
+        self.state.send_modify(|state| {
+            state.evidence = self
+                .bindings
+                .iter()
+                .filter_map(|(name, binding)| {
+                    binding.observation().map(|value| (name.clone(), value))
+                })
+                .collect();
+        });
         if diagnostic {
             for (name, transport) in &self.bindings {
                 if !transport.available() {
@@ -369,6 +379,7 @@ impl Tunnel {
                     result = requests.join_next(), if !requests.is_empty() => {
                         let result = result.context("request worker stopped")?;
                         self.state.send_modify(|state| {
+                            state.evidence = bindings.iter().filter_map(|(name, binding)| binding.observation().map(|value| (name.clone(), value))).collect();
                             state.in_flight = requests.len();
                             match &result {
                                 Ok(Ok(true)) => state.completed += 1,
