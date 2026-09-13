@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, RwLock,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -126,7 +126,9 @@ impl Control {
             "x-tunnel-client-wire-protocol-version",
             HeaderValue::from_static(protocol::WIRE_VERSION),
         );
-        let instance_id = uuid::Uuid::new_v4().to_string();
+        static INSTANCE_ID: LazyLock<String> =
+            LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
+        let instance_id = INSTANCE_ID.clone();
         headers.insert("x-tunnel-client-instance-id", instance_id.parse()?);
         if let Some(organization) = &cp.organization_id {
             headers.insert(
