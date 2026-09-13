@@ -1,5 +1,4 @@
 use std::{
-    convert::Infallible,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -9,12 +8,12 @@ use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect, Response, Sse, sse::Event},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Bytes, BytesMut};
-use futures_util::{Stream, StreamExt, stream};
+use futures_util::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -60,17 +59,12 @@ impl Server {
         let state = Monitor {
             status: self.status,
             details: self.details,
-            stop: stop.clone(),
         };
         let router = Router::new()
-            .route("/", get(|| async { Redirect::temporary("/ui") }))
-            .route("/ui", get(|| async { Html(include_str!("ui.html")) }))
             .route("/healthz", get(|| async { "live" }))
             .route("/readyz", get(readiness))
             .route("/health", get(ready))
             .route("/health/mcp", get(status))
-            .route("/api/status", get(status))
-            .route("/api/events", get(events))
             .route("/metrics", get(metrics));
         let mut router = router.with_state(state);
         if let Some(harpoon) = self.harpoon {
@@ -92,7 +86,6 @@ impl Server {
 struct Monitor {
     status: watch::Receiver<Snapshot>,
     details: bool,
-    stop: CancellationToken,
 }
 
 async fn readiness(State(state): State<Monitor>) -> impl IntoResponse {
@@ -119,27 +112,6 @@ async fn ready(State(state): State<Monitor>) -> Response {
 }
 async fn status(State(state): State<Monitor>) -> Json<Snapshot> {
     Json(state.status.borrow().clone())
-}
-async fn events(
-    State(state): State<Monitor>,
-) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
-    let stream = stream::unfold(
-        (state.status, true, state.stop),
-        |(mut status, first, stop)| async move {
-            if !first {
-                tokio::select! {
-                    result = status.changed() => if result.is_err() { return None; },
-                    () = stop.cancelled() => return None,
-                }
-            }
-            let event = Event::default()
-                .event("status")
-                .json_data(status.borrow_and_update().clone())
-                .expect("status is serializable");
-            Some((Ok(event), (status, false, stop)))
-        },
-    );
-    Sse::new(stream).keep_alive(Default::default())
 }
 async fn metrics(State(state): State<Monitor>) -> impl IntoResponse {
     let snapshot = state.status.borrow().clone();
