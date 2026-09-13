@@ -254,8 +254,8 @@ async fn request_document(transport: &HttpTransport, url: &Url) -> Result<Fetche
 
 pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
     let (candidates, advertised) = discovery_candidates(transport).await;
-    let mut resource = fetch_resource(transport, candidates, advertised).await?;
-    if let Some(registry) = &transport.harpoon {
+    let resource = fetch_resource(transport, candidates, advertised).await?;
+    if transport.harpoon.is_some() {
         let group = auth_group(&resource.url);
         let resource_url = resource
             .value
@@ -338,18 +338,13 @@ pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
                 tracing::warn!(channel = %transport.channel, %error, "Harpoon OAuth target registration skipped");
             }
         }
-        registry.rewrite(&mut resource.value);
     }
-    let mut reply = Reply {
+    Ok(Reply {
         message: Some(to_raw_value(&resource.value)?),
         headers: protocol::wire_headers(&resource.headers, true),
         status: resource.status,
         kind: "oauth_discovery_response",
-    };
-    if let Some(registry) = &transport.harpoon {
-        registry.rewrite_headers(&mut reply.headers);
-    }
-    Ok(reply)
+    })
 }
 
 fn register(
