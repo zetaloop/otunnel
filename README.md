@@ -1,6 +1,8 @@
 # otunnel
 
-A Rust CLI and library for the [tunnel-client](https://github.com/openai/tunnel-client) MCP runtime, with concurrent stdio forwarding.
+A Rust implementation of OpenAI's [tunnel-client](https://github.com/openai/tunnel-client).
+
+Connect local MCP servers to OpenAI from the command line or a Rust application.
 
 ## Install
 
@@ -8,7 +10,7 @@ A Rust CLI and library for the [tunnel-client](https://github.com/openai/tunnel-
 cargo binstall otunnel
 ```
 
-From source: `cargo install --path .`.
+From a local checkout: `cargo install --path .`
 
 ## Use
 
@@ -17,7 +19,7 @@ otunnel doctor --config tunnel.yaml
 otunnel run --config tunnel.yaml
 ```
 
-Uses tunnel-client’s [configuration](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md) and profiles. Cloudflare tunnels require `cloudflared` on `PATH`.
+Uses tunnel-client's [configuration files and profiles](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md). Cloudflare tunnels require `cloudflared` on `PATH`.
 
 ## Library
 
