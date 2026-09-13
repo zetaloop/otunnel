@@ -248,8 +248,13 @@ fn components(monitor: &Monitor, state: &Snapshot) -> BTreeMap<&'static str, Val
             json!({"target_count":monitor.harpoon.len(),"catalog_state":catalog}),
         ),
     );
-    components.insert("cloudflared", component(match state.cloudflare_ready {None=>"disabled",Some(false)=>"unknown",Some(true)=>"ok"},
-        match state.cloudflare_ready {None=>"disabled",Some(false)=>"starting",Some(true)=>"ready"}, "", 0.0,
+    let (status, phase, reason) = match state.cloudflare_ready {
+        None => ("disabled", "disabled", ""),
+        Some(true) => ("ok", "ready", ""),
+        Some(false) if state.cloudflare_observed_at == 0.0 => ("unknown", "pending", ""),
+        Some(false) => ("degraded", "not_ready", "companion_not_ready"),
+    };
+    components.insert("cloudflared", component(status, phase, reason, state.cloudflare_observed_at,
         json!({"enabled":state.cloudflare_ready.is_some(),"ready":state.cloudflare_ready==Some(true)})));
     components
 }

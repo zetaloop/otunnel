@@ -78,11 +78,17 @@ impl Process {
     pub fn id(&self) -> Option<u32> {
         self.child.id()
     }
-    pub fn stderr(&mut self) -> Result<ChildStderr> {
-        self.child
-            .stderr()
-            .take()
-            .context("child stderr is unavailable")
+    pub fn output(&mut self) -> Result<(ChildStdout, ChildStderr)> {
+        Ok((
+            self.child
+                .stdout()
+                .take()
+                .context("child stdout is unavailable")?,
+            self.child
+                .stderr()
+                .take()
+                .context("child stderr is unavailable")?,
+        ))
     }
     pub fn pipes(&mut self) -> Result<(ChildStdout, ChildStdin)> {
         let child = &mut self.child;

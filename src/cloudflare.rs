@@ -5,7 +5,7 @@ use bytes::Bytes;
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::{ChildStderr, Command},
+    process::{ChildStderr, ChildStdout, Command},
     sync::watch,
     time::{Instant, MissedTickBehavior},
 };
@@ -22,7 +22,7 @@ use crate::{
 
 pub(crate) struct Companion {
     process: Process,
-    output: ChildStderr,
+    output: (ChildStdout, ChildStderr),
     token: String,
     deadline: Instant,
 }
@@ -43,6 +43,15 @@ impl Companion {
         };
         anyhow::ensure!(!token.is_empty(), "Cloudflare token is empty");
         let mut command = Command::new(&config.path);
+        for (name, value) in std::env::vars_os() {
+            let key = name.to_string_lossy();
+            if key.eq_ignore_ascii_case("TUNNEL_TOKEN")
+                || key.eq_ignore_ascii_case("TUNNEL_MANAGEMENT_DIAGNOSTICS")
+                || value == std::ffi::OsStr::new(&token)
+            {
+                command.env_remove(name);
+            }
+        }
         command
             .args([
                 "tunnel",
@@ -54,11 +63,12 @@ impl Companion {
                 "run",
             ])
             .env("TUNNEL_TOKEN", &token)
+            .env("TUNNEL_MANAGEMENT_DIAGNOSTICS", "false")
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut process = Process::launch(command)?;
-        let output = process.stderr()?;
+        let output = process.output()?;
         Ok(Self {
             process,
             output,
@@ -85,6 +95,7 @@ impl Companion {
         };
         state.send_modify(|state| {
             state.cloudflare_ready = Some(false);
+            state.cloudflare_observed_at = crate::control::now();
             state.ready = false;
         });
         result
@@ -92,24 +103,39 @@ impl Companion {
 }
 
 async fn monitor(
-    output: ChildStderr,
+    output: (ChildStdout, ChildStderr),
     token: &str,
     deadline: Instant,
     stop: &CancellationToken,
     state: &watch::Sender<Snapshot>,
 ) -> Result<()> {
-    let mut output = BufReader::new(output).lines();
+    let mut stdout = BufReader::new(output.0).lines();
+    let mut stderr = BufReader::new(output.1).lines();
+    let (mut stdout_open, mut stderr_open) = (true, true);
     let mut metrics: Option<(Http, Url)> = None;
     let mut ever_ready = false;
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             () = stop.cancelled() => return Ok(()),
             () = tokio::time::sleep_until(deadline), if !ever_ready => bail!("cloudflared did not become ready before its startup deadline"),
-            line = output.next_line() => {
-                let line = line?.context("cloudflared closed its log stream")?;
-                let line = line.replace(token, "[redacted]");
+            line = async {
+                tokio::select! {
+                    line = stdout.next_line(), if stdout_open => ("stdout", line),
+                    line = stderr.next_line(), if stderr_open => ("stderr", line),
+                }
+            }, if stdout_open || stderr_open => {
+                let (stream, line) = line;
+                let line = match line {
+                    Ok(Some(line)) => line,
+                    result => {
+                        if stream == "stdout" { stdout_open = false; } else { stderr_open = false; }
+                        if let Err(error) = result { tracing::warn!(component = "cloudflared", stream, %error, "read cloudflared output"); }
+                        continue;
+                    }
+                };
+                let line = line.replace(token, "[REDACTED]");
                 let event = serde_json::from_str::<Value>(&line).ok();
                 let message = event.as_ref().and_then(|event| event.get("message")).and_then(Value::as_str).unwrap_or(&line);
                 if let Some(address) = message.strip_prefix("Starting metrics server on ").and_then(|value| value.strip_suffix("/metrics")) {
@@ -119,17 +145,17 @@ async fn monitor(
                     interval.reset_immediately();
                 }
                 match event.as_ref().and_then(|event| event.get("level")).and_then(Value::as_str) {
-                    Some("error" | "fatal" | "panic") => tracing::error!(component = "cloudflared", %message),
-                    Some("warn") => tracing::warn!(component = "cloudflared", %message),
-                    Some("debug" | "trace") => tracing::debug!(component = "cloudflared", %message),
-                    _ => tracing::info!(component = "cloudflared", %message),
+                    Some("error" | "fatal" | "panic") => tracing::error!(component = "cloudflared", stream, %message),
+                    Some("warn") => tracing::warn!(component = "cloudflared", stream, %message),
+                    Some("debug" | "trace") => tracing::debug!(component = "cloudflared", stream, %message),
+                    _ => tracing::info!(component = "cloudflared", stream, %message),
                 }
             }
             _ = interval.tick(), if metrics.is_some() => {
                 let (client, url) = metrics.as_ref().expect("metrics endpoint discovered");
-                let probe = tokio::time::timeout(Duration::from_secs(3), async {
+                let probe = tokio::time::timeout(Duration::from_millis(500), async {
                     let response = client.send(http::Method::GET, url, Default::default(), Bytes::new()).await?;
-                    let ready = response.status.is_success();
+                    let ready = response.status == http::StatusCode::OK;
                     response.bytes().await?;
                     Ok::<_, anyhow::Error>(ready)
                 });
@@ -141,10 +167,15 @@ async fn monitor(
                     Ok(ready) => ready,
                     Err(error) => { tracing::debug!(%error, "cloudflared health request failed"); false }
                 };
-                ever_ready |= ready;
+                if ready && !ever_ready {
+                    ever_ready = true;
+                    interval = tokio::time::interval(Duration::from_secs(1));
+                    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                }
                 state.send_if_modified(|state| {
-                    if state.cloudflare_ready == Some(ready) { return false; }
+                    if state.cloudflare_ready == Some(ready) && state.cloudflare_observed_at > 0.0 { return false; }
                     state.cloudflare_ready = Some(ready);
+                    state.cloudflare_observed_at = crate::control::now();
                     state.refresh_readiness();
                     true
                 });

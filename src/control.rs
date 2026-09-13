@@ -249,7 +249,7 @@ impl Control {
     }
 
     pub async fn metadata(&self) -> Result<Value> {
-        let metadata = self.fetch("").await?;
+        let metadata = self.fetch().await?;
         self.observations.send_modify(|state| {
             state.metadata = Some(metadata.clone());
         });
@@ -257,19 +257,68 @@ impl Control {
     }
 
     pub async fn cloudflare(&self) -> Result<Value> {
-        self.fetch("cloudflare/runtime").await
+        let url = self.endpoint("cloudflare/runtime")?;
+        let client = self.http.clone().logging(None);
+        for attempt in 0..3 {
+            let deadline = Instant::now() + self.poll_timeout + self.guard;
+            let response = tokio::time::timeout_at(
+                deadline,
+                client.send(Method::GET, &url, self.headers(), Bytes::new()),
+            )
+            .await;
+            let headers = match response {
+                Ok(Ok(response)) => {
+                    let status = response.status.as_u16();
+                    if response.status.is_success() {
+                        let bytes = tokio::time::timeout_at(deadline, response.bytes())
+                            .await
+                            .map_err(|_| {
+                                anyhow::anyhow!("managed Cloudflare runtime response timed out")
+                            })?
+                            .map_err(|_| {
+                                anyhow::anyhow!("read managed Cloudflare runtime response")
+                            })?;
+                        let payload: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                            anyhow::anyhow!("decode managed Cloudflare runtime response")
+                        })?;
+                        anyhow::ensure!(
+                            [
+                                "/runtime_token",
+                                "/cloudflare_tunnel/tunnel_id",
+                                "/cloudflare_tunnel/name",
+                                "/cloudflare_tunnel/account_id",
+                            ]
+                            .iter()
+                            .all(|key| payload
+                                .pointer(key)
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.trim().is_empty())),
+                            "invalid managed Cloudflare runtime response"
+                        );
+                        return Ok(payload);
+                    }
+                    if attempt == 2 || !(status == 429 || (500..600).contains(&status)) {
+                        return Err(StatusError {
+                            status,
+                            operation: "Cloudflare runtime",
+                        }
+                        .into());
+                    }
+                    response.headers
+                }
+                _ if attempt == 2 => bail!("fetch managed Cloudflare runtime failed"),
+                _ => HeaderMap::new(),
+            };
+            tokio::time::sleep(retry_delay(attempt, &headers)).await;
+        }
+        unreachable!()
     }
 
-    async fn fetch(&self, suffix: &str) -> Result<Value> {
-        let url = self.endpoint(suffix)?;
-        let http = if suffix == "cloudflare/runtime" {
-            self.http.clone().logging(None)
-        } else {
-            self.http.clone()
-        };
-        timeout(Duration::from_secs(30), async {
-            let response = http
-                .send(Method::GET, &url, self.headers(), Bytes::new())
+    async fn fetch(&self) -> Result<Value> {
+        timeout(self.poll_timeout + self.guard, async {
+            let response = self
+                .http
+                .send(Method::GET, &self.url, self.headers(), Bytes::new())
                 .await?;
             if !response.status.is_success() {
                 return Err(StatusError {

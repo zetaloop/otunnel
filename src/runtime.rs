@@ -36,6 +36,7 @@ pub struct Snapshot {
     pub control: crate::control::Observation,
     pub lifecycle: &'static str,
     pub cloudflare_ready: Option<bool>,
+    pub cloudflare_observed_at: f64,
     pub started_at: u64,
     pub channels: BTreeMap<String, Probe>,
     pub evidence: BTreeMap<String, serde_json::Value>,
