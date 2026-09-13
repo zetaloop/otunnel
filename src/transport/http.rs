@@ -188,18 +188,26 @@ impl Transport for HttpTransport {
         headers.insert("accept", "application/json, text/event-stream".parse()?);
         headers.insert("content-type", "application/json".parse()?);
         let version = protocol::version(&request.message);
-        let modern = version.as_deref() == Some(protocol::MCP_VERSION);
+        let modern = version
+            .as_deref()
+            .is_some_and(|version| version >= protocol::MCP_VERSION);
         if let Some(version) = &version {
             headers.insert("mcp-protocol-version", version.parse()?);
         }
-        if let Some(method) = view(&request.message)?.method.as_deref() {
+        if modern && let Some(method) = view(&request.message)?.method.as_deref() {
             headers.insert("mcp-method", method.parse()?);
-        }
-        if let Some(name) = protocol::field(&request.message, "params")
-            .and_then(|params| protocol::field(&params, "name"))
-        {
-            let name: String = serde_json::from_str(name.get())?;
-            headers.insert("mcp-name", name.parse()?);
+            let key = match method {
+                "tools/call" | "prompts/get" => Some("name"),
+                "resources/read" => Some("uri"),
+                _ => None,
+            };
+            if let Some(name) = key.and_then(|key| {
+                protocol::field(&request.message, "params")
+                    .and_then(|params| protocol::field(&params, key))
+            }) {
+                let name: String = serde_json::from_str(name.get())?;
+                headers.insert("mcp-name", name.parse()?);
+            }
         }
         let mut response = self
             .send(
