@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap, time::Duration};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{
@@ -88,6 +88,32 @@ impl Poll {
                         "command is missing its request ID or shard token"
                     );
                     command.channel = crate::config::channel(&command.channel)?;
+                    match command.command_type.as_str() {
+                        "jsonrpc" => {
+                            let message = command
+                                .jsonrpc
+                                .as_deref()
+                                .context("JSON-RPC command has no payload")?;
+                            let version = field(message, "jsonrpc")
+                                .and_then(|value| serde_json::from_str::<String>(value.get()).ok());
+                            anyhow::ensure!(
+                                version.as_deref() == Some("2.0"),
+                                "invalid JSON-RPC payload"
+                            );
+                            view(message)?;
+                        }
+                        "oauth_discovery" => {}
+                        "session_termination" => {
+                            anyhow::ensure!(
+                                command.headers.iter().any(|(name, values)| {
+                                    name.eq_ignore_ascii_case("mcp-session-id")
+                                        && values.iter().any(|value| !value.is_empty())
+                                }),
+                                "session termination has no Mcp-Session-Id header"
+                            );
+                        }
+                        _ => bail!("unknown command type"),
+                    }
                     Ok(command)
                 })();
                 match parsed {
