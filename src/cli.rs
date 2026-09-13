@@ -487,7 +487,6 @@ pub fn command() -> Command {
                             "allow-remote-ui"
                                 | "open-web-ui"
                                 | "admin-ui.log-buffer-events"
-                                | "proxy.check-interval"
                                 | "harpoon.capture-payloads"
                         ))
                         .help(*help),
