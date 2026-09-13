@@ -517,6 +517,7 @@ pub fn command() -> Command {
         .subcommand(health::command())
         .subcommand(admin::command())
         .subcommand(management::profiles_command())
+        .subcommand(management::runtimes_command())
         .subcommand(profiles::command())
         .subcommand(profiles::init_command())
         .subcommand(
@@ -783,6 +784,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
         "health" => return health::execute(matches).await,
         "admin" => return admin::execute(matches).await,
         "admin-profiles" => return management::profiles(matches),
+        "runtimes" => return management::runtimes(matches).await,
         "profiles" => return profiles::execute(matches),
         "init" => return profiles::init(matches),
         _ => {}

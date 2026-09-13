@@ -21,14 +21,27 @@ pub struct Tunnel {
     pub description: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub creator: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "identifiers"
+    )]
     pub tenant_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "identifiers"
+    )]
     pub workspace_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "identifiers"
+    )]
     pub organization_ids: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub request_id: String,
+}
+
+fn identifiers<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]

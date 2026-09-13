@@ -257,3 +257,36 @@ pub fn reference(value: &str) -> Result<()> {
     );
     Ok(())
 }
+
+pub fn target(value: &str) -> Result<()> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        [
+        r"sk-[A-Za-z0-9_-]{12,}",
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
+        r"(?i)\bAuthorization\s*:",
+        r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|password|secret)=\S+",
+        r"(?i)\b(OPENAI_ADMIN_KEY|OPENAI_API_KEY|CONTROL_PLANE_API_KEY)=",
+        r"://[^/\s:@]+:[^/\s:@]+@",
+    ].into_iter().map(|pattern| Regex::new(pattern).expect("valid credential pattern")).collect()
+    });
+    static FLAG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^-{1,2}[a-z0-9_-]*(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|password|secret)[a-z0-9_-]*$").expect("valid credential flag pattern")
+    });
+    static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(env:[A-Za-z_][A-Za-z0-9_]*|file:.+|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})$").expect("valid credential reference pattern")
+    });
+    anyhow::ensure!(
+        !PATTERNS.iter().any(|pattern| pattern.is_match(value)),
+        "MCP target contains inline credential material; use env or file references"
+    );
+    let words: Vec<_> = value.split_whitespace().collect();
+    for pair in words.windows(2) {
+        anyhow::ensure!(
+            !FLAG.is_match(pair[0]) || pair[1].starts_with('-') || REFERENCE.is_match(pair[1]),
+            "MCP command contains inline credential material; use env or file references"
+        );
+    }
+    Ok(())
+}
