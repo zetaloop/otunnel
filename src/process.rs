@@ -79,6 +79,9 @@ impl Process {
                 .with_context(|| format!("start {program}"))?,
         })
     }
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
     pub fn stderr(&mut self) -> Result<ChildStderr> {
         self.child
             .stderr()

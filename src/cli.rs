@@ -881,12 +881,7 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
             let health = if config.health.unix_socket.is_some()
                 || !config.health.listen_addr.is_empty()
             {
-                let server = Server::bind(
-                    &config.health,
-                    tunnel.status(),
-                    (!config.harpoon.additional_transports.is_empty()).then(|| tunnel.harpoon()),
-                )
-                .await?;
+                let server = Server::bind(&config, tunnel.status(), tunnel.harpoon()).await?;
                 tracing::info!(url = %server.url(), socket = ?config.health.unix_socket, "health service available");
                 url_file = config
                     .health
@@ -920,22 +915,15 @@ pub async fn execute(matches: &ArgMatches) -> Result<u8> {
         }
         "doctor" => {
             let tunnel = Tunnel::new(config.clone())?;
-            let health = if config.health.unix_socket.is_some()
-                || !config.health.listen_addr.is_empty()
-            {
-                match Server::bind(
-                    &config.health,
-                    tunnel.status(),
-                    (!config.harpoon.additional_transports.is_empty()).then(|| tunnel.harpoon()),
-                )
-                .await
-                {
-                    Ok(server) => Some(Ok(server)),
-                    Err(error) => Some(Err(error)),
-                }
-            } else {
-                None
-            };
+            let health =
+                if config.health.unix_socket.is_some() || !config.health.listen_addr.is_empty() {
+                    match Server::bind(&config, tunnel.status(), tunnel.harpoon()).await {
+                        Ok(server) => Some(Ok(server)),
+                        Err(error) => Some(Err(error)),
+                    }
+                } else {
+                    None
+                };
             let mut report = tunnel.diagnose().await;
             if let Some(health) = health {
                 let (passed, detail) = match health {

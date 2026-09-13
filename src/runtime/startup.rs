@@ -26,7 +26,7 @@ impl Default for Startup {
     }
 }
 impl Startup {
-    fn pending() -> Self {
+    pub(super) fn pending() -> Self {
         Self {
             state: "pending",
             ..Self::default()
@@ -43,6 +43,9 @@ impl Startup {
 
 impl Snapshot {
     pub fn readiness(&self) -> (bool, String) {
+        if self.lifecycle == "draining" {
+            return (false, "runtime is draining".into());
+        }
         if self.cloudflare_ready == Some(false) {
             return (false, "cloudflared not ready".into());
         }
@@ -71,7 +74,6 @@ impl Snapshot {
             ),
             "startup-timeout" => (false, format!("mcp startup wait failed: {message}")),
             "failed" => (false, format!("mcp probe failed: {message}")),
-            _ if self.lifecycle == "draining" => (false, "runtime is draining".into()),
             _ => (true, "ready".into()),
         }
     }

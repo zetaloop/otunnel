@@ -71,6 +71,7 @@ pub struct Observation {
     pub consecutive_failures: u64,
     pub cycles: u64,
     pub errors: u64,
+    pub error_kinds: std::collections::BTreeMap<&'static str, u64>,
     pub commands: u64,
     pub http_status: u16,
 }
@@ -386,6 +387,12 @@ impl Control {
                         state.last_error = now();
                         state.consecutive_failures += 1;
                         state.errors += 1;
+                        let kind = if state.failure_category == "timeout" {
+                            "timeout"
+                        } else {
+                            "other"
+                        };
+                        *state.error_kinds.entry(kind).or_default() += 1;
                         state.http_status = match &result {
                             Ok(Ok(Err((status, _)))) => *status,
                             _ => 0,

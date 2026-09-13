@@ -234,6 +234,12 @@ impl Harpoon {
             .collect()
     }
 
+    pub fn len(&self) -> usize {
+        self.targets
+            .read()
+            .expect("target registry lock poisoned")
+            .len()
+    }
     pub fn is_empty(&self) -> bool {
         self.targets
             .read()

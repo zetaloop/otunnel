@@ -39,6 +39,7 @@ pub struct Snapshot {
     pub started_at: u64,
     pub channels: BTreeMap<String, Probe>,
     pub evidence: BTreeMap<String, serde_json::Value>,
+    pub process_ids: BTreeMap<String, u32>,
     pub in_flight: usize,
     pub activity: Activity,
     pub completed: u64,
@@ -60,6 +61,7 @@ pub struct Activity {
     pub last_completion: f64,
     pub pressure_started: f64,
     pub pressure_seconds: f64,
+    pub last_failed: bool,
 }
 
 #[derive(Serialize)]
@@ -112,7 +114,24 @@ impl Tunnel {
         }
         let control = Arc::new(Control::new(&config)?);
         let harpoon = Arc::new(crate::harpoon::Harpoon::new(&config)?);
+        let probe = config
+            .mcp
+            .server_urls
+            .iter()
+            .any(|server| server.channel == "main" && config.enabled("main"));
         let (state, _) = watch::channel(Snapshot {
+            mcp_probe: if probe {
+                Startup::pending()
+            } else {
+                Startup::default()
+            },
+            oauth: if probe {
+                Startup::pending()
+            } else {
+                Startup::default()
+            },
+            cloudflare_ready: (config.cloudflared.managed || config.cloudflared.token.is_some())
+                .then_some(false),
             control: control.connection().borrow().clone(),
             lifecycle: "starting",
             started_at: SystemTime::now()
@@ -168,6 +187,11 @@ impl Tunnel {
         for command in &self.config.mcp.commands {
             let enabled = self.config.enabled(&command.channel);
             let mut process = Process::spawn(&command.command, enabled)?;
+            if let Some(pid) = process.id() {
+                self.state.send_modify(|state| {
+                    state.process_ids.insert(command.channel.clone(), pid);
+                });
+            }
             if enabled {
                 pipes.push((command.channel.clone(), process.pipes()?));
             }
@@ -419,6 +443,7 @@ impl Tunnel {
                             state.in_flight = requests.len() + queued.len();
                             state.activity.active.remove(&id);
                             state.activity.last_completion = crate::control::now();
+                            state.activity.last_failed = !matches!(result, Ok(true));
                             match &result { Ok(true) => state.completed += 1, Ok(false) => state.expired += 1, Err(_) => state.failed += 1 }
                         });
                         match result {

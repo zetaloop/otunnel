@@ -73,6 +73,7 @@ async fn details(base: &str) -> Option<Value> {
     }
     let (code, body) = Target::new(base)
         .ok()?
+        .follow_redirects(false)
         .request(
             "/health/mcp",
             Duration::from_millis(500),
@@ -102,13 +103,6 @@ fn managed(root: &Root, directory: &str, path: &str) -> Value {
         .ok();
     json!({"path":path,"exists":metadata.is_some(),"size_bytes":metadata.map_or(0, |metadata| metadata.len())})
 }
-pub fn ui(base: &str) -> String {
-    if base.is_empty() {
-        String::new()
-    } else {
-        format!("{base}/ui")
-    }
-}
 
 pub async fn local(root: &Root, alias: &str, record: &Alias, process: &Process) -> Result<Value> {
     let health_file = super::first(&[&process.health_url_file, &record.health_url_file]);
@@ -136,14 +130,14 @@ pub async fn local(root: &Root, alias: &str, record: &Alias, process: &Process) 
                 continue;
             }
             let system = fetch(&base, "/api/system").await.unwrap_or(Value::Null);
-            live = json!({"found":true,"base_url":base,"ui_url":ui(&base),"source_health_url_file":path,"match_reason":"control_plane_tunnel_id","status":status,"system":system});
+            live = json!({"found":true,"base_url":base,"ui_url":"","source_health_url_file":path,"match_reason":"control_plane_tunnel_id","status":status,"system":system});
             break;
         }
     }
     health["raw_url"] = json!(raw_url);
     health["base_url"] = probe["base_url"].clone();
     health["url"] = probe["healthz"]["url"].clone();
-    health["ui"] = json!(ui(string(&probe["base_url"])));
+    health["ui"] = json!("");
     health["healthz"] = probe["healthz"].clone();
     health["readyz"] = probe["readyz"].clone();
     if probe["healthz"]["ok"] == true
@@ -164,7 +158,7 @@ pub async fn local(root: &Root, alias: &str, record: &Alias, process: &Process) 
         && let Some(base) = live["base_url"].as_str()
     {
         let replacement = self::probe(base).await;
-        effective = json!({"base_url":replacement["base_url"],"url":replacement["healthz"]["url"],"ui":ui(base),"healthz":replacement["healthz"],"readyz":replacement["readyz"]});
+        effective = json!({"base_url":replacement["base_url"],"url":replacement["healthz"]["url"],"ui":"","healthz":replacement["healthz"],"readyz":replacement["readyz"]});
         if replacement["healthz"]["ok"] == true
             && let Some(links) = details(base).await
         {
