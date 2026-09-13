@@ -25,6 +25,53 @@ use crate::{
 mod call;
 pub(crate) mod headers;
 
+const INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets and call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
+const TEMPLATE_INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets. For exact targets, use call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. For entries with template_version and parameters_schema, use call_target_template with the label and all parameters declared by parameters_schema; each value must satisfy that schema. Templates make GET requests to a fixed destination and do not follow redirects. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
+
+const SUPPORTED_VERSIONS: [&str; 5] = [
+    protocol::MCP_VERSION,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
+
+pub(crate) fn validate_meta(message: &RawValue) -> std::result::Result<(), String> {
+    let Some(version) = protocol::version(message) else {
+        return Ok(());
+    };
+    if version.as_str() < protocol::MCP_VERSION {
+        return Ok(());
+    }
+    let meta =
+        protocol::field(message, "params").and_then(|params| protocol::field(&params, "_meta"));
+    let capabilities = meta
+        .as_deref()
+        .and_then(|meta| protocol::field(meta, "io.modelcontextprotocol/clientCapabilities"))
+        .and_then(|value| serde_json::from_str::<Value>(value.get()).ok());
+    if !capabilities.is_some_and(|value| value.is_object()) {
+        return Err(
+            "missing or invalid _meta field \"io.modelcontextprotocol/clientCapabilities\"".into(),
+        );
+    }
+    if let Some(info) = meta
+        .as_deref()
+        .and_then(|meta| protocol::field(meta, "io.modelcontextprotocol/clientInfo"))
+    {
+        let valid = serde_json::from_str::<Value>(info.get())
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|value| {
+                value.get("name").is_none_or(Value::is_string)
+                    && value.get("version").is_none_or(Value::is_string)
+            });
+        if !valid {
+            return Err("invalid _meta field \"io.modelcontextprotocol/clientInfo\"".into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 pub struct TargetInfo {
     pub label: String,
@@ -238,6 +285,22 @@ impl Harpoon {
             .is_empty()
     }
 
+    fn has_templates(&self) -> bool {
+        self.targets
+            .read()
+            .expect("target registry lock poisoned")
+            .values()
+            .any(|target| target.template.is_some())
+    }
+
+    fn instructions(&self) -> &'static str {
+        if self.has_templates() {
+            TEMPLATE_INSTRUCTIONS
+        } else {
+            INSTRUCTIONS
+        }
+    }
+
     pub(crate) fn private(&self, url: &Url) -> bool {
         let host = url
             .host_str()
@@ -321,12 +384,7 @@ impl Harpoon {
     }
 
     fn tools(&self) -> Result<Value> {
-        let templates = self
-            .targets
-            .read()
-            .expect("target registry lock poisoned")
-            .values()
-            .any(|target| target.template.is_some());
+        let templates = self.has_templates();
         let mut tools = vec![tool(
             "call_target",
             "Call Harpoon target",
@@ -491,14 +549,47 @@ impl Transport for Harpoon {
         if envelope.id.is_none() {
             return sink.send(Reply::ack(202, "notify_ack")).await;
         }
-        let modern = protocol::version(&request.message).as_deref() == Some(protocol::MCP_VERSION);
-        let identity = json!({"name":"harpoon","version":env!("CARGO_PKG_VERSION")});
+        if let Err(message) = validate_meta(&request.message) {
+            return sink
+                .send(Reply::error(&request, 200, -32602, message)?)
+                .await;
+        }
+        let modern = protocol::version(&request.message)
+            .is_some_and(|version| version.as_str() >= protocol::MCP_VERSION);
+        let identity = json!({
+            "name":"harpoon",
+            "title":"Harpoon (Constrained HTTP Client)",
+            "version":env!("CARGO_PKG_VERSION")
+        });
+        let instructions = self.instructions();
         let mut result = match envelope.method.as_deref() {
             Some("server/discover") => {
-                json!({"supportedVersions":[protocol::MCP_VERSION,"2025-11-25"],"capabilities":{"tools":{}},"instructions":"Use list_targets to discover HTTP targets and call_target to access them. OAuth targets retain their endpoint roles in tags.","ttlMs":0,"cacheScope":"private"})
+                json!({
+                    "supportedVersions":SUPPORTED_VERSIONS,
+                    "capabilities":{"tools":{}},
+                    "instructions":instructions,
+                    "ttlMs":0,
+                    "cacheScope":"public"
+                })
             }
             Some("initialize") => {
-                json!({"protocolVersion":"2025-11-25","serverInfo":identity,"capabilities":{"tools":{}},"instructions":"Use list_targets to discover HTTP targets and call_target to access them. OAuth targets retain their endpoint roles in tags."})
+                let requested = protocol::field(&request.message, "params")
+                    .and_then(|params| protocol::field(&params, "protocolVersion"))
+                    .and_then(|version| serde_json::from_str::<String>(version.get()).ok())
+                    .unwrap_or_default();
+                let version = if requested.as_str() < protocol::MCP_VERSION
+                    && SUPPORTED_VERSIONS.contains(&requested.as_str())
+                {
+                    requested
+                } else {
+                    "2025-11-25".into()
+                };
+                json!({
+                    "protocolVersion":version,
+                    "serverInfo":identity,
+                    "capabilities":{"tools":{}},
+                    "instructions":instructions
+                })
             }
             Some("ping") if !modern => json!({}),
             Some("tools/list") => self.tools()?,
@@ -526,10 +617,16 @@ impl Transport for Harpoon {
                                 fields.remove("body_base64");
                             }
                         }
-                        json!({"content":[{"type":"text","text":serde_json::to_string(&text)?}],"structuredContent":value})
+                        json!({
+                            "content":[{"type":"text","text":serde_json::to_string(&text)?}],
+                            "structuredContent":value
+                        })
                     }
                     Err(error) => {
-                        json!({"isError":true,"content":[{"type":"text","text":format!("{error:#}")}]})
+                        json!({
+                            "isError":true,
+                            "content":[{"type":"text","text":format!("{error:#}")}]
+                        })
                     }
                 }
             }
