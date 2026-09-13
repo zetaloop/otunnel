@@ -252,36 +252,40 @@ pub fn wire_headers(headers: &HeaderMap, filtered: bool) -> Headers {
     let excluded: Vec<_> = headers
         .get_all("connection")
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|v| v.trim().to_ascii_lowercase())
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
         .collect();
-    let allowed = [
-        "content-type",
-        "mcp-session-id",
-        "mcp-protocol-version",
-        "last-event-id",
-        "access-control-expose-headers",
-        "www-authenticate",
-    ];
-    headers
-        .keys()
-        .filter(|name| {
-            name.as_str() != "connection"
-                && !excluded.iter().any(|v| v == name.as_str())
-                && (!filtered || allowed.contains(&name.as_str()))
-        })
-        .filter_map(|name| {
-            let values: Vec<_> = headers
-                .get_all(name)
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-                .collect();
-            (!values.is_empty()).then(|| (name.to_string(), values))
-        })
-        .collect()
+    let mut result = Headers::new();
+    for name in headers.keys() {
+        if name == "connection" || excluded.iter().any(|value| value == name.as_str()) {
+            continue;
+        }
+        let canonical = if filtered {
+            match name.as_str() {
+                "access-control-expose-headers" => "Access-Control-Expose-Headers".into(),
+                "content-type" => "Content-Type".into(),
+                "last-event-id" => "Last-Event-Id".into(),
+                "mcp-protocol-version" => "Mcp-Protocol-Version".into(),
+                "mcp-session-id" => "Mcp-Session-Id".into(),
+                "www-authenticate" => "Www-Authenticate".into(),
+                _ => continue,
+            }
+        } else {
+            crate::harpoon::headers::canonical(name.as_str())
+        };
+        let values: Vec<_> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !values.is_empty() {
+            result.insert(canonical, values);
+        }
+    }
+    result
 }
 
 pub fn timeout(value: &Value) -> Option<Duration> {
