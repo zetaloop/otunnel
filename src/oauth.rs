@@ -219,37 +219,70 @@ async fn discovery_candidates(transport: &HttpTransport) -> (Vec<Url>, bool) {
     (candidates, advertised)
 }
 
-async fn request_document(transport: &HttpTransport, url: &Url) -> Result<Fetched> {
-    let mut headers = HeaderMap::new();
-    headers.insert("accept", "application/json".parse()?);
-    let mut response = transport
-        .send(
+fn timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<tokio::time::error::Elapsed>()
+            || cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+    })
+}
+
+async fn request_document(transport: &HttpTransport, url: &Url, retry: bool) -> Result<Fetched> {
+    for attempt in 0..if retry { 3 } else { 1 } {
+        let deadline =
+            retry.then(|| tokio::time::Instant::now() + Duration::from_secs(2 << attempt));
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "application/json".parse()?);
+        let incoming = HeaderMap::new();
+        let request = transport.send(
             Method::GET,
             url.clone(),
             headers,
             Bytes::new(),
-            &HeaderMap::new(),
+            &incoming,
             true,
-        )
-        .await?;
-    let status = response.status.as_u16();
-    let headers = response.headers.clone();
-    let mut body = BytesMut::new();
-    while let Some(chunk) = response.body.next().await {
-        let chunk = chunk?;
-        let remaining = (METADATA_LIMIT + 1).saturating_sub(body.len());
-        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if body.len() > METADATA_LIMIT {
-            break;
-        }
+        );
+        let response = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, request)
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
+            None => request.await,
+        };
+        let mut response = match response {
+            Err(error) if retry && attempt < 2 && timed_out(&error) => continue,
+            result => result?,
+        };
+        let read = async {
+            let status = response.status.as_u16();
+            let headers = response.headers.clone();
+            let mut body = BytesMut::new();
+            while let Some(chunk) = response.body.next().await {
+                let chunk = chunk?;
+                let remaining = (METADATA_LIMIT + 1).saturating_sub(body.len());
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() > METADATA_LIMIT {
+                    break;
+                }
+            }
+            let too_large = body.len() > METADATA_LIMIT;
+            Ok(Fetched {
+                status,
+                headers,
+                body: body.freeze(),
+                too_large,
+            })
+        };
+        return match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, read).await?,
+            None => read.await,
+        };
     }
-    let too_large = body.len() > METADATA_LIMIT;
-    Ok(Fetched {
-        status,
-        headers,
-        body: body.freeze(),
-        too_large,
-    })
+    unreachable!()
 }
 
 pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
@@ -401,82 +434,82 @@ async fn fetch_resource(
     advertised: bool,
 ) -> Result<Document> {
     let count = candidates.len();
-    let mut missing = count > 0 && !advertised;
-    let mut timed_out = count > 0;
-    let mut failure = anyhow::anyhow!("OAuth discovery has no metadata candidates");
-    for (index, url) in candidates.into_iter().enumerate() {
-        let fetched = match request_document(transport, &url).await {
-            Ok(fetched) => fetched,
-            Err(error) => {
-                missing = false;
-                timed_out &= error.is::<tokio::time::error::Elapsed>()
-                    || error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(reqwest::Error::is_timeout)
-                    });
-                failure = error.context(format!("OAuth discovery GET {url}"));
-                continue;
-            }
-        };
-        missing &= fetched.status == 404;
-        timed_out = false;
-        let next = matches!(fetched.status, 404 | 500..=599) && index + 1 < count;
-        let result = (|| {
-            anyhow::ensure!(
-                !fetched.too_large,
-                "OAuth discovery response body from {url} exceeds {METADATA_LIMIT} bytes"
-            );
-            anyhow::ensure!(
-                !fetched.body.is_empty(),
-                "OAuth discovery empty body from {url} (status {})",
-                fetched.status
-            );
-            anyhow::ensure!(
-                !next,
-                "OAuth discovery status {} from {url}",
-                fetched.status
-            );
-            let value: Value = serde_json::from_slice(&fetched.body)
-                .context("OAuth discovery invalid metadata")?;
-            anyhow::ensure!(
-                value
-                    .get("resource")
+    for retry in [false, true] {
+        let mut missing = count > 0 && !advertised;
+        let mut timeouts = count > 0;
+        let mut failure = anyhow::anyhow!("OAuth discovery has no metadata candidates");
+        for (index, url) in candidates.iter().enumerate() {
+            let fetched = match request_document(transport, url, retry).await {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    missing = false;
+                    timeouts &= timed_out(&error);
+                    failure = error.context(format!("OAuth discovery GET {url}"));
+                    continue;
+                }
+            };
+            missing &= fetched.status == 404;
+            timeouts = false;
+            let next = matches!(fetched.status, 404 | 500..=599) && index + 1 < count;
+            let result = (|| {
+                anyhow::ensure!(
+                    !fetched.too_large,
+                    "OAuth discovery response body from {url} exceeds {METADATA_LIMIT} bytes"
+                );
+                anyhow::ensure!(
+                    !fetched.body.is_empty(),
+                    "OAuth discovery empty body from {url} (status {})",
+                    fetched.status
+                );
+                anyhow::ensure!(
+                    !next,
+                    "OAuth discovery status {} from {url}",
+                    fetched.status
+                );
+                let value: Value = serde_json::from_slice(&fetched.body)
+                    .context("OAuth discovery invalid metadata")?;
+                anyhow::ensure!(
+                    value
+                        .get("resource")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
+                    "protected resource metadata is missing resource"
+                );
+                if let Some(issuer) = value
+                    .pointer("/authorization_servers/0")
                     .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty()),
-                "protected resource metadata is missing resource"
-            );
-            if let Some(issuer) = value
-                .pointer("/authorization_servers/0")
-                .and_then(Value::as_str)
-            {
-                issuer
-                    .parse::<http::Uri>()
-                    .context("protected resource metadata has an invalid authorization server")?;
-            }
-            Ok::<_, anyhow::Error>(Document {
-                url,
-                value,
-                headers: fetched.headers,
-                status: fetched.status,
-            })
-        })();
-        match result {
-            Ok(document) => return Ok(document),
-            Err(error) => {
-                failure = error;
-                if !next {
-                    break;
+                {
+                    issuer.parse::<http::Uri>().context(
+                        "protected resource metadata has an invalid authorization server",
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(Document {
+                    url: url.clone(),
+                    value,
+                    headers: fetched.headers,
+                    status: fetched.status,
+                })
+            })();
+            match result {
+                Ok(document) => return Ok(document),
+                Err(error) => {
+                    failure = error;
+                    if !next {
+                        break;
+                    }
                 }
             }
         }
+        if retry || !timeouts {
+            return Err(DiscoveryError {
+                optional: missing,
+                retry: timeouts,
+                error: failure,
+            }
+            .into());
+        }
     }
-    Err(DiscoveryError {
-        optional: missing,
-        retry: timed_out,
-        error: failure,
-    }
-    .into())
+    unreachable!()
 }
 
 fn authorization_candidates(issuer: &Url) -> Result<Vec<Url>> {
@@ -496,67 +529,78 @@ fn authorization_candidates(issuer: &Url) -> Result<Vec<Url>> {
 }
 
 async fn fetch_authorization(transport: &HttpTransport, issuer: &Url) -> Result<Document> {
-    let mut fallback = None;
-    let mut failure = None;
-    for url in authorization_candidates(issuer)? {
-        let fetched = match request_document(transport, &url).await {
-            Ok(fetched) => fetched,
-            Err(error) => {
-                failure = Some(error.context(format!("OAuth authorization metadata GET {url}")));
-                continue;
-            }
-        };
-        let result = (|| {
-            anyhow::ensure!(
-                fetched.status == 200,
-                "OAuth authorization metadata returned HTTP {}",
-                fetched.status
-            );
-            anyhow::ensure!(
-                !fetched.too_large,
-                "OAuth authorization metadata exceeds {METADATA_LIMIT} bytes"
-            );
-            let content_type = fetched
-                .headers
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            anyhow::ensure!(
-                content_type
-                    .split(';')
-                    .next()
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json")),
-                "OAuth authorization metadata has bad content type {content_type:?}"
-            );
-            let value: Value = serde_json::from_slice(&fetched.body)
-                .context("OAuth authorization metadata is not JSON")?;
-            anyhow::ensure!(
-                value
-                    .get("issuer")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty()),
-                "OAuth authorization metadata has no issuer"
-            );
-            Ok::<_, anyhow::Error>(Document {
-                url,
-                value,
-                headers: fetched.headers,
-                status: fetched.status,
-            })
-        })();
-        match result {
-            Ok(document) => {
-                if document.value["issuer"] == issuer.as_str() {
-                    return Ok(document);
+    let candidates = authorization_candidates(issuer)?;
+    for retry in [false, true] {
+        let mut fallback = None;
+        let mut failure = None;
+        let mut timeouts = !candidates.is_empty();
+        for url in &candidates {
+            let fetched = match request_document(transport, url, retry).await {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    timeouts &= timed_out(&error);
+                    failure =
+                        Some(error.context(format!("OAuth authorization metadata GET {url}")));
+                    continue;
                 }
-                if fallback.is_none() {
-                    fallback = Some(document);
+            };
+            timeouts = false;
+            let result = (|| {
+                anyhow::ensure!(
+                    fetched.status == 200,
+                    "OAuth authorization metadata returned HTTP {}",
+                    fetched.status
+                );
+                anyhow::ensure!(
+                    !fetched.too_large,
+                    "OAuth authorization metadata exceeds {METADATA_LIMIT} bytes"
+                );
+                let content_type = fetched
+                    .headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                anyhow::ensure!(
+                    content_type
+                        .parse::<mime::Mime>()
+                        .is_ok_and(|media_type| media_type.essence_str() == "application/json"),
+                    "OAuth authorization metadata has bad content type {content_type:?}"
+                );
+                let value: Value = serde_json::from_slice(&fetched.body)
+                    .context("OAuth authorization metadata is not JSON")?;
+                anyhow::ensure!(
+                    value
+                        .get("issuer")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
+                    "OAuth authorization metadata has no issuer"
+                );
+                Ok::<_, anyhow::Error>(Document {
+                    url: url.clone(),
+                    value,
+                    headers: fetched.headers,
+                    status: fetched.status,
+                })
+            })();
+            match result {
+                Ok(document) => {
+                    if document.value["issuer"] == issuer.as_str() {
+                        return Ok(document);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(document);
+                    }
                 }
+                Err(error) => failure = Some(error),
             }
-            Err(error) => failure = Some(error),
+        }
+        if fallback.is_some() || retry || !timeouts {
+            return fallback.ok_or_else(|| {
+                failure.unwrap_or_else(|| {
+                    anyhow::anyhow!("OAuth authorization metadata was not found")
+                })
+            });
         }
     }
-    fallback.ok_or_else(|| {
-        failure.unwrap_or_else(|| anyhow::anyhow!("OAuth authorization metadata was not found"))
-    })
+    unreachable!()
 }

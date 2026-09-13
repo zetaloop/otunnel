@@ -1377,6 +1377,7 @@ dependencies = [
  "indexmap",
  "ipnet",
  "libc",
+ "mime",
  "percent-encoding",
  "process-wrap",
  "rand",

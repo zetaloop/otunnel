@@ -592,7 +592,10 @@ async fn execute(
     }
     let delivery = Delivery::new(control.clone(), &command);
     let headers = protocol::header_map(&command.headers)?;
-    let Some(binding) = bindings.get(&command.channel) else {
+    let Some(binding) = bindings.get(&command.channel).filter(|binding| {
+        binding.available()
+            && (command.command_type != "oauth_discovery" || command.channel == "main")
+    }) else {
         let message = format!("unsupported channel {:?}", command.channel);
         let mut reply = match command.command_type.as_str() {
             "jsonrpc" => {
