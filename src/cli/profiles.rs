@@ -232,6 +232,7 @@ pub fn execute(arguments: &ArgMatches) -> Result<u8> {
             let executable = words
                 .next()
                 .context("set VISUAL or EDITOR to edit profiles")?;
+            let executable = otunnel::process::resolve_program(executable)?;
             let result = Process::new(executable)
                 .args(words)
                 .arg(temporary.path())
@@ -470,7 +471,7 @@ fn write(path: &Path, contents: &[u8], force: bool) -> Result<()> {
 
 fn preflight(arguments: &[String], depth: usize) -> Result<PathBuf> {
     let name = arguments.first().context("command is empty")?;
-    let executable = which::which(name)
+    let executable = otunnel::process::resolve_program(name)
         .with_context(|| format!("stdio MCP executable {name:?} was not found"))?;
     #[cfg(unix)]
     {
@@ -482,7 +483,7 @@ fn preflight(arguments: &[String], depth: usize) -> Result<PathBuf> {
             let line = source.lines().next().unwrap_or_default();
             let interpreter = shell_words::split(line)?;
             if let Some(interpreter) = interpreter.first() {
-                which::which(interpreter).with_context(|| {
+                otunnel::process::resolve_program(interpreter).with_context(|| {
                     format!("script interpreter {interpreter:?} is unavailable")
                 })?;
             }

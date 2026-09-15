@@ -1,4 +1,4 @@
-use std::process::Stdio;
+use std::{path::PathBuf, process::Stdio};
 
 use anyhow::{Context, Result};
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
@@ -43,13 +43,18 @@ pub fn running(pid: u32) -> bool {
     }
 }
 
+pub fn resolve_program(program: &str) -> Result<PathBuf> {
+    Ok(which::which(program)?)
+}
+
 pub struct Process {
     child: Box<dyn ChildWrapper>,
 }
 impl Process {
     pub fn spawn(invocation: &str, output: Stdio) -> Result<Self> {
         let args = crate::config::command_args(invocation)?;
-        let mut command = Command::new(&args[0]);
+        let program = resolve_program(&args[0]).with_context(|| format!("start {}", args[0]))?;
+        let mut command = Command::new(program);
         command
             .args(&args[1..])
             .stdin(Stdio::piped())

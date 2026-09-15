@@ -20,7 +20,7 @@ strip = true
 
 [features]
 default = ["cli"]
-cli = ["dep:axum", "dep:clap", "dep:clap_complete", "dep:csv", "dep:tempfile", "dep:tracing-subscriber", "dep:which", "dep:cap-std", "dep:same-file", "dep:time"]
+cli = ["dep:axum", "dep:clap", "dep:clap_complete", "dep:csv", "dep:tempfile", "dep:tracing-subscriber", "dep:cap-std", "dep:same-file", "dep:time"]
 
 [[bin]]
 name = "otunnel"
@@ -72,7 +72,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"], optional = true }
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
-which = { version = "8.0.6", optional = true }
+which = "8.0.6"
 
 [target."cfg(windows)".dependencies]
 async-io = "2.6.0"
