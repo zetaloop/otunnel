@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use http::HeaderMap;
+use bytes::Bytes;
+use http::{HeaderMap, Method};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{config, harpoon::headers};
@@ -15,6 +17,8 @@ pub struct Definition {
     pub version: u8,
     pub origin: String,
     pub method: String,
+    #[serde(default)]
+    pub body_policy: Option<BodyPolicy>,
     pub path_template: String,
     #[serde(default)]
     pub query: BTreeMap<String, String>,
@@ -39,6 +43,175 @@ impl Definition {
             }
         }
         Template::new(&definition).map(|_| ())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BodyPolicy {
+    pub content_types: Vec<String>,
+    pub max_bytes: usize,
+    pub required: Option<bool>,
+    pub validation: Option<BodyValidation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BodyValidation {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub json: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pattern: String,
+    #[serde(default, rename = "enum", skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+struct CompiledBodyPolicy {
+    definition: BodyPolicy,
+    pattern: Option<Regex>,
+}
+
+impl CompiledBodyPolicy {
+    fn new(method: &str, definition: Option<&BodyPolicy>) -> Result<Option<Self>> {
+        if method == "GET" {
+            anyhow::ensure!(
+                definition.is_none(),
+                "template GET cannot configure a body policy"
+            );
+            return Ok(None);
+        }
+        let definition = definition.context("template writes require an explicit body policy")?;
+        let required = definition
+            .required
+            .context("template writes require an explicit required setting")?;
+        let validation = definition
+            .validation
+            .clone()
+            .context("template writes require explicit body validation")?;
+        anyhow::ensure!(
+            (1..=100 * 1024).contains(&definition.max_bytes),
+            "template body byte limit must be within 1 to 102400"
+        );
+        anyhow::ensure!(
+            (1..=16).contains(&definition.content_types.len()),
+            "template body policy must allow 1 to 16 content types"
+        );
+        anyhow::ensure!(
+            validation.json || !validation.pattern.is_empty() || !validation.values.is_empty(),
+            "template body policy requires JSON, pattern, or enum validation"
+        );
+        anyhow::ensure!(
+            validation.pattern.len() <= 512 && validation.values.len() <= 64,
+            "template body validation exceeds size limits"
+        );
+        let mut seen = BTreeSet::new();
+        for value in &definition.content_types {
+            let parsed: mime::Mime = value.parse().context("invalid template content type")?;
+            anyhow::ensure!(
+                value.len() <= 128
+                    && value.contains('/')
+                    && !value.contains('*')
+                    && parsed.params().next().is_none()
+                    && parsed.to_string() == *value,
+                "template content types must be canonical media types without parameters or wildcards"
+            );
+            anyhow::ensure!(
+                !(value == "application/json" || value.ends_with("+json")) || validation.json,
+                "JSON content types require JSON body validation"
+            );
+            anyhow::ensure!(
+                seen.insert(value.clone()),
+                "duplicate template content type"
+            );
+        }
+        let pattern = if validation.pattern.is_empty() {
+            None
+        } else {
+            validate_body_pattern(&validation.pattern)?;
+            Some(
+                Regex::new(&format!(r"\A(?:{})\z", validation.pattern))
+                    .context("invalid template body pattern")?,
+            )
+        };
+        let result = Self {
+            definition: BodyPolicy {
+                content_types: definition.content_types.clone(),
+                max_bytes: definition.max_bytes,
+                required: Some(required),
+                validation: Some(validation),
+            },
+            pattern,
+        };
+        let validation = result
+            .definition
+            .validation
+            .as_ref()
+            .expect("compiled body validation");
+        let mut total = 0;
+        let mut seen = BTreeSet::new();
+        for value in &validation.values {
+            total += value.len();
+            anyhow::ensure!(
+                total <= 100 * 1024
+                    && result
+                        .validate(Some(value), Some(&result.definition.content_types[0]))
+                        .is_ok(),
+                "template body enum violates body policy or size limits"
+            );
+            anyhow::ensure!(seen.insert(value), "duplicate template body enum value");
+        }
+        Ok(Some(result))
+    }
+
+    fn validate(&self, body: Option<&str>, content_type: Option<&str>) -> Result<()> {
+        let required = self.definition.required.expect("compiled required setting");
+        if body.is_none() && content_type.is_none() && !required {
+            return Ok(());
+        }
+        let body = body.context("template body and content_type must be supplied together")?;
+        let content_type =
+            content_type.context("template body and content_type must be supplied together")?;
+        anyhow::ensure!(
+            self.definition
+                .content_types
+                .iter()
+                .any(|value| value == content_type),
+            "template content type is not permitted"
+        );
+        anyhow::ensure!(
+            body.len() <= self.definition.max_bytes && (!required || !body.is_empty()),
+            "template body violates its byte limit or required-body policy"
+        );
+        let validation = self
+            .definition
+            .validation
+            .as_ref()
+            .expect("compiled body validation");
+        anyhow::ensure!(
+            !validation.json || serde_json::from_str::<Value>(body).is_ok(),
+            "template body must be valid JSON"
+        );
+        anyhow::ensure!(
+            self.pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.is_match(body)),
+            "template body does not match its pattern"
+        );
+        anyhow::ensure!(
+            validation.values.is_empty() || validation.values.iter().any(|value| value == body),
+            "template body is outside its enum"
+        );
+        Ok(())
+    }
+
+    fn canonical(&self) -> BodyPolicy {
+        let mut definition = self.definition.clone();
+        definition.content_types.sort();
+        definition
+            .validation
+            .as_mut()
+            .expect("compiled body validation")
+            .values
+            .sort();
+        definition
     }
 }
 
@@ -220,6 +393,77 @@ fn validate_pattern(pattern: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_body_pattern(pattern: &str) -> Result<()> {
+    validate_pattern(pattern)?;
+    let bytes = pattern.as_bytes();
+    let mut class = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 1;
+                let escaped = bytes[index];
+                anyhow::ensure!(
+                    !b"dDsSwW".contains(&escaped) && (escaped != b'-' || class),
+                    "body patterns require explicit ASCII classes and escaped syntax punctuation"
+                );
+            }
+            b'[' => {
+                anyhow::ensure!(
+                    !class && bytes.get(index + 1) != Some(&b'^'),
+                    "body patterns cannot use nested or negated classes"
+                );
+                class = true;
+            }
+            b']' => {
+                anyhow::ensure!(class, "body patterns must escape literal closing brackets");
+                class = false;
+            }
+            b'.' if !class => anyhow::bail!("body patterns cannot use wildcard dots"),
+            b'^' | b'$'
+                if !class
+                    && bytes
+                        .get(index + 1)
+                        .is_some_and(|value| b"*+?{".contains(value)) =>
+            {
+                anyhow::bail!("body patterns cannot quantify anchors directly")
+            }
+            b'{' if !class => {
+                let start = index + 1;
+                index = start;
+                while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                anyhow::ensure!(
+                    index > start && (index - start == 1 || bytes[start] != b'0'),
+                    "body patterns must escape literal opening braces"
+                );
+                if bytes.get(index) == Some(&b',') {
+                    let start = index + 1;
+                    index = start;
+                    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                        index += 1;
+                    }
+                    anyhow::ensure!(
+                        index - start <= 1 || bytes[start] != b'0',
+                        "body patterns cannot use leading zeros in repetition bounds"
+                    );
+                }
+                anyhow::ensure!(
+                    bytes.get(index) == Some(&b'}'),
+                    "body patterns require valid repetition bounds"
+                );
+            }
+            b'}' if !class => {
+                anyhow::bail!("body patterns must escape literal closing braces")
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 enum Part {
     Literal(String),
     Parameter(String),
@@ -255,6 +499,9 @@ impl Part {
 }
 
 pub(crate) struct Template {
+    method: Method,
+    body_policy: Option<CompiledBodyPolicy>,
+    operation: Option<String>,
     origin: Url,
     path: Vec<Part>,
     query: BTreeMap<String, Part>,
@@ -266,7 +513,13 @@ pub(crate) struct Template {
 impl Template {
     pub fn new(definition: &Definition) -> Result<Self> {
         anyhow::ensure!(definition.version == 1, "template version must be 1");
-        anyhow::ensure!(definition.method == "GET", "template method must be GET");
+        anyhow::ensure!(
+            matches!(definition.method.as_str(), "GET" | "POST" | "PUT"),
+            "template method must be GET, POST, or PUT"
+        );
+        let method = Method::from_bytes(definition.method.as_bytes())?;
+        let body_policy =
+            CompiledBodyPolicy::new(definition.method.as_str(), definition.body_policy.as_ref())?;
         anyhow::ensure!(
             !definition.follow_redirects,
             "template redirects must be disabled"
@@ -348,12 +601,20 @@ impl Template {
             "template contains unused parameters"
         );
         anyhow::ensure!(
-            definition.headers.len() + definition.allowed_headers.len() <= 32,
+            definition.headers.len()
+                + definition.allowed_headers.len()
+                + usize::from(body_policy.is_some())
+                <= 32,
             "template has too many headers"
         );
         let mut headers = HeaderMap::new();
         for (name, value) in &definition.headers {
             let name = headers::template_name(name)?;
+            anyhow::ensure!(
+                body_policy.is_none()
+                    || !matches!(name.as_str(), "content-type" | "content-encoding"),
+                "template writes require the body policy content type and unencoded body bytes"
+            );
             anyhow::ensure!(
                 !headers.contains_key(&name),
                 "duplicate template header name"
@@ -368,6 +629,11 @@ impl Template {
                 "template authentication headers must be fixed by the operator"
             );
             anyhow::ensure!(
+                body_policy.is_none()
+                    || !matches!(name.as_str(), "content-type" | "content-encoding"),
+                "template writes require the body policy content type and unencoded body bytes"
+            );
+            anyhow::ensure!(
                 !headers.contains_key(&name),
                 "template caller header conflicts with a fixed header"
             );
@@ -377,7 +643,10 @@ impl Template {
             );
         }
         headers::template_size(&headers)?;
-        let template = Self {
+        let mut template = Self {
+            method,
+            body_policy,
+            operation: None,
             origin,
             path,
             query,
@@ -394,11 +663,36 @@ impl Template {
             template.url(&longest).as_str().len() <= 4096,
             "template maximum rendered URL exceeds size limit"
         );
+        if let Some(policy) = &template.body_policy {
+            #[derive(Serialize)]
+            struct Operation<'a> {
+                method: &'a str,
+                body_policy: BodyPolicy,
+                parameters_schema: Value,
+            }
+            let encoded = serde_json::to_vec(&Operation {
+                method: template.method.as_str(),
+                body_policy: policy.canonical(),
+                parameters_schema: template.schema(),
+            })?;
+            let digest = Sha256::digest(encoded);
+            template.operation = Some(format!(
+                "write-v1:{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ));
+        }
         Ok(template)
     }
 
     pub fn origin(&self) -> &Url {
         &self.origin
+    }
+
+    pub fn method(&self) -> &str {
+        self.method.as_str()
     }
 
     fn url(&self, values: &BTreeMap<String, String>) -> Url {
@@ -480,6 +774,46 @@ impl Template {
         Ok((url, headers))
     }
 
+    pub fn request(
+        &self,
+        values: &BTreeMap<String, String>,
+        caller: HeaderMap,
+        operation: Option<&str>,
+        body: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<(Method, Url, HeaderMap, Bytes)> {
+        match &self.body_policy {
+            Some(policy) => {
+                anyhow::ensure!(
+                    operation == self.operation.as_deref(),
+                    "write operation must match the discovered invocation schema"
+                );
+                policy.validate(body, content_type)?;
+            }
+            None => {
+                anyhow::ensure!(
+                    operation.is_none(),
+                    "GET templates do not accept a write operation"
+                );
+                anyhow::ensure!(
+                    body.is_none() && content_type.is_none(),
+                    "template GET requests cannot contain body or content_type arguments"
+                );
+            }
+        }
+        let (url, mut headers) = self.render(values, caller)?;
+        if let Some(content_type) = content_type {
+            headers.insert("content-type", http::HeaderValue::try_from(content_type)?);
+            headers::template_size(&headers)?;
+        }
+        let body = if self.method == Method::GET {
+            Bytes::new()
+        } else {
+            Bytes::copy_from_slice(body.unwrap_or_default().as_bytes())
+        };
+        Ok((self.method.clone(), url, headers, body))
+    }
+
     pub fn schema(&self) -> Value {
         let mut properties = serde_json::Map::new();
         for (name, constraint) in &self.parameters {
@@ -525,13 +859,84 @@ impl Template {
     }
 
     pub fn invocation(&self, label: &str, mut schema: Value) -> Value {
+        let root = schema.as_object_mut().expect("template call schema object");
+        root.remove("$id");
+        root.remove("title");
         schema["properties"]["label"]["const"] = json!(label);
         schema["properties"]["parameters"] = self.schema();
-        let headers: serde_json::Map<_, _> = self.allowed_headers.iter().map(|name| {
-            (headers::canonical(name), json!({"type":"string","maxLength":8192,"not":{"pattern":"[\u{0000}-\u{001f}\u{007f}]"}}))
-        }).collect();
-        schema["properties"]["headers"] = json!({"type":"object","properties":headers,"additionalProperties":false,"maxProperties":32,"default":{}});
-        let mut invocation = json!({"tool_name":"call_target_template","input_schema":schema});
+        schema["description"] = json!(format!(
+            "Arguments for this fixed-origin HTTPS {} operation. Supply raw parameter values without URL encoding; the client renders them. The method, path structure, and query names are fixed. Redirects are disabled. GET rejects bodies; writes enforce the advertised body policy and are never automatically replayed.",
+            self.method
+        ));
+        match &self.body_policy {
+            Some(policy) => {
+                schema["properties"]["operation"] = json!({"type":"string","const":self.operation});
+                schema["required"]
+                    .as_array_mut()
+                    .expect("template call schema required fields")
+                    .push(json!("operation"));
+                let policy = policy.canonical();
+                let validation = policy
+                    .validation
+                    .as_ref()
+                    .expect("compiled body validation");
+                let mut body = json!({
+                    "type":"string",
+                    "maxLength":policy.max_bytes,
+                    "x-maxBytes":policy.max_bytes,
+                    "description":"Raw UTF-8 body. x-maxBytes is an enforced byte limit; maxLength is a character limit. All configured JSON, full-string pattern, and exact raw-string enum checks must pass."
+                });
+                if policy.required == Some(true) {
+                    body["minLength"] = json!(1);
+                    schema["required"]
+                        .as_array_mut()
+                        .expect("template call schema required fields")
+                        .extend([json!("body"), json!("content_type")]);
+                }
+                if validation.json {
+                    body["contentMediaType"] = json!("application/json");
+                }
+                if !validation.pattern.is_empty() {
+                    body["pattern"] = json!(format!("^(?:{})$", validation.pattern));
+                    body["not"] = json!({"pattern":"[^ -~]"});
+                }
+                if !validation.values.is_empty() {
+                    body["enum"] = json!(validation.values);
+                }
+                schema["properties"]["body"] = body;
+                schema["properties"]["content_type"] =
+                    json!({"type":"string","enum":policy.content_types});
+                schema["dependentRequired"] =
+                    json!({"body":["content_type"],"content_type":["body"]});
+            }
+            None => {
+                let properties = schema["properties"]
+                    .as_object_mut()
+                    .expect("template call schema properties");
+                properties.remove("operation");
+                properties.remove("body");
+                properties.remove("content_type");
+            }
+        }
+        let headers: serde_json::Map<_, _> = self
+            .allowed_headers
+            .iter()
+            .map(|name| {
+                (
+                    headers::canonical(name),
+                    json!({"type":"string","maxLength":8192,"not":{"pattern":"[\u{0000}-\u{001f}\u{007f}]"}}),
+                )
+            })
+            .collect();
+        schema["properties"]["headers"] = json!({
+            "type":"object",
+            "properties":headers,
+            "additionalProperties":false,
+            "maxProperties":32,
+            "default":{},
+            "description":"Optional caller headers using the advertised spelling. Values must be valid UTF-8 without control characters. The client also enforces an 8192-byte total header budget including managed headers."
+        });
+        let mut invocation = json!({"tool_name":"call_target","input_schema":schema});
         let example: Option<BTreeMap<_, _>> = self
             .parameters
             .iter()
@@ -544,10 +949,39 @@ impl Template {
                 Some((name.clone(), value.clone()))
             })
             .collect();
-        if let Some(parameters) = example
-            && self.render(&parameters, HeaderMap::new()).is_ok()
-        {
-            invocation["examples"] = json!([{"label":label,"parameters":parameters}]);
+        if let Some(parameters) = example {
+            let mut example = json!({"label":label,"parameters":parameters});
+            if let Some(policy) = &self.body_policy {
+                example["operation"] = json!(self.operation);
+                let policy = policy.canonical();
+                let validation = policy.validation.expect("compiled body validation");
+                if let Some(body) = validation.values.iter().min() {
+                    let content_type = policy
+                        .content_types
+                        .iter()
+                        .min()
+                        .expect("compiled content type");
+                    example["body"] = json!(body);
+                    example["content_type"] = json!(content_type);
+                } else if policy.required == Some(true) {
+                    return invocation;
+                }
+            }
+            let parameters: BTreeMap<String, String> =
+                serde_json::from_value(example["parameters"].clone())
+                    .expect("validated template example");
+            if self
+                .request(
+                    &parameters,
+                    HeaderMap::new(),
+                    example.get("operation").and_then(Value::as_str),
+                    example.get("body").and_then(Value::as_str),
+                    example.get("content_type").and_then(Value::as_str),
+                )
+                .is_ok()
+            {
+                invocation["examples"] = json!([example]);
+            }
         }
         invocation
     }

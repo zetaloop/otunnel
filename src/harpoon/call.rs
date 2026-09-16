@@ -52,6 +52,12 @@ pub(super) struct CallTemplate {
     label: String,
     #[serde(deserialize_with = "unique")]
     parameters: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "present")]
+    operation: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    body: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    content_type: Option<String>,
     #[serde(default, deserialize_with = "unique")]
     headers: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "present")]
@@ -88,6 +94,13 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+fn validate_timeout(milliseconds: i64) -> Result<()> {
+    anyhow::ensure!(milliseconds > 0, "timeout must be positive");
+    anyhow::ensure!(milliseconds >= 100, "timeout must be at least 100ms");
+    anyhow::ensure!(milliseconds <= 120000, "timeout must be at most 120000ms");
+    Ok(())
+}
+
 fn unique<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
@@ -111,33 +124,12 @@ fn unique<'de, D: Deserializer<'de>>(
 }
 
 impl Harpoon {
-    pub(super) fn call_schema(&self, template: bool) -> Value {
-        let timeout = json!({"type":"integer","maximum":120000,"minimum":100,"default":30000});
-        let response = json!({"type":"integer","maximum":self.response_limit(),"minimum":1,"default":self.response_limit()});
-        let headers = json!({"additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"},"type":"object","default":{}});
-        if template {
-            return json!({
-                "$schema":"https://json-schema.org/draft/2020-12/schema",
-                "$id":"https://github.com/openai/tunnel-client/pkg/runtimeharpoon/call-target-template-request",
-                "properties":{
-                    "label":{"type":"string","maxLength":64,"minLength":1,"pattern":"^[a-z0-9][a-z0-9_-]{0,63}$"},
-                    "parameters":{"type":"object","description":"Required string values matching the target parameters_schema."},
-                    "headers":headers,
-                    "timeout_ms":timeout,
-                    "max_response_bytes":response
-                },
-                "additionalProperties":false,
-                "type":"object",
-                "required":["label","parameters"],
-                "title":"Call Harpoon target template",
-                "description":"Call a configured GET operation with bounded string identifiers."
-            });
-        }
-        let mut timeout = timeout;
+    fn exact_call_schema(&self) -> Value {
+        let mut timeout = json!({"type":"integer","maximum":120000,"minimum":100,"default":30000});
         timeout["description"] = json!("Request timeout in milliseconds");
-        let mut response = response;
+        let mut response = json!({"type":"integer","maximum":self.response_limit(),"minimum":1,"default":self.response_limit()});
         response["description"] = json!("Maximum response bytes to read");
-        let mut headers = headers;
+        let mut headers = json!({"additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"},"type":"object","default":{}});
         headers["description"] = json!(
             "HTTP headers to include in the request; transport proxy forwarding headers plus client-managed identity headers plus caller-supplied fields nominated by Connection are blocked"
         );
@@ -160,6 +152,44 @@ impl Harpoon {
             "title":"Call Harpoon target",
             "description":"Call an allowlisted HTTP target by label."
         })
+    }
+
+    pub(super) fn template_call_schema(&self) -> Value {
+        let timeout = json!({"type":"integer","maximum":120000,"minimum":100,"default":30000});
+        let response = json!({"type":"integer","maximum":self.response_limit(),"minimum":1,"default":self.response_limit()});
+        let headers = json!({"additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"},"type":"object","default":{}});
+        json!({
+            "$schema":"https://json-schema.org/draft/2020-12/schema",
+            "$id":"https://github.com/openai/tunnel-client/pkg/runtimeharpoon/call-target-template-request",
+            "properties":{
+                "label":{"type":"string","maxLength":64,"minLength":1,"pattern":"^[a-z0-9][a-z0-9_-]{0,63}$"},
+                "parameters":{"type":"object","description":"Required string values matching the target parameters_schema."},
+                "operation":{"type":"string","minLength":1,"maxLength":73,"description":"Copy the required write operation constant from the discovered invocation schema; unavailable for GET."},
+                "body":{"type":"string","maxLength":102400,"description":"Raw UTF-8 request body for a write template; must satisfy the discovered body policy."},
+                "content_type":{"type":"string","minLength":1,"maxLength":128,"description":"Exact allowed media type"},
+                "headers":headers,
+                "timeout_ms":timeout,
+                "max_response_bytes":response
+            },
+            "additionalProperties":false,
+            "type":"object",
+            "required":["label","parameters"],
+            "title":"Call Harpoon target template",
+            "description":"Call a configured GET, POST, or PUT operation with bounded string identifiers and an operator-controlled body policy."
+        })
+    }
+
+    pub(super) fn call_schema(&self, templates: bool) -> Value {
+        let exact = self.exact_call_schema();
+        if templates {
+            json!({
+                "$schema":"https://json-schema.org/draft/2020-12/schema",
+                "type":"object",
+                "oneOf":[exact,self.template_call_schema()]
+            })
+        } else {
+            exact
+        }
     }
 
     pub(super) fn response_schema(&self) -> Value {
@@ -227,7 +257,7 @@ impl Harpoon {
         let mut properties = serde_json::Map::new();
         if templates {
             properties.insert("template_version".into(), json!({"type":"integer","description":"Template contract version; absent for exact targets."}));
-            properties.insert("parameters_schema".into(), json!({"type":"object","description":"Required string parameter schema for call_target_template."}));
+            properties.insert("parameters_schema".into(), json!({"type":"object","description":"Required string parameter schema for template calls."}));
             properties.insert("invocation".into(), json!({
                 "properties":{
                     "tool_name":{"type":"string","description":"MCP tool to call with arguments matching input_schema."},
@@ -249,7 +279,7 @@ impl Harpoon {
             ("allowed_methods".into(), json!({"items":{"type":"string","enum":["GET","POST","PUT"]},"type":"array","description":"HTTP methods permitted for this target"})),
         ]);
         let description = if templates {
-            "Allowlisted targets: use call_target for exact targets. For entries with template_version and parameters_schema, use call_target_template with the label and all parameters declared by parameters_schema; each value must satisfy that schema."
+            "Allowlisted targets available to call_target. Template entries include a complete invocation schema that fixes the permitted method, parameters, headers, and body policy."
         } else {
             "Allowlisted targets available to call_target."
         };
@@ -333,10 +363,26 @@ impl Harpoon {
                     format!("label {}", if label.is_empty() { "unknown" } else { label })
                 })
             }
-            "call_target" | "call_target_template" => {
-                let (call, parameters) = if name == "call_target_template" {
+            "call_target" => {
+                let value: Value = serde_json::from_str(arguments.get())
+                    .context("label unknown: invalid parameters")?;
+                let label = value
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let template = self
+                    .target(&label)
+                    .is_ok_and(|target| target.template.is_some())
+                    || value.as_object().is_some_and(|arguments| {
+                        ["parameters", "operation", "content_type"]
+                            .iter()
+                            .any(|field| arguments.contains_key(*field))
+                    });
+                let result: Result<Value> = if template {
                     anyhow::ensure!(
-                        arguments.get().len() <= 32768,
+                        arguments.get().len() <= 32768 + 6 * 100 * 1024,
                         "label unknown: invalid template arguments"
                     );
                     let call: CallTemplate = serde_json::from_str(arguments.get())
@@ -345,39 +391,34 @@ impl Harpoon {
                         super::valid_label(&call.label),
                         "label unknown: invalid template arguments"
                     );
-                    (
-                        CallTarget {
-                            label: call.label,
-                            method: "GET".into(),
-                            headers: call.headers,
-                            body: String::new(),
-                            timeout_ms: call.timeout_ms,
-                            max_response_bytes: call.max_response_bytes,
-                            follow_redirects: Some(false),
-                            max_redirects: None,
-                        },
-                        Some(call.parameters),
-                    )
-                } else {
-                    (
-                        serde_json::from_str::<CallTarget>(arguments.get())
-                            .context("label unknown: invalid parameters")?,
-                        None,
-                    )
-                };
-                let label = call.label.trim().to_owned();
-                let result = async {
                     let milliseconds = call.timeout_ms.unwrap_or(30000);
-                    anyhow::ensure!(milliseconds > 0, "timeout must be positive");
-                    anyhow::ensure!(milliseconds >= 100, "timeout must be at least 100ms");
-                    anyhow::ensure!(milliseconds <= 120000, "timeout must be at most 120000ms");
-                    let response = tokio::time::timeout(Duration::from_millis(milliseconds as u64), self.request(call, parameters)).await.context("request failed")??;
-                    if name == "call_target_template" {
-                        Ok(serde_json::to_value(response)?)
-                    } else {
-                        Ok(json!({"status_code":response.status_code,"headers":response.headers,"body_base64":response.body_base64,"body_size_bytes":response.body_size_bytes,"truncated":response.truncated}))
-                    }
-                }.await;
+                    validate_timeout(milliseconds)?;
+                    let response = tokio::time::timeout(
+                        Duration::from_millis(milliseconds as u64),
+                        self.request_template(call),
+                    )
+                    .await
+                    .context("request failed")??;
+                    Ok(serde_json::to_value(response)?)
+                } else {
+                    let call: CallTarget = serde_json::from_str(arguments.get())
+                        .context("label unknown: invalid parameters")?;
+                    let milliseconds = call.timeout_ms.unwrap_or(30000);
+                    validate_timeout(milliseconds)?;
+                    let response = tokio::time::timeout(
+                        Duration::from_millis(milliseconds as u64),
+                        self.request_exact(call),
+                    )
+                    .await
+                    .context("request failed")??;
+                    Ok(json!({
+                        "status_code":response.status_code,
+                        "headers":response.headers,
+                        "body_base64":response.body_base64,
+                        "body_size_bytes":response.body_size_bytes,
+                        "truncated":response.truncated
+                    }))
+                };
                 result.with_context(|| {
                     format!(
                         "label {}",
@@ -389,47 +430,68 @@ impl Harpoon {
         }
     }
 
-    async fn request(
-        &self,
-        call: CallTarget,
-        parameters: Option<BTreeMap<String, String>>,
-    ) -> Result<CallResponse> {
-        anyhow::ensure!(!call.label.trim().is_empty(), "label is required");
-        let mut target = self.target(call.label.trim())?;
-        let mut method = Method::from_bytes(call.method.trim().to_ascii_uppercase().as_bytes())?;
-        anyhow::ensure!(
-            matches!(method, Method::GET | Method::POST | Method::PUT),
-            "invalid method"
-        );
-        let is_template = target.template.is_some();
-        let mut headers = match (&target.template, parameters) {
-            (Some(template), Some(parameters)) => {
-                let mut caller = HeaderMap::new();
-                for (name, value) in &call.headers {
-                    let name = HeaderName::try_from(name)?;
-                    anyhow::ensure!(!caller.contains_key(&name), "duplicate caller header name");
-                    caller.insert(name, HeaderValue::try_from(value)?);
-                }
-                let (url, headers) = template.render(&parameters, caller)?;
-                target.url = url;
-                headers
-            }
-            (None, None) => headers::outbound(&call.headers)?,
-            (Some(_), None) => bail!("template target requires call_target_template"),
-            (None, Some(_)) => bail!("unknown template target"),
-        };
+    fn response_limit_for(&self, requested: Option<i64>) -> Result<usize> {
         let limit = self.response_limit();
-        let limit = match call.max_response_bytes {
+        match requested {
             Some(value) => {
                 anyhow::ensure!(value > 0, "max_response_bytes must be positive");
                 anyhow::ensure!(
                     value as u64 <= limit as u64,
                     "max_response_bytes must be less than or equal to {limit}"
                 );
-                value as usize
+                Ok(value as usize)
             }
-            None => limit,
-        };
+            None => Ok(limit),
+        }
+    }
+
+    async fn request_template(&self, call: CallTemplate) -> Result<CallResponse> {
+        anyhow::ensure!(!call.label.trim().is_empty(), "label is required");
+        let target = self.target(call.label.trim())?;
+        let template = target
+            .template
+            .as_ref()
+            .context("unknown template target")?;
+        let mut caller = HeaderMap::new();
+        for (name, value) in &call.headers {
+            let name = HeaderName::try_from(name)?;
+            anyhow::ensure!(!caller.contains_key(&name), "duplicate caller header name");
+            caller.insert(name, HeaderValue::try_from(value)?);
+        }
+        let (method, url, headers, body) = template.request(
+            &call.parameters,
+            caller,
+            call.operation.as_deref(),
+            call.body.as_deref(),
+            call.content_type.as_deref(),
+        )?;
+        let response = target
+            .client
+            .send(method, &url, headers, body)
+            .await
+            .context("request failed")?;
+        self.read_response(
+            response,
+            self.response_limit_for(call.max_response_bytes)?,
+            false,
+        )
+        .await
+    }
+
+    async fn request_exact(&self, call: CallTarget) -> Result<CallResponse> {
+        anyhow::ensure!(!call.label.trim().is_empty(), "label is required");
+        let mut target = self.target(call.label.trim())?;
+        anyhow::ensure!(
+            target.template.is_none(),
+            "template target requires parameters"
+        );
+        let mut method = Method::from_bytes(call.method.trim().to_ascii_uppercase().as_bytes())?;
+        anyhow::ensure!(
+            matches!(method, Method::GET | Method::POST | Method::PUT),
+            "invalid method"
+        );
+        let mut headers = headers::outbound(&call.headers)?;
+        let limit = self.response_limit_for(call.max_response_bytes)?;
         let follow = call.follow_redirects.unwrap_or(true);
         let redirects = if follow {
             let limit = self.redirect_limit();
@@ -452,7 +514,7 @@ impl Harpoon {
         let mut hop = 0;
         let initial_host = target.url.host_str().unwrap_or_default().to_owned();
         loop {
-            let mut response = target
+            let response = target
                 .client
                 .send(method.clone(), &target.url, headers.clone(), body.clone())
                 .await
@@ -484,34 +546,43 @@ impl Harpoon {
                 hop += 1;
                 continue;
             }
-            let status_code = response.status.as_u16();
-            let mut response_headers = headers::wire(&response.headers);
-            let mut bytes = BytesMut::new();
-            while let Some(chunk) = response.body.next().await {
-                let chunk = chunk.context("response read failed")?;
-                anyhow::ensure!(
-                    chunk.len() <= limit.saturating_sub(bytes.len()),
-                    "response exceeds size limit"
-                );
-                bytes.extend_from_slice(&chunk);
-            }
-            let body_size_bytes = bytes.len();
-            let mut bytes = bytes.freeze();
-            if !is_template {
-                if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes)
-                    && self.rewrite(&mut value)
-                {
-                    bytes = Bytes::from(serde_json::to_vec(&value)?);
-                }
-                self.rewrite_headers(&mut response_headers);
-            }
-            return Ok(CallResponse {
-                status_code,
-                headers: response_headers,
-                body_base64: STANDARD.encode(&bytes),
-                body_size_bytes,
-                truncated: false,
-            });
+            return self.read_response(response, limit, true).await;
         }
+    }
+
+    async fn read_response(
+        &self,
+        mut response: crate::net::Response,
+        limit: usize,
+        rewrite: bool,
+    ) -> Result<CallResponse> {
+        let status_code = response.status.as_u16();
+        let mut response_headers = headers::wire(&response.headers);
+        let mut bytes = BytesMut::new();
+        while let Some(chunk) = response.body.next().await {
+            let chunk = chunk.context("response read failed")?;
+            anyhow::ensure!(
+                chunk.len() <= limit.saturating_sub(bytes.len()),
+                "response exceeds size limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let body_size_bytes = bytes.len();
+        let mut bytes = bytes.freeze();
+        if rewrite {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes)
+                && self.rewrite(&mut value)
+            {
+                bytes = Bytes::from(serde_json::to_vec(&value)?);
+            }
+            self.rewrite_headers(&mut response_headers);
+        }
+        Ok(CallResponse {
+            status_code,
+            headers: response_headers,
+            body_base64: STANDARD.encode(&bytes),
+            body_size_bytes,
+            truncated: false,
+        })
     }
 }

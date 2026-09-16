@@ -26,7 +26,7 @@ mod call;
 pub(crate) mod headers;
 
 const INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets and call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
-const TEMPLATE_INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets. For exact targets, use call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. For entries with template_version and parameters_schema, use call_target_template with the label and all parameters declared by parameters_schema; each value must satisfy that schema. Templates make GET requests to a fixed destination and do not follow redirects. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
+const TEMPLATE_INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets. call_target accepts exact targets and operator-configured templates. Template entries publish a complete invocation schema that fixes the method, destination, parameters, headers, and any write body policy; redirects and automatic write replay are disabled. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
 
 #[derive(Clone, Serialize)]
 pub struct TargetInfo {
@@ -120,15 +120,14 @@ impl Harpoon {
                 category: "config".into(),
                 source: "config".into(),
                 tags: Vec::new(),
-                allowed_methods: if template.is_some() {
-                    vec!["GET".into()]
-                } else {
-                    vec!["GET".into(), "POST".into(), "PUT".into()]
-                },
+                allowed_methods: template.as_ref().map_or_else(
+                    || vec!["GET".into(), "POST".into(), "PUT".into()],
+                    |template| vec![template.method().into()],
+                ),
                 template_version: template.as_ref().map(|_| 1),
                 parameters_schema: template.as_ref().map(|template| template.schema()),
                 invocation: template.as_ref().map(|template| {
-                    template.invocation(target.label.trim(), self.call_schema(true))
+                    template.invocation(target.label.trim(), self.template_call_schema())
                 }),
             },
             original_url,
@@ -353,23 +352,12 @@ impl Harpoon {
         let mut tools = vec![tool(
             "call_target",
             "Call Harpoon target",
-            "Call an allowlisted HTTP target by label.",
-            self.call_schema(false),
+            "Call an allowlisted exact target or operator-configured template. Exact targets require method; templates require their discovered parameters and omit method. GET templates are bodyless; POST/PUT templates enforce the advertised body policy and may change upstream state. Templates never follow redirects or automatically replay writes.",
+            self.call_schema(templates),
             self.response_schema(),
             false,
             Some(true),
         )];
-        if templates {
-            tools.push(tool(
-                "call_target_template",
-                "Call Harpoon target template",
-                "Call a version-1 GET target template using only its declared string parameters and permitted headers. Discover the tool name, complete input schema, and available examples in each list_targets entry's invocation. The target fixes the destination and disables redirects.",
-                self.call_schema(true),
-                self.response_schema(),
-                true,
-                None,
-            ));
-        }
         tools.push(tool(
             "get_oauth_target_audience",
             "Get OAuth target audience",
