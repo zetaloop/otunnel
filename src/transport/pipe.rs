@@ -189,6 +189,13 @@ impl Pipe {
     }
 
     async fn relay(&self, mut request: Request, sink: &dyn Sink) -> Result<()> {
+        if let Some(id) = request.headers.get("x-request-id") {
+            request.message = replace(
+                &request.message,
+                &["params", "_meta", "otunnel/requestId"],
+                &to_raw_value(id.to_str()?)?,
+            )?;
+        }
         let self_contained = protocol::self_contained(&request.message);
         let method = view(&request.message)?
             .method
