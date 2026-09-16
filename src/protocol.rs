@@ -331,6 +331,55 @@ pub fn version(message: &RawValue) -> Option<String> {
     serde_json::from_str(value.get()).ok()
 }
 
+pub fn self_contained(message: &RawValue) -> bool {
+    let Some(version) = version(message) else {
+        return false;
+    };
+    valid_date(&version) && version.as_str() >= MCP_VERSION && validate_meta(message).is_ok()
+}
+
+fn valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| {
+        bytes[range].iter().try_fold(0u16, |value, byte| {
+            byte.is_ascii_digit()
+                .then_some(value * 10 + u16::from(byte - b'0'))
+        })
+    };
+    let Some(year) = number(0..4) else {
+        return false;
+    };
+    let Some(month) = number(5..7) else {
+        return false;
+    };
+    let Some(day) = number(8..10) else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    month > 0
+        && day > 0
+        && days
+            .get(usize::from(month - 1))
+            .is_some_and(|limit| day <= *limit)
+}
+
 pub fn result(request: &Request, value: &RawValue) -> Result<Reply> {
     let id = view(&request.message)?.id;
     if id.is_none() {

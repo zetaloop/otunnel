@@ -37,6 +37,12 @@ struct Frame {
     message: Json,
     written: Option<oneshot::Sender<Result<()>>>,
 }
+#[derive(Default)]
+struct Lifecycle {
+    initialize_succeeded: bool,
+    initialized_sent: bool,
+    ready: bool,
+}
 struct State {
     observation: Mutex<Observation>,
     pending: Mutex<BTreeMap<u64, Pending>>,
@@ -50,8 +56,8 @@ struct State {
 pub struct Pipe {
     state: Arc<State>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    lifecycle: Mutex<Lifecycle>,
     send_initialized: bool,
-    initialized: AtomicBool,
     stateless: AtomicBool,
 }
 
@@ -134,8 +140,8 @@ impl Pipe {
         Ok(Self {
             state,
             tasks: Mutex::new(vec![reader, writer]),
+            lifecycle: Mutex::new(Lifecycle::default()),
             send_initialized: false,
-            initialized: AtomicBool::new(false),
             stateless: AtomicBool::new(false),
         })
     }
@@ -145,7 +151,45 @@ impl Pipe {
         self
     }
 
+    fn reset_initialization(&self) {
+        *self.lifecycle.lock().expect("lifecycle mutex poisoned") = Lifecycle::default();
+    }
+
+    fn initialization_required(&self, message: &RawValue) -> bool {
+        let envelope = match view(message) {
+            Ok(envelope) => envelope,
+            Err(_) => return false,
+        };
+        let Some(method) = envelope.method.as_deref() else {
+            return false;
+        };
+        envelope.id.is_some()
+            && !matches!(method, "initialize" | "ping" | "server/discover")
+            && !protocol::self_contained(message)
+            && !self
+                .lifecycle
+                .lock()
+                .expect("lifecycle mutex poisoned")
+                .ready
+    }
+
+    fn initialization_error(&self, request: &Request) -> Result<Reply> {
+        let id = view(&request.message)?.id;
+        let mut reply = Reply::json(to_raw_value(&json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "error":{
+                "code":-32002,
+                "message":"MCP server is not initialized; send initialize and notifications/initialized before operational requests",
+                "data":{"origin":"tunnel-client","error_type":"mcp_initialization_required"}
+            }
+        }))?);
+        reply.status = 409;
+        Ok(reply)
+    }
+
     async fn relay(&self, mut request: Request, sink: &dyn Sink) -> Result<()> {
+        let self_contained = protocol::self_contained(&request.message);
         let method = view(&request.message)?
             .method
             .map(|method| method.into_owned());
@@ -221,13 +265,24 @@ impl Pipe {
             let response = view(&message)?;
             let terminal = response.method.is_none();
             if terminal && response.result.is_some() {
-                if method.as_deref() == Some("initialize") && self.send_initialized {
-                    self.state
-                        .write(to_raw_value(
-                            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-                        )?)
-                        .await?;
-                    self.initialized.store(true, Ordering::Release);
+                if method.as_deref() == Some("initialize") && !self_contained {
+                    let send_initialized = {
+                        let mut lifecycle =
+                            self.lifecycle.lock().expect("lifecycle mutex poisoned");
+                        lifecycle.initialize_succeeded = true;
+                        self.send_initialized && !lifecycle.initialized_sent
+                    };
+                    if send_initialized {
+                        self.state
+                            .write(to_raw_value(
+                                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                            )?)
+                            .await?;
+                        let mut lifecycle =
+                            self.lifecycle.lock().expect("lifecycle mutex poisoned");
+                        lifecycle.initialized_sent = true;
+                        lifecycle.ready = true;
+                    }
                 }
                 if method.as_deref() == Some("server/discover") {
                     let versions = response
@@ -398,18 +453,35 @@ impl Drop for Pipe {
 impl Transport for Pipe {
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
         let envelope = view(&request.message)?;
-        if self.send_initialized {
-            match envelope.method.as_deref() {
-                Some("initialize") => self.initialized.store(false, Ordering::Release),
-                Some("notifications/initialized")
-                    if envelope.id.is_none() && self.initialized.load(Ordering::Acquire) =>
-                {
-                    return sink.send(Reply::ack(202, "notify_ack")).await;
-                }
-                _ => {}
+        let self_contained = protocol::self_contained(&request.message);
+        if envelope.method.as_deref() == Some("initialize") && !self_contained {
+            self.reset_initialization();
+        }
+        if self.initialization_required(&request.message) {
+            return sink.send(self.initialization_error(&request)?).await;
+        }
+        let initialized = envelope.method.as_deref() == Some("notifications/initialized")
+            && envelope.id.is_none()
+            && !self_contained;
+        if initialized
+            && self.send_initialized
+            && self
+                .lifecycle
+                .lock()
+                .expect("lifecycle mutex poisoned")
+                .initialized_sent
+        {
+            return sink.send(Reply::ack(202, "notify_ack")).await;
+        }
+        let result = self.relay(request, sink).await;
+        if result.is_ok() && initialized {
+            let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
+            lifecycle.ready = lifecycle.initialize_succeeded;
+            if self.send_initialized && lifecycle.ready {
+                lifecycle.initialized_sent = true;
             }
         }
-        self.relay(request, sink).await
+        result
     }
     async fn terminate(&self, headers: HeaderMap, _discovery: bool) -> Result<Reply> {
         let scope = headers
