@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "otunnel"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Concurrent MCP tunnel client and embedding library"
 license = "MIT"
