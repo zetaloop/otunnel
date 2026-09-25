@@ -1,6 +1,10 @@
 use std::{
+    collections::BTreeMap,
     net::IpAddr,
-    sync::{Arc, LazyLock, RwLock},
+    sync::{
+        Arc, LazyLock, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -23,10 +27,12 @@ use crate::{
 };
 
 mod call;
+mod catalog;
 pub(crate) mod headers;
+mod policy;
 
 const INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets and call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
-const TEMPLATE_INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets. call_target accepts exact targets and operator-configured templates. Template entries publish a complete invocation schema that fixes the method, destination, parameters, headers, and any write body policy; redirects and automatic write replay are disabled. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
+const TEMPLATE_INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets. For exact targets, use call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. For entries with template_version and parameters_schema, use call_target without method, with the label and all parameters declared by parameters_schema; each value must satisfy that schema. Use the discovered invocation.input_schema for all arguments, including the required operation constant on every write. Templates use an operator-fixed GET, POST, or PUT method and destination. GET is bodyless; writes enforce the advertised body policy. Templates do not follow redirects or automatically replay writes. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
 
 #[derive(Clone, Serialize)]
 pub struct TargetInfo {
@@ -62,9 +68,12 @@ pub struct Harpoon {
     config: config::Harpoon,
     ca_bundle: Option<String>,
     proxy: Option<String>,
-    logging: bool,
+    clients: Mutex<BTreeMap<(String, Option<String>), Http>>,
     patterns: Vec<Regex>,
     targets: RwLock<IndexMap<String, Target>>,
+    policy_key: [u8; 32],
+    discovery_bytes: AtomicUsize,
+    pub(crate) rich_headers: Arc<AtomicBool>,
 }
 
 impl Harpoon {
@@ -72,7 +81,7 @@ impl Harpoon {
         let harpoon = Self {
             config: config.harpoon.clone(),
             ca_bundle: config.ca_bundle.clone(),
-            logging: config.log.http_raw_unsafe,
+            clients: Mutex::new(BTreeMap::new()),
             proxy: config
                 .harpoon
                 .http_proxy
@@ -87,6 +96,9 @@ impl Harpoon {
                 .map(|pattern| Regex::new(&format!("(?i:{pattern})")))
                 .collect::<std::result::Result<_, _>>()?,
             targets: RwLock::new(IndexMap::new()),
+            policy_key: policy::key(&config.control_plane)?,
+            discovery_bytes: AtomicUsize::new(0),
+            rich_headers: Arc::new(AtomicBool::new(false)),
         };
         for target in &config.harpoon.targets {
             harpoon.register(target)?;
@@ -127,7 +139,10 @@ impl Harpoon {
                 template_version: template.as_ref().map(|_| 1),
                 parameters_schema: template.as_ref().map(|template| template.schema()),
                 invocation: template.as_ref().map(|template| {
-                    template.invocation(target.label.trim(), self.template_call_schema())
+                    template.invocation(
+                        &self.invocation_label(target.label.trim(), template),
+                        self.template_call_schema(),
+                    )
                 }),
             },
             original_url,
@@ -139,7 +154,15 @@ impl Harpoon {
     }
 
     pub(crate) fn client(&self, url: &Url, socket: Option<&str>) -> Result<Http> {
-        Ok(Http::new(
+        let key = (
+            url.origin().ascii_serialization(),
+            socket.map(str::to_owned),
+        );
+        let mut clients = self.clients.lock().expect("HTTP clients mutex poisoned");
+        if let Some(client) = clients.get(&key) {
+            return Ok(client.clone());
+        }
+        let client = Http::new(
             url.clone(),
             Options {
                 proxy: self.proxy.as_deref(),
@@ -147,8 +170,9 @@ impl Harpoon {
                 socket,
                 ..Default::default()
             },
-        )?
-        .logging(self.logging.then_some("harpoon")))
+        )?;
+        clients.insert(key, client.clone());
+        Ok(client)
     }
 
     pub(crate) fn insert(&self, mut target: Target) -> Result<()> {
@@ -187,6 +211,7 @@ impl Harpoon {
             .collect();
         target.info.tags.sort();
         target.info.tags.dedup();
+        let size = catalog::size(&target, self.template_call_schema())?;
         let mut targets = self.targets.write().expect("target registry lock poisoned");
         anyhow::ensure!(
             !targets.contains_key(&target.info.label),
@@ -206,6 +231,22 @@ impl Harpoon {
                 );
             }
         }
+        let rich = self.rich_headers.load(Ordering::Relaxed)
+            || target
+                .template
+                .as_ref()
+                .is_some_and(|template| template.rich());
+        let total = self
+            .discovery_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(size);
+        anyhow::ensure!(
+            !rich || total <= catalog::LIMIT,
+            "harpoon: structured-header discovery exceeds the 512 KiB catalog budget; reduce target metadata or split the catalog"
+        );
+        self.discovery_bytes
+            .store(total.min(catalog::LIMIT + 1), Ordering::Relaxed);
+        self.rich_headers.store(rich, Ordering::Release);
         targets.insert(target.info.label.clone(), target);
         Ok(())
     }
@@ -352,8 +393,8 @@ impl Harpoon {
         let mut tools = vec![tool(
             "call_target",
             "Call Harpoon target",
-            "Call an allowlisted exact target or operator-configured template. Exact targets require method; templates require their discovered parameters and omit method. GET templates are bodyless; POST/PUT templates enforce the advertised body policy and may change upstream state. Templates never follow redirects or automatically replay writes.",
-            self.call_schema(templates),
+            "Call an allowlisted exact target or operator-configured template. Exact targets require method; templates require their discovered parameters and forbid method. GET templates are bodyless; POST/PUT enforce the advertised body policy and may change upstream state. Templates never follow redirects or automatically replay writes. Inspect upstream state after an ambiguous write failure.",
+            self.call_schema(),
             self.response_schema(),
             false,
             Some(true),

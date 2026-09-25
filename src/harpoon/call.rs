@@ -179,16 +179,35 @@ impl Harpoon {
         })
     }
 
-    pub(super) fn call_schema(&self, templates: bool) -> Value {
-        let exact = self.exact_call_schema();
-        if templates {
-            json!({
-                "$schema":"https://json-schema.org/draft/2020-12/schema",
-                "type":"object",
-                "oneOf":[exact,self.template_call_schema()]
-            })
+    pub(super) fn call_schema(&self) -> Value {
+        let mut branches = vec![self.exact_call_schema()];
+        let mut legacy = false;
+        for target in self
+            .targets
+            .read()
+            .expect("target registry lock poisoned")
+            .values()
+        {
+            if let Some(template) = &target.template {
+                if template.rich() {
+                    branches.push(
+                        target
+                            .info
+                            .invocation
+                            .as_ref()
+                            .expect("template invocation")["input_schema"]
+                            .clone(),
+                    );
+                } else if !legacy {
+                    branches.push(self.template_call_schema());
+                    legacy = true;
+                }
+            }
+        }
+        if branches.len() == 1 {
+            branches.pop().expect("exact call schema")
         } else {
-            exact
+            json!({"$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object", "oneOf":branches})
         }
     }
 
@@ -279,7 +298,7 @@ impl Harpoon {
             ("allowed_methods".into(), json!({"items":{"type":"string","enum":["GET","POST","PUT"]},"type":"array","description":"HTTP methods permitted for this target"})),
         ]);
         let description = if templates {
-            "Allowlisted targets available to call_target. Template entries include a complete invocation schema that fixes the permitted method, parameters, headers, and body policy."
+            "Allowlisted targets: use call_target for exact targets. For entries with template_version and parameters_schema, use call_target without method, with the label and all parameters declared by parameters_schema; each value must satisfy that schema. Use the discovered invocation.input_schema for all arguments, including the required operation constant on every write. Copy invocation.input_schema.properties.label.const exactly; it may differ from the target's logical label."
         } else {
             "Allowlisted targets available to call_target."
         };
@@ -375,6 +394,7 @@ impl Harpoon {
                 let template = self
                     .target(&label)
                     .is_ok_and(|target| target.template.is_some())
+                    || super::policy::contains_bound(arguments)
                     || value.as_object().is_some_and(|arguments| {
                         ["parameters", "operation", "content_type"]
                             .iter()
@@ -388,17 +408,11 @@ impl Harpoon {
                     let call: CallTemplate = serde_json::from_str(arguments.get())
                         .context("label unknown: invalid template arguments")?;
                     anyhow::ensure!(
-                        super::valid_label(&call.label),
+                        super::valid_label(&call.label)
+                            || super::policy::bound(&call.label).is_some(),
                         "label unknown: invalid template arguments"
                     );
-                    let milliseconds = call.timeout_ms.unwrap_or(30000);
-                    validate_timeout(milliseconds)?;
-                    let response = tokio::time::timeout(
-                        Duration::from_millis(milliseconds as u64),
-                        self.request_template(call),
-                    )
-                    .await
-                    .context("request failed")??;
+                    let response = self.request_template(call).await?;
                     Ok(serde_json::to_value(response)?)
                 } else {
                     let call: CallTarget = serde_json::from_str(arguments.get())
@@ -446,36 +460,57 @@ impl Harpoon {
     }
 
     async fn request_template(&self, call: CallTemplate) -> Result<CallResponse> {
-        anyhow::ensure!(!call.label.trim().is_empty(), "label is required");
-        let target = self.target(call.label.trim())?;
-        let template = target
-            .template
-            .as_ref()
-            .context("unknown template target")?;
-        let mut caller = HeaderMap::new();
-        for (name, value) in &call.headers {
-            let name = HeaderName::try_from(name)?;
-            anyhow::ensure!(!caller.contains_key(&name), "duplicate caller header name");
-            caller.insert(name, HeaderValue::try_from(value)?);
-        }
-        let (method, url, headers, body) = template.request(
-            &call.parameters,
-            caller,
-            call.operation.as_deref(),
-            call.body.as_deref(),
-            call.content_type.as_deref(),
-        )?;
-        let response = target
-            .client
-            .send(method, &url, headers, body)
+        let target = self
+            .template_target(&call.label)
+            .map_err(|_| anyhow::anyhow!("label unknown: unknown template target"))?;
+        let result: Result<CallResponse> = async {
+            let template = target
+                .template
+                .as_ref()
+                .context("unknown template target")?;
+            let mut caller = HeaderMap::new();
+            for (name, value) in &call.headers {
+                let name = HeaderName::try_from(name).map_err(|_| {
+                    template.header_error(
+                        "header_invalid",
+                        "invalid or forbidden template header name",
+                    )
+                })?;
+                if caller.contains_key(&name) {
+                    return Err(
+                        template.header_error("header_duplicate", "duplicate caller header name")
+                    );
+                }
+                caller.insert(
+                    name,
+                    HeaderValue::try_from(value).map_err(|_| {
+                        template.header_error("header_invalid", "invalid caller header value")
+                    })?,
+                );
+            }
+            let (method, url, headers, body) = template.request(
+                &call.parameters,
+                caller,
+                call.operation.as_deref(),
+                call.body.as_deref(),
+                call.content_type.as_deref(),
+            )?;
+            let milliseconds = call.timeout_ms.unwrap_or(30000);
+            validate_timeout(milliseconds)?;
+            let limit = self.response_limit_for(call.max_response_bytes)?;
+            tokio::time::timeout(Duration::from_millis(milliseconds as u64), async {
+                let response = target
+                    .client
+                    .send(method, &url, headers, body)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("template request failed"))?;
+                self.read_response(response, limit, false).await
+            })
             .await
-            .context("request failed")?;
-        self.read_response(
-            response,
-            self.response_limit_for(call.max_response_bytes)?,
-            false,
-        )
-        .await
+            .map_err(|_| anyhow::anyhow!("template request failed"))?
+        }
+        .await;
+        result.map_err(|error| anyhow::anyhow!("label {}: {error}", target.info.label))
     }
 
     async fn request_exact(&self, call: CallTarget) -> Result<CallResponse> {

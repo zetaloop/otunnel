@@ -122,6 +122,7 @@ impl Config {
                 "harpoon.targets entry requires label"
             );
             if let Some(template) = &target.template {
+                template.rules()?;
                 anyhow::ensure!(
                     target.url.is_empty() && target.unix_socket.is_none(),
                     "harpoon.targets entry {:?}: template cannot be combined with url or unix_socket",

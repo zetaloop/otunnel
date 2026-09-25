@@ -85,8 +85,10 @@ pub struct Tunnel {
 impl Tunnel {
     pub fn new(mut config: Config) -> Result<Self> {
         config.normalize()?;
-        let control = Arc::new(Control::new(&config)?);
         let harpoon = Arc::new(crate::harpoon::Harpoon::new(&config)?);
+        let mut control = Control::new(&config)?;
+        control.suppress_raw = harpoon.rich_headers.clone();
+        let control = Arc::new(control);
         let proxy = Arc::new(crate::proxy_health::Checker::new(&config)?);
         let probe = config
             .mcp

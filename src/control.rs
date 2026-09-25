@@ -76,6 +76,7 @@ pub(crate) fn now() -> f64 {
 
 pub struct Control {
     http: Http,
+    pub(crate) suppress_raw: Arc<AtomicBool>,
     url: Url,
     headers: HeaderMap,
     server_info: RwLock<Option<HeaderValue>>,
@@ -172,6 +173,14 @@ impl Control {
         let uses_proxy = http.proxied(&url)?;
         Ok(Self {
             http,
+            suppress_raw: Arc::new(AtomicBool::new(config.harpoon.targets.iter().any(
+                |target| {
+                    target
+                        .template
+                        .as_ref()
+                        .is_some_and(|template| template.rich())
+                },
+            ))),
             url,
             headers,
             server_info: RwLock::new(None),
@@ -195,6 +204,15 @@ impl Control {
             })
             .0,
         })
+    }
+
+    fn client(&self) -> Http {
+        let client = self.http.clone();
+        if self.suppress_raw.load(Ordering::Acquire) {
+            client.logging(None)
+        } else {
+            client
+        }
     }
 
     pub(crate) fn connection(&self) -> watch::Receiver<Observation> {
@@ -328,7 +346,7 @@ impl Control {
     async fn fetch(&self) -> Result<Value> {
         timeout(self.poll_timeout + self.guard, async {
             let response = self
-                .http
+                .client()
                 .send(Method::GET, &self.url, self.headers(), Bytes::new())
                 .await?;
             if !response.status.is_success() {
@@ -581,7 +599,7 @@ impl Control {
                 receipt.attempt(attempt != 0);
                 let response = timeout(self.poll_timeout + self.guard, async {
                     let response = self
-                        .http
+                        .client()
                         .send(Method::POST, &url, headers.clone(), body.clone())
                         .await?;
                     let status = response.status.as_u16();

@@ -12,7 +12,13 @@ use url::Url;
 
 use crate::{config, harpoon::headers};
 
+mod policy;
+mod rules;
+pub(crate) use policy::{encode, hex};
+pub use rules::{Header, HeaderRule, HeaderValidation};
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Definition {
     pub version: u8,
     pub origin: String,
@@ -25,13 +31,43 @@ pub struct Definition {
     pub parameters: BTreeMap<String, Parameter>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    #[serde(default)]
-    pub allowed_headers: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "rules::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_headers: Option<Vec<HeaderRule>>,
+    #[serde(
+        default,
+        deserialize_with = "rules::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub header_rules: Option<Vec<HeaderRule>>,
     #[serde(default)]
     pub follow_redirects: bool,
 }
 
 impl Definition {
+    pub(crate) fn rules(&self) -> Result<&[HeaderRule]> {
+        anyhow::ensure!(
+            self.allowed_headers.is_none() || self.header_rules.is_none(),
+            "header_rules and allowed_headers cannot be combined"
+        );
+        Ok(self
+            .header_rules
+            .as_deref()
+            .or(self.allowed_headers.as_deref())
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn rich(&self) -> bool {
+        self.header_rules
+            .iter()
+            .chain(self.allowed_headers.iter())
+            .flatten()
+            .any(|rule| matches!(rule, HeaderRule::Rule(_)))
+    }
+
     /// Validate a profile without reading its credential references.
     pub fn validate(&self) -> Result<()> {
         let mut definition = self.clone();
@@ -47,6 +83,7 @@ impl Definition {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BodyPolicy {
     pub content_types: Vec<String>,
     pub max_bytes: usize,
@@ -55,6 +92,7 @@ pub struct BodyPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BodyValidation {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub json: bool,
@@ -126,10 +164,7 @@ impl CompiledBodyPolicy {
             None
         } else {
             validate_body_pattern(&validation.pattern)?;
-            Some(
-                Regex::new(&format!(r"\A(?:{})\z", validation.pattern))
-                    .context("invalid template body pattern")?,
-            )
+            Some(compile_pattern(&validation.pattern).context("invalid template body pattern")?)
         };
         let result = Self {
             definition: BodyPolicy {
@@ -216,22 +251,23 @@ impl CompiledBodyPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Parameter {
     #[serde(rename = "type")]
     pub kind: String,
     pub required: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pattern: String,
-    #[serde(default, rename = "enum")]
+    #[serde(default, rename = "enum", skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
     #[serde(default)]
     pub min_length: usize,
     pub max_length: usize,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reserved_values: Vec<String>,
 }
 
@@ -272,10 +308,7 @@ impl Constraint {
             None
         } else {
             validate_pattern(&definition.pattern)?;
-            Some(
-                Regex::new(&format!(r"\A(?:{})\z", definition.pattern))
-                    .context("invalid parameter pattern")?,
-            )
+            Some(compile_pattern(&definition.pattern).context("invalid parameter pattern")?)
         };
         let mut seen = BTreeSet::new();
         for value in &definition.reserved_values {
@@ -358,6 +391,38 @@ fn parameter_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+fn compile_pattern(pattern: &str) -> Result<Regex> {
+    let mut normalized = String::with_capacity(pattern.len());
+    let mut class = false;
+    let mut escaped = false;
+    for character in pattern.chars() {
+        if escaped {
+            normalized.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            normalized.push(character);
+            escaped = true;
+        } else {
+            match character {
+                '[' if class => normalized.push_str(r"\["),
+                '[' => {
+                    class = true;
+                    normalized.push(character);
+                }
+                ']' => {
+                    class = false;
+                    normalized.push(character);
+                }
+                '&' | '~' if class => {
+                    normalized.push_str(&format!(r"\x{:02x}", character as u32));
+                }
+                _ => normalized.push(character),
+            }
+        }
+    }
+    Ok(Regex::new(&format!(r"\A(?:{normalized})\z"))?)
 }
 
 fn validate_pattern(pattern: &str) -> Result<()> {
@@ -507,7 +572,8 @@ pub(crate) struct Template {
     query: BTreeMap<String, Part>,
     parameters: BTreeMap<String, Constraint>,
     headers: HeaderMap,
-    allowed_headers: BTreeSet<String>,
+    header_rules: BTreeMap<String, rules::Rule>,
+    pub(super) digest: String,
 }
 
 impl Template {
@@ -600,48 +666,22 @@ impl Template {
             used.len() == parameters.len(),
             "template contains unused parameters"
         );
+        let rules = definition.rules()?;
         anyhow::ensure!(
-            definition.headers.len()
-                + definition.allowed_headers.len()
-                + usize::from(body_policy.is_some())
-                <= 32,
+            definition.headers.len() + rules.len() + usize::from(body_policy.is_some()) <= 32,
             "template has too many headers"
         );
-        let mut headers = HeaderMap::new();
-        for (name, value) in &definition.headers {
-            let name = headers::template_name(name)?;
+        let headers = config::headers(&definition.headers)?;
+        for (name, value) in &headers {
+            headers::template_name(name.as_str())?;
             anyhow::ensure!(
                 body_policy.is_none()
                     || !matches!(name.as_str(), "content-type" | "content-encoding"),
                 "template writes require the body policy content type and unencoded body bytes"
             );
-            anyhow::ensure!(
-                !headers.contains_key(&name),
-                "duplicate template header name"
-            );
-            headers.insert(name, headers::template_value(&config::resolve(value)?)?);
+            headers::template_value(std::str::from_utf8(value.as_bytes())?)?;
         }
-        let mut allowed_headers = BTreeSet::new();
-        for name in &definition.allowed_headers {
-            let name = headers::template_name(name)?.to_string();
-            anyhow::ensure!(
-                !headers::credential(&name),
-                "template authentication headers must be fixed by the operator"
-            );
-            anyhow::ensure!(
-                body_policy.is_none()
-                    || !matches!(name.as_str(), "content-type" | "content-encoding"),
-                "template writes require the body policy content type and unencoded body bytes"
-            );
-            anyhow::ensure!(
-                !headers.contains_key(&name),
-                "template caller header conflicts with a fixed header"
-            );
-            anyhow::ensure!(
-                allowed_headers.insert(name),
-                "duplicate template caller header name"
-            );
-        }
+        let header_rules = rules::compile(rules, &headers, body_policy.is_some())?;
         headers::template_size(&headers)?;
         let mut template = Self {
             method,
@@ -652,7 +692,8 @@ impl Template {
             query,
             parameters,
             headers,
-            allowed_headers,
+            header_rules,
+            digest: String::new(),
         };
         let longest = template
             .parameters
@@ -663,6 +704,7 @@ impl Template {
             template.url(&longest).as_str().len() <= 4096,
             "template maximum rendered URL exceeds size limit"
         );
+        template.digest = template.policy(definition)?;
         if let Some(policy) = &template.body_policy {
             #[derive(Serialize)]
             struct Operation<'a> {
@@ -670,21 +712,69 @@ impl Template {
                 body_policy: BodyPolicy,
                 parameters_schema: Value,
             }
-            let encoded = serde_json::to_vec(&Operation {
+            let encoded = encode(&Operation {
                 method: template.method.as_str(),
                 body_policy: policy.canonical(),
                 parameters_schema: template.schema(),
             })?;
-            let digest = Sha256::digest(encoded);
-            template.operation = Some(format!(
-                "write-v1:{}",
-                digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            ));
+            template.operation = Some(format!("write-v1:{}", hex(&Sha256::digest(encoded))));
         }
         Ok(template)
+    }
+
+    pub fn rich(&self) -> bool {
+        self.header_rules.values().any(|rule| !rule.legacy)
+    }
+
+    pub(crate) fn header_error(&self, code: &str, error: impl std::fmt::Display) -> anyhow::Error {
+        if self.rich() {
+            anyhow::anyhow!("{code}: {error}")
+        } else {
+            anyhow::anyhow!("{error}")
+        }
+    }
+
+    fn caller_headers(&self, caller: HeaderMap) -> Result<HeaderMap> {
+        if caller.keys_len() > 32 {
+            return Err(self.header_error("header_budget_exceeded", "too many template headers"));
+        }
+        let mut headers = self.headers.clone();
+        let mut sources = self.headers.clone();
+        for name in caller.keys() {
+            headers::template_name(name.as_str())
+                .map_err(|error| self.header_error("header_invalid", error))?;
+            let canonical = headers::canonical(name.as_str());
+            let rule = self.header_rules.get(&canonical).ok_or_else(|| {
+                self.header_error(
+                    "header_not_allowed",
+                    "caller header is not permitted by the target",
+                )
+            })?;
+            if caller.get_all(name).iter().count() != 1 {
+                return Err(self.header_error("header_duplicate", "duplicate caller header name"));
+            }
+            let value = std::str::from_utf8(caller[name].as_bytes())
+                .map_err(|_| self.header_error("header_invalid", "invalid caller header value"))?;
+            rule.validate(value)
+                .map_err(|error| self.header_error("header_invalid", error))?;
+            sources.insert(name.clone(), caller[name].clone());
+            headers.insert(
+                http::HeaderName::try_from(&rule.schema.forward_as)?,
+                caller[name].clone(),
+            );
+        }
+        for rule in self.header_rules.values() {
+            if rule.schema.required && !caller.contains_key(&rule.schema.name) {
+                return Err(
+                    self.header_error("header_required", "required caller header is missing")
+                );
+            }
+        }
+        headers::template_size(&sources)
+            .map_err(|error| self.header_error("header_budget_exceeded", error))?;
+        headers::template_size(&headers)
+            .map_err(|error| self.header_error("header_budget_exceeded", error))?;
+        Ok(headers)
     }
 
     pub fn origin(&self) -> &Url {
@@ -749,24 +839,7 @@ impl Template {
             url.as_str().len() <= 4096,
             "rendered URL exceeds size limit"
         );
-        anyhow::ensure!(caller.keys_len() <= 32, "too many template headers");
-        let mut headers = self.headers.clone();
-        for name in caller.keys() {
-            headers::template_name(name.as_str())?;
-            anyhow::ensure!(
-                self.allowed_headers.contains(name.as_str()),
-                "caller header is not permitted by the target"
-            );
-            anyhow::ensure!(
-                caller.get_all(name).iter().count() == 1,
-                "duplicate caller header name"
-            );
-            headers.insert(
-                name.clone(),
-                headers::template_value(caller[name].to_str()?)?,
-            );
-        }
-        headers::template_size(&headers)?;
+        let mut headers = self.caller_headers(caller)?;
         headers.insert(
             "user-agent",
             http::HeaderValue::from_static(headers::USER_AGENT),
@@ -862,7 +935,7 @@ impl Template {
         let root = schema.as_object_mut().expect("template call schema object");
         root.remove("$id");
         root.remove("title");
-        schema["properties"]["label"]["const"] = json!(label);
+        schema["properties"]["label"] = json!({"type":"string","const":label});
         schema["properties"]["parameters"] = self.schema();
         schema["description"] = json!(format!(
             "Arguments for this fixed-origin HTTPS {} operation. Supply raw parameter values without URL encoding; the client renders them. The method, path structure, and query names are fixed. Redirects are disabled. GET rejects bodies; writes enforce the advertised body policy and are never automatically replayed.",
@@ -918,25 +991,35 @@ impl Template {
                 properties.remove("content_type");
             }
         }
-        let headers: serde_json::Map<_, _> = self
-            .allowed_headers
-            .iter()
-            .map(|name| {
-                (
-                    headers::canonical(name),
-                    json!({"type":"string","maxLength":8192,"not":{"pattern":"[\u{0000}-\u{001f}\u{007f}]"}}),
-                )
-            })
+        let required: Vec<_> = self
+            .header_rules
+            .values()
+            .filter(|rule| rule.schema.required)
+            .map(|rule| rule.schema.name.clone())
             .collect();
-        schema["properties"]["headers"] = json!({
-            "type":"object",
-            "properties":headers,
-            "additionalProperties":false,
-            "maxProperties":32,
-            "default":{},
-            "description":"Optional caller headers using the advertised spelling. Values must be valid UTF-8 without control characters. The client also enforces an 8192-byte total header budget including managed headers."
+        let properties: BTreeMap<_, _> = self
+            .header_rules
+            .iter()
+            .map(|(name, rule)| (name, rule.public()))
+            .collect();
+        let mut headers = json!({
+            "type":"object", "properties":properties, "additionalProperties":false, "maxProperties":32,
+            "description":"Caller headers using the advertised spelling; runtime names are case-insensitive. Values must be valid UTF-8 without control characters. Pattern-bearing rules require printable ASCII; length bounds count Unicode code points. The client also enforces an 8192-byte total header budget including managed headers."
         });
+        if required.is_empty() {
+            headers["default"] = json!({});
+        } else {
+            headers["required"] = json!(required);
+            schema["required"]
+                .as_array_mut()
+                .expect("template required fields")
+                .push(json!("headers"));
+        }
+        schema["properties"]["headers"] = headers;
         let mut invocation = json!({"tool_name":"call_target","input_schema":schema});
+        if !required.is_empty() {
+            return invocation;
+        }
         let example: Option<BTreeMap<_, _>> = self
             .parameters
             .iter()
