@@ -16,6 +16,7 @@ pub mod health;
 mod listener;
 #[cfg(feature = "cli")]
 pub mod management;
+mod metrics;
 mod net;
 mod oauth;
 pub mod process;

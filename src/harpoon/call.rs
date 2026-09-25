@@ -417,14 +417,7 @@ impl Harpoon {
                 } else {
                     let call: CallTarget = serde_json::from_str(arguments.get())
                         .context("label unknown: invalid parameters")?;
-                    let milliseconds = call.timeout_ms.unwrap_or(30000);
-                    validate_timeout(milliseconds)?;
-                    let response = tokio::time::timeout(
-                        Duration::from_millis(milliseconds as u64),
-                        self.request_exact(call),
-                    )
-                    .await
-                    .context("request failed")??;
+                    let response = self.request_exact(call).await?;
                     Ok(json!({
                         "status_code":response.status_code,
                         "headers":response.headers,
@@ -460,9 +453,11 @@ impl Harpoon {
     }
 
     async fn request_template(&self, call: CallTemplate) -> Result<CallResponse> {
+        let mut metrics = super::metrics::Call::new(self, true);
         let target = self
             .template_target(&call.label)
             .map_err(|_| anyhow::anyhow!("label unknown: unknown template target"))?;
+        metrics.label.clone_from(&target.info.label);
         let result: Result<CallResponse> = async {
             let template = target
                 .template
@@ -498,13 +493,15 @@ impl Harpoon {
             let milliseconds = call.timeout_ms.unwrap_or(30000);
             validate_timeout(milliseconds)?;
             let limit = self.response_limit_for(call.max_response_bytes)?;
+            metrics.outcome = "request_error";
             tokio::time::timeout(Duration::from_millis(milliseconds as u64), async {
                 let response = target
                     .client
                     .send(method, &url, headers, body)
                     .await
                     .map_err(|_| anyhow::anyhow!("template request failed"))?;
-                self.read_response(response, limit, false).await
+                self.read_response(response, limit, false, &mut metrics)
+                    .await
             })
             .await
             .map_err(|_| anyhow::anyhow!("template request failed"))?
@@ -514,17 +511,21 @@ impl Harpoon {
     }
 
     async fn request_exact(&self, call: CallTarget) -> Result<CallResponse> {
+        let mut metrics = super::metrics::Call::new(self, false);
         anyhow::ensure!(!call.label.trim().is_empty(), "label is required");
         let mut target = self.target(call.label.trim())?;
         anyhow::ensure!(
             target.template.is_none(),
             "template target requires parameters"
         );
+        metrics.label.clone_from(&target.info.label);
         let mut method = Method::from_bytes(call.method.trim().to_ascii_uppercase().as_bytes())?;
         anyhow::ensure!(
             matches!(method, Method::GET | Method::POST | Method::PUT),
             "invalid method"
         );
+        let milliseconds = call.timeout_ms.unwrap_or(30000);
+        validate_timeout(milliseconds)?;
         let mut headers = headers::outbound(&call.headers)?;
         let limit = self.response_limit_for(call.max_response_bytes)?;
         let follow = call.follow_redirects.unwrap_or(true);
@@ -548,41 +549,48 @@ impl Harpoon {
         let mut body = Bytes::from(call.body);
         let mut hop = 0;
         let initial_host = target.url.host_str().unwrap_or_default().to_owned();
-        loop {
-            let response = target
-                .client
-                .send(method.clone(), &target.url, headers.clone(), body.clone())
-                .await
-                .context("request failed")?;
-            if follow
-                && matches!(response.status.as_u16(), 301 | 302 | 303 | 307 | 308)
-                && let Some(location) = response.headers.get("location")
-            {
-                anyhow::ensure!(hop < redirects, "redirect limit exceeded");
-                let location = location.to_str().context("redirect blocked")?;
-                let next = target.url.join(location).context("redirect blocked")?;
-                let host = next.host_str().unwrap_or_default();
-                if host != initial_host && !host.ends_with(&format!(".{initial_host}")) {
-                    headers.remove("authorization");
-                }
-                if !matches!(method, Method::GET | Method::HEAD)
-                    && matches!(response.status.as_u16(), 301..=303)
+        metrics.outcome = "request_error";
+        tokio::time::timeout(Duration::from_millis(milliseconds as u64), async {
+            loop {
+                let response = target
+                    .client
+                    .send(method.clone(), &target.url, headers.clone(), body.clone())
+                    .await
+                    .context("request failed")?;
+                if follow
+                    && matches!(response.status.as_u16(), 301 | 302 | 303 | 307 | 308)
+                    && let Some(location) = response.headers.get("location")
                 {
-                    method = Method::GET;
-                    body = Bytes::new();
+                    anyhow::ensure!(hop < redirects, "redirect limit exceeded");
+                    let location = location.to_str().context("redirect blocked")?;
+                    let next = target.url.join(location).context("redirect blocked")?;
+                    let host = next.host_str().unwrap_or_default();
+                    if host != initial_host && !host.ends_with(&format!(".{initial_host}")) {
+                        headers.remove("authorization");
+                    }
+                    if !matches!(method, Method::GET | Method::HEAD)
+                        && matches!(response.status.as_u16(), 301..=303)
+                    {
+                        method = Method::GET;
+                        body = Bytes::new();
+                    }
+                    if !(target.url.scheme() == "https" && next.scheme() == "http") {
+                        let mut referer = target.url.clone();
+                        let _ = referer.set_username("");
+                        let _ = referer.set_password(None);
+                        headers.insert("referer", referer.as_str().parse()?);
+                    }
+                    target = self.destination(&next)?;
+                    hop += 1;
+                    continue;
                 }
-                if !(target.url.scheme() == "https" && next.scheme() == "http") {
-                    let mut referer = target.url.clone();
-                    let _ = referer.set_username("");
-                    let _ = referer.set_password(None);
-                    headers.insert("referer", referer.as_str().parse()?);
-                }
-                target = self.destination(&next)?;
-                hop += 1;
-                continue;
+                return self
+                    .read_response(response, limit, true, &mut metrics)
+                    .await;
             }
-            return self.read_response(response, limit, true).await;
-        }
+        })
+        .await
+        .context("request failed")?
     }
 
     async fn read_response(
@@ -590,18 +598,24 @@ impl Harpoon {
         mut response: crate::net::Response,
         limit: usize,
         rewrite: bool,
+        metrics: &mut super::metrics::Call<'_>,
     ) -> Result<CallResponse> {
         let status_code = response.status.as_u16();
+        metrics.status = status_code;
+        metrics.outcome = "response_read_error";
         let mut response_headers = headers::wire(&response.headers);
         let mut bytes = BytesMut::new();
         while let Some(chunk) = response.body.next().await {
-            let chunk = chunk.context("response read failed")?;
-            anyhow::ensure!(
-                chunk.len() <= limit.saturating_sub(bytes.len()),
-                "response exceeds size limit"
-            );
-            bytes.extend_from_slice(&chunk);
+            let chunk = chunk.map_err(|_| anyhow::anyhow!("response read failed"))?;
+            let remaining = limit.saturating_add(1).saturating_sub(bytes.len());
+            bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            metrics.bytes = bytes.len().min(limit);
+            if bytes.len() > limit {
+                metrics.outcome = "response_too_large";
+                bail!("response exceeds size limit");
+            }
         }
+        metrics.outcome = "success";
         let body_size_bytes = bytes.len();
         let mut bytes = bytes.freeze();
         if rewrite {

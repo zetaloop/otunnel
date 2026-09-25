@@ -29,6 +29,7 @@ use crate::{
 mod call;
 mod catalog;
 pub(crate) mod headers;
+mod metrics;
 mod policy;
 
 const INSTRUCTIONS: &str = "Harpoon provides a constrained outbound HTTP client. Use list_targets to see allowlisted targets and call_target to make GET/POST/PUT requests with strict size, timeout, and redirect limits. get_oauth_target_audience is a narrow opt-in lookup for OAuth token-endpoint private_key_jwt audiences. Harpoon cannot reach arbitrary hosts or paths outside the configured allowlist.";
@@ -72,6 +73,7 @@ pub struct Harpoon {
     patterns: Vec<Regex>,
     targets: RwLock<IndexMap<String, Target>>,
     policy_key: [u8; 32],
+    metrics: crate::metrics::Metrics,
     discovery_bytes: AtomicUsize,
     pub(crate) rich_headers: Arc<AtomicBool>,
 }
@@ -97,6 +99,7 @@ impl Harpoon {
                 .collect::<std::result::Result<_, _>>()?,
             targets: RwLock::new(IndexMap::new()),
             policy_key: policy::key(&config.control_plane)?,
+            metrics: crate::metrics::Metrics::default(),
             discovery_bytes: AtomicUsize::new(0),
             rich_headers: Arc::new(AtomicBool::new(false)),
         };
@@ -120,7 +123,13 @@ impl Harpoon {
             "Harpoon target cannot combine a template with an exact URL or socket"
         );
         let original_url = match &template {
-            Some(template) => template.origin().to_string(),
+            Some(_) => target
+                .template
+                .as_ref()
+                .expect("template definition")
+                .origin
+                .trim_end_matches('/')
+                .to_owned(),
             None => config::resolve(&target.url)?,
         };
         let url = Url::parse(&original_url)?;

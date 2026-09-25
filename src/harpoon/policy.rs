@@ -15,7 +15,7 @@ use crate::{
     template::{Template, hex},
 };
 
-fn mac(key: &[u8], values: &[&str]) -> Hmac<Sha256> {
+pub(super) fn mac(key: &[u8], values: &[&str]) -> Hmac<Sha256> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC key length");
     for value in values {
         mac.update(value.as_bytes());

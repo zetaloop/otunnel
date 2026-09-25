@@ -203,6 +203,8 @@ impl Tunnel {
             let main = self.bindings["main"].clone();
             let state = self.state.clone();
             let stop = self.stop.clone();
+            let harpoon = self.harpoon.clone();
+            let config = self.config.control_plane.clone();
             self.observers.spawn(async move {
                 if !wait.is_zero() {
                     let mut observation = state.subscribe();
@@ -242,9 +244,12 @@ impl Tunnel {
                         state.oauth = Startup::settled(status, error);
                         state.refresh_readiness();
                     });
+                    let _ = harpoon.log_catalog(&config);
                     break;
                 }
             });
+        } else {
+            let _ = self.harpoon.log_catalog(&self.config.control_plane);
         }
         let control = self.control.clone();
         let state = self.state.clone();

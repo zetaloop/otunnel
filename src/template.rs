@@ -775,10 +775,6 @@ impl Template {
         Ok(headers)
     }
 
-    pub fn origin(&self) -> &Url {
-        &self.origin
-    }
-
     pub fn method(&self) -> &str {
         self.method.as_str()
     }
