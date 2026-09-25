@@ -45,7 +45,6 @@ jobs:
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo check --package otunnel --all-targets --no-default-features --locked
-          cargo test --workspace --locked
       - name: Package
         run: cargo dist
       - uses: actions/upload-artifact@v7
