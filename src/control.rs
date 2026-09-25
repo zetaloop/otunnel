@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, LazyLock, RwLock,
+        Arc, LazyLock, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -26,6 +26,7 @@ use crate::{
 };
 
 mod observation;
+mod routing;
 pub use observation::Upload;
 
 #[derive(Clone, Serialize)]
@@ -93,6 +94,7 @@ pub struct Control {
     initial_poll_timeout: Duration,
     guard: Duration,
     learned_poll_ms: AtomicU64,
+    routing: Mutex<routing::State>,
     uses_proxy: bool,
     observations: watch::Sender<Observation>,
 }
@@ -128,6 +130,30 @@ impl Control {
         )?;
         let http = http.logging(config.log.http_raw_unsafe.then_some("controlplane"));
         let mut headers = config::headers(&cp.extra_headers)?;
+        for name in [
+            "authorization",
+            "accept",
+            "user-agent",
+            "x-tunnel-client-name",
+            "x-tunnel-client-version",
+            "x-tunnel-client-wire-protocol-version",
+            "x-tunnel-client-instance-id",
+            "x-tunnel-client-capabilities",
+            "x-tunnel-mcp-server-info",
+            "x-tunnel-shard-token",
+        ] {
+            if headers.remove(name).is_some() {
+                tracing::warn!(
+                    header = name,
+                    "control-plane extra header cannot override protected header"
+                );
+            }
+        }
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-tunnel-client-capabilities",
+            HeaderValue::from_static("wrong-cluster-v1"),
+        );
         let mut authorization =
             HeaderValue::try_from(format!("Bearer {}", config::resolve(&cp.api_key)?))?;
         authorization.set_sensitive(true);
@@ -164,6 +190,7 @@ impl Control {
             initial_poll_timeout: cp.initial_poll_timeout.0,
             guard: cp.poll_deadline_guardrail.0,
             learned_poll_ms: AtomicU64::new(0),
+            routing: Mutex::new(routing::State::default()),
             uses_proxy,
             observations: watch::channel(Observation {
                 poll_state: "starting",
@@ -339,7 +366,13 @@ impl Control {
             });
         }
         let mut attempt = 0;
+        let client = self.http.clone().logging(None);
         loop {
+            let route = self
+                .routing
+                .lock()
+                .expect("routing mutex poisoned")
+                .snapshot();
             let learned = self.learned_poll_ms.load(Ordering::Relaxed);
             let duration = if learned == 0 {
                 self.poll_timeout
@@ -364,6 +397,8 @@ impl Control {
             let started = Instant::now();
             let mut received_headers = false;
             let mut response_status = 0;
+            let mut correction = None;
+            let mut failed_destination = false;
             self.observations.send_modify(|state| {
                 state.poll_state = "polling";
                 state.effective_wait = requested.as_secs_f64();
@@ -373,9 +408,12 @@ impl Control {
                 state.cycles += 1;
             });
             let result = timeout(duration + self.guard, async {
-                let response = self
-                    .http
-                    .send(Method::GET, &url, self.headers(), Bytes::new())
+                let mut headers = self.headers();
+                if let Some(token) = &route.token {
+                    headers.insert("x-tunnel-shard-token", token.clone());
+                }
+                let response = client
+                    .send(Method::GET, &url, headers, Bytes::new())
                     .await?;
                 received_headers = true;
                 let received = Instant::now();
@@ -387,6 +425,19 @@ impl Control {
                 } else if status == 200 {
                     serde_json::from_slice::<Poll>(&response.bytes().await?)?.commands()
                 } else {
+                    failed_destination = matches!(status, 408 | 500..=599);
+                    match response.limited(64 * 1024).await {
+                        Ok(body) if status == 409 && body.len() <= 64 * 1024 => {
+                            correction = routing::Correction::parse(&headers, &body);
+                        }
+                        Err(error) => {
+                            failed_destination |= matches!(
+                                observation::category(&error),
+                                "network_error" | "timeout"
+                            );
+                        }
+                        _ => {}
+                    }
                     return Ok::<_, anyhow::Error>(Err((status, headers)));
                 };
                 Ok(Ok(Batch { received, commands }))
@@ -420,6 +471,18 @@ impl Control {
                 }
             }
             let connected = matches!(&result, Ok(Ok(Ok(_))));
+            failed_destination |= match &result {
+                Ok(Err(error)) => {
+                    !received_headers
+                        || matches!(observation::category(error), "network_error" | "timeout")
+                }
+                Err(_) => true,
+                _ => false,
+            };
+            self.routing
+                .lock()
+                .expect("routing mutex poisoned")
+                .complete(&route, correction, connected, failed_destination);
             self.observations.send_modify(|state| {
                 state.connected = connected;
                 match &result {
@@ -456,16 +519,15 @@ impl Control {
             });
             let retry_headers = match result {
                 Ok(Ok(Ok(batch))) => return Ok(batch),
-                Ok(Ok(Err((status, headers)))) if status == 429 || status >= 500 => headers,
-                Ok(Ok(Err((status, _)))) => {
-                    return Err(StatusError {
-                        status,
-                        operation: "poll",
-                    }
-                    .into());
+                Ok(Ok(Err((status, headers)))) => {
+                    tracing::warn!(status, "tunnel poll failed");
+                    headers
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "tunnel poll interrupted");
+                    tracing::warn!(
+                        category = observation::category(&error),
+                        "tunnel poll interrupted"
+                    );
                     HeaderMap::new()
                 }
                 Err(_) => HeaderMap::new(),

@@ -59,6 +59,19 @@ pub struct Response {
     pub body: BoxStream<'static, Result<Bytes>>,
 }
 impl Response {
+    pub async fn limited(mut self, limit: usize) -> Result<Bytes> {
+        let mut buffer = BytesMut::new();
+        while let Some(chunk) = self.body.next().await {
+            let chunk = chunk?;
+            let remaining = limit.saturating_add(1).saturating_sub(buffer.len());
+            buffer.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if buffer.len() > limit {
+                break;
+            }
+        }
+        Ok(buffer.freeze())
+    }
+
     pub async fn bytes(self) -> Result<Bytes> {
         Ok(self
             .body

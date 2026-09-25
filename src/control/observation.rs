@@ -105,10 +105,12 @@ pub(super) fn category(error: &anyhow::Error) -> &'static str {
     {
         return "timeout";
     }
-    if error
-        .chain()
-        .any(|cause| cause.is::<reqwest::Error>() || cause.is::<std::io::Error>())
-    {
+    if error.chain().any(|cause| {
+        cause.is::<reqwest::Error>()
+            || cause.is::<std::io::Error>()
+            || cause.is::<hyper::Error>()
+            || cause.is::<hyper_util::client::legacy::Error>()
+    }) {
         "network_error"
     } else {
         "request_error"
