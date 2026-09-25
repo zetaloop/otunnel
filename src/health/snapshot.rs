@@ -28,6 +28,7 @@ fn dates(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         for name in [
             "observed_at",
+            "timestamp",
             "last_attempt",
             "last_success",
             "last_error",
@@ -471,6 +472,15 @@ pub(super) async fn system(State(monitor): State<Monitor>) -> Json<Value> {
     if let Some(error) = &state.mcp_probe.error {
         value["main_channel_probe_error"] = json!(error);
     }
+    let summaries = state.proxy.summaries();
+    if !summaries.is_empty() {
+        value["proxy_health"] = json!(summaries);
+    }
+    let identities = state.proxy.identities();
+    if !identities.is_empty() {
+        value["proxy_identity_map"] = json!(identities);
+    }
+    dates(&mut value);
     Json(value)
 }
 

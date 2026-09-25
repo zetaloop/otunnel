@@ -683,6 +683,7 @@ fn load(matches: &ArgMatches) -> Result<Config> {
         })
         .transpose()?
         .unwrap_or_default();
+    let mut proxy_sources = config.proxy_sources.clone();
     let mut initial_poll_timeout = config.control_plane.initial_poll_timeout;
     let mut value = serde_json::to_value(config)?;
     for (name, environment, pointer, kind, _) in SETTINGS {
@@ -704,6 +705,17 @@ fn load(matches: &ArgMatches) -> Result<Config> {
         };
         let mut arguments = arguments.cloned().collect::<Vec<_>>();
         let origin = matches.value_source(selected);
+        if name.ends_with("http-proxy") {
+            proxy_sources.insert(
+                (*name).into(),
+                if origin == Some(clap::parser::ValueSource::CommandLine) {
+                    *name
+                } else {
+                    *environment
+                }
+                .into(),
+            );
+        }
         if matches!(*name, "control-plane.api-key" | "cloudflared.token") {
             if origin == Some(clap::parser::ValueSource::EnvVariable) {
                 arguments[0] = format!("env:{environment}");
@@ -828,6 +840,7 @@ fn load(matches: &ArgMatches) -> Result<Config> {
     }
     let mut config: Config = serde_json::from_value(value)?;
     config.control_plane.initial_poll_timeout = initial_poll_timeout;
+    config.proxy_sources = proxy_sources;
     if config.control_plane.api_key.is_empty()
         && env::var_os("CONTROL_PLANE_API_KEY").is_none()
         && env::var_os("OPENAI_API_KEY").is_some()

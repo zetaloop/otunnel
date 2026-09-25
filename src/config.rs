@@ -50,6 +50,8 @@ use yaml::Coerce;
 settings!(Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     config_version: Option<u8> = None,
+    #[serde(skip)]
+    proxy_sources: BTreeMap<String, String> = BTreeMap::new(),
     control_plane: ControlPlane = ControlPlane::default(),
     mcp: Mcp = Mcp::default(),
     harpoon: Harpoon = Harpoon::default(),
@@ -108,7 +110,33 @@ impl Config {
         let mut raw = yaml_serde::Value::deserialize(document)?;
         raw.apply_merge()?;
         Self::coerce(&mut raw);
-        let config = Self::deserialize(raw)?;
+        let mut config = Self::deserialize(raw)?;
+        for (name, source, configured) in [
+            (
+                "control-plane.http-proxy",
+                "CONTROL_PLANE_HTTP_PROXY",
+                config.control_plane.http_proxy.is_some(),
+            ),
+            (
+                "mcp.http-proxy",
+                "MCP_HTTP_PROXY",
+                config.mcp.http_proxy.is_some(),
+            ),
+            (
+                "harpoon.http-proxy",
+                "HARPOON_HTTP_PROXY",
+                config.harpoon.http_proxy.is_some(),
+            ),
+            (
+                "http-proxy",
+                "TUNNEL_CLIENT_HTTP_PROXY",
+                config.http_proxy.is_some(),
+            ),
+        ] {
+            if configured {
+                config.proxy_sources.insert(name.into(), source.into());
+            }
+        }
         anyhow::ensure!(
             config
                 .config_version

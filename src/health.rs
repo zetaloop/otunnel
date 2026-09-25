@@ -184,6 +184,8 @@ async fn metrics(State(state): State<Monitor>) -> impl IntoResponse {
             writeln!(body, "commands_poll_errors_total{{error_kind={kind:?},otel_scope_name=\"controlplane\",otel_scope_schema_url=\"\",otel_scope_version=\"\"}} {count}").expect("metric output");
         }
     }
+    body.push_str(&snapshot.control.metrics());
+    body.push_str(&snapshot.proxy.metrics());
     body.push_str(&state.harpoon.metrics());
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],

@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc, LazyLock, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -47,6 +47,8 @@ pub struct Batch {
 
 #[derive(Clone, Default, Serialize)]
 pub struct Observation {
+    #[serde(skip)]
+    pub(crate) metrics: Arc<crate::metrics::Metrics>,
     pub poll_state: &'static str,
     pub effective_wait: f64,
     pub deadline: f64,
@@ -67,6 +69,12 @@ pub struct Observation {
     pub http_status: u16,
 }
 
+impl Observation {
+    pub fn metrics(&self) -> String {
+        self.metrics.render()
+    }
+}
+
 pub(crate) fn now() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -76,6 +84,7 @@ pub(crate) fn now() -> f64 {
 
 pub struct Control {
     http: Http,
+    pub(crate) metrics: Arc<crate::metrics::Metrics>,
     pub(crate) suppress_raw: Arc<AtomicBool>,
     url: Url,
     headers: HeaderMap,
@@ -171,8 +180,10 @@ impl Control {
         }
         let subscriptions = cp.poll_channels.clone().unwrap_or_default();
         let uses_proxy = http.proxied(&url)?;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
         Ok(Self {
             http,
+            metrics: metrics.clone(),
             suppress_raw: Arc::new(AtomicBool::new(config.harpoon.targets.iter().any(
                 |target| {
                     target
@@ -192,6 +203,7 @@ impl Control {
             routing: Mutex::new(routing::State::default()),
             uses_proxy,
             observations: watch::channel(Observation {
+                metrics,
                 poll_state: "starting",
                 effective_wait: cp.poll_timeout.0.as_secs_f64(),
                 deadline: (cp.poll_timeout.0 + cp.poll_deadline_guardrail.0).as_secs_f64(),
@@ -204,6 +216,13 @@ impl Control {
             })
             .0,
         })
+    }
+
+    pub(crate) fn tunnel_id(&self) -> &str {
+        self.url
+            .path_segments()
+            .and_then(Iterator::last)
+            .unwrap_or_default()
     }
 
     fn client(&self) -> Http {
@@ -421,13 +440,11 @@ impl Control {
                 response_status = status;
                 let headers = response.headers.clone();
                 let mut status_error = StatusError::new(status, "poll");
-                let commands = if status == 204 {
+                let mut commands = if status == 204 {
                     Vec::new()
                 } else if status == 200 {
-                    let mut poll =
-                        serde_json::from_slice::<Option<Poll>>(&response.bytes().await?)?
-                            .unwrap_or_default();
-                    poll.commands.truncate(limit.min(25));
+                    let poll = serde_json::from_slice::<Option<Poll>>(&response.bytes().await?)?
+                        .unwrap_or_default();
                     poll.commands()
                 } else {
                     failed_destination = matches!(status, 408 | 500..=599);
@@ -467,6 +484,18 @@ impl Control {
                     }
                     return Ok::<_, anyhow::Error>(Err((status_error, headers)));
                 };
+                for command in &mut commands {
+                    command.polled_at = Some(received);
+                    if let Some(created) = command.created_at.filter(|created| created.year() > 1) {
+                        let age = now()
+                            - received.elapsed().as_secs_f64()
+                            - created.unix_timestamp_nanos() as f64 / 1e9;
+                        if age >= 0.0 {
+                            self.metrics
+                                .observe("controlplane", "commands_age_seconds", &[], age);
+                        }
+                    }
+                }
                 Ok(Ok(Batch { received, commands }))
             })
             .await;
@@ -498,6 +527,12 @@ impl Control {
                 }
             }
             let connected = matches!(&result, Ok(Ok(Ok(_))));
+            self.metrics.observe(
+                "controlplane",
+                "commands_poll_latency_seconds",
+                &[("error", if connected { "false" } else { "true" })],
+                started.elapsed().as_secs_f64(),
+            );
             failed_destination |= match &result {
                 Ok(Err(error)) => {
                     !received_headers
@@ -682,6 +717,10 @@ struct Correlation {
     shard_token: String,
     channel: String,
     client_request_id: Option<String>,
+    created_at: Option<time::OffsetDateTime>,
+    polled_at: Instant,
+    request_kind: String,
+    request_method: Option<String>,
 }
 
 pub struct Delivery {
@@ -689,6 +728,7 @@ pub struct Delivery {
     command: Correlation,
     notifications_failed: AtomicBool,
     terminal_started: AtomicBool,
+    delivered_status: AtomicU16,
 }
 impl Delivery {
     pub fn new(control: Arc<Control>, command: &Command) -> Self {
@@ -698,6 +738,27 @@ impl Delivery {
                 request_id: command.request_id.clone(),
                 shard_token: command.shard_token.clone(),
                 channel: command.channel.clone(),
+                created_at: command.created_at,
+                polled_at: command.polled_at.unwrap_or_else(Instant::now),
+                request_kind: match command.command_type.as_str() {
+                    "jsonrpc" => {
+                        if command.jsonrpc.as_ref().is_some_and(|message| {
+                            protocol::view(message).is_ok_and(|message| message.id.is_some())
+                        }) {
+                            "call"
+                        } else {
+                            "notification"
+                        }
+                    }
+                    kind => kind,
+                }
+                .into(),
+                request_method: command.jsonrpc.as_ref().and_then(|message| {
+                    protocol::view(message)
+                        .ok()?
+                        .method
+                        .map(|method| method.into_owned())
+                }),
                 client_request_id: command
                     .headers
                     .iter()
@@ -708,8 +769,52 @@ impl Delivery {
             },
             notifications_failed: AtomicBool::new(false),
             terminal_started: AtomicBool::new(false),
+            delivered_status: AtomicU16::new(0),
         }
     }
+    pub(crate) fn record_latency(&self) {
+        let status = self.delivered_status.load(Ordering::Acquire);
+        if status == 0 {
+            return;
+        }
+        let status = status.to_string();
+        let tunnel = self.control.tunnel_id();
+        let mut attributes = vec![
+            ("channel", self.command.channel.as_str()),
+            ("tunnel_id", tunnel),
+            ("tunnel_service_status", status.as_str()),
+            ("request_kind", self.command.request_kind.as_str()),
+        ];
+        if let Some(method) = self
+            .command
+            .request_method
+            .as_deref()
+            .filter(|method| !method.is_empty())
+        {
+            attributes.push(("request_method", method));
+        }
+        if let Some(created) = self.command.created_at.filter(|created| created.year() > 1) {
+            let elapsed = now() - created.unix_timestamp_nanos() as f64 / 1e9;
+            if elapsed >= 0.0 {
+                attributes.push(("latency_type", "enqueue_to_response"));
+                self.control.metrics.observe(
+                    "dispatcher",
+                    "command_end_to_end_latency_milliseconds",
+                    &attributes,
+                    (elapsed * 1000.0).floor(),
+                );
+                attributes.pop();
+            }
+        }
+        attributes.push(("latency_type", "poll_to_response"));
+        self.control.metrics.observe(
+            "dispatcher",
+            "command_end_to_end_latency_milliseconds",
+            &attributes,
+            self.command.polled_at.elapsed().as_millis() as f64,
+        );
+    }
+
     pub fn terminal_started(&self) -> bool {
         self.terminal_started.load(Ordering::Acquire)
     }
@@ -721,7 +826,9 @@ impl Sink for Delivery {
             if self.terminal_started.swap(true, Ordering::AcqRel) {
                 bail!("request already has a terminal response");
             }
-            return self.control.post(&self.command, &reply).await;
+            self.control.post(&self.command, &reply).await?;
+            self.delivered_status.store(reply.status, Ordering::Release);
+            return Ok(());
         }
         if !self.notifications_failed.load(Ordering::Acquire)
             && let Err(error) = self.control.post(&self.command, &reply).await

@@ -59,6 +59,10 @@ pub(crate) fn validate_meta(message: &RawValue) -> std::result::Result<(), Strin
 #[derive(Deserialize)]
 pub struct Command {
     pub request_id: String,
+    #[serde(default, deserialize_with = "timestamp")]
+    pub created_at: Option<time::OffsetDateTime>,
+    #[serde(skip)]
+    pub polled_at: Option<tokio::time::Instant>,
     pub shard_token: String,
     pub command_type: String,
     #[serde(default = "crate::config::main_channel", deserialize_with = "nullable")]
@@ -69,6 +73,17 @@ pub struct Command {
     pub response_timeout: Value,
     #[serde(default)]
     pub jsonrpc: Option<Json>,
+}
+
+fn timestamp<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<time::OffsetDateTime>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| {
+            time::OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
 }
 
 pub(crate) fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(

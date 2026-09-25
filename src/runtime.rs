@@ -597,6 +597,15 @@ async fn execute(
         binding.available()
             && (command.command_type != "oauth_discovery" || command.channel == "main")
     }) else {
+        control.metrics.increment(
+            "dispatcher",
+            "command_unsupported_channel_total",
+            &[
+                ("tunnel_id", control.tunnel_id()),
+                ("channel", &command.channel),
+                ("command_type", &command.command_type),
+            ],
+        );
         let message = format!("unsupported channel {:?}", command.channel);
         let mut reply = match command.command_type.as_str() {
             "jsonrpc" => {
@@ -685,6 +694,7 @@ async fn execute(
         }
         _ => unreachable!(),
     }
+    delivery.record_latency();
     Ok(())
 }
 
