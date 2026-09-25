@@ -414,7 +414,7 @@ fn generate(name: &str, mut values: Values) -> Result<String> {
         #[serde(flatten)]
         fields: serde_json::Value,
     }
-    Ok(serde_saphyr::to_string(&Sample {
+    Ok(yaml_serde::to_string(&Sample {
         config_version: 1,
         fields: profile,
     })?)

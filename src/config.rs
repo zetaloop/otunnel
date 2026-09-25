@@ -9,13 +9,19 @@ use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 
 // YAML null has the same effect as an omitted setting.
 macro_rules! settings {
     ($name:ident { $($(#[$attribute:meta])* $field:ident: $kind:ty = $default:expr),* $(,)? }) => {
         #[derive(Clone, Serialize)]
         pub struct $name { $($(#[$attribute])* pub $field: $kind),* }
+        impl yaml::Coerce for $name {
+            fn coerce(value: &mut yaml_serde::Value) {
+                $(if let Some(value) = value.get_mut(stringify!($field)) {
+                    <Option<$kind> as yaml::Coerce>::coerce(value);
+                })*
+            }
+        }
         impl Default for $name {
             fn default() -> Self { Self { $($field: $default),* } }
         }
@@ -36,8 +42,10 @@ macro_rules! settings {
 
 mod duration;
 mod reference;
+mod yaml;
 pub use duration::Span;
 pub use reference::{path, resolve};
+use yaml::Coerce;
 
 settings!(Config {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,11 +70,12 @@ impl Config {
 
     fn validate_source(&self, text: &str) -> Result<()> {
         self.scope()?;
-        let mut input = text.as_bytes();
-        let raw = serde_saphyr::read::<_, Value>(&mut input)
+        let document = yaml_serde::Deserializer::from_str(text)
             .next()
-            .transpose()?
             .context("configuration is empty")?;
+        let mut raw = yaml_serde::Value::deserialize(document)?;
+        raw.apply_merge()?;
+        let raw = serde_json::to_value(raw)?;
         reference::validate_profile(self, &raw)?;
         self.mcp.oauth_origins()?;
         for target in &self.harpoon.targets {
@@ -94,12 +103,12 @@ impl Config {
         Ok(config)
     }
     pub fn parse(text: &str) -> Result<Self> {
-        let mut input = text.as_bytes();
-        let mut documents = serde_saphyr::read::<_, Self>(&mut input);
-        let config = documents
-            .next()
-            .transpose()?
-            .context("configuration is empty")?;
+        let mut documents = yaml_serde::Deserializer::from_str(text);
+        let document = documents.next().context("configuration is empty")?;
+        let mut raw = yaml_serde::Value::deserialize(document)?;
+        raw.apply_merge()?;
+        Self::coerce(&mut raw);
+        let config = Self::deserialize(raw)?;
         anyhow::ensure!(
             config
                 .config_version
@@ -142,7 +151,10 @@ impl Config {
         }
         if config.config_version == Some(2) {
             // A version-two profile is a single YAML document, including empty trailing documents.
-            serde_saphyr::from_str::<Self>(text)?;
+            anyhow::ensure!(
+                documents.next().is_none(),
+                "exactly one YAML document is required"
+            );
         }
         Ok(config)
     }
@@ -721,7 +733,7 @@ pub fn pem(value: &str) -> Result<Vec<u8>> {
 pub fn headers(values: &BTreeMap<String, String>) -> Result<HeaderMap> {
     let mut normalized = BTreeMap::new();
     for (name, value) in values {
-        let name = HeaderName::try_from(name)?.to_string();
+        let name = HeaderName::try_from(name.trim())?.to_string();
         if let Some(previous) = normalized.insert(name.clone(), value.as_str()) {
             anyhow::ensure!(
                 previous == value,
@@ -733,12 +745,12 @@ pub fn headers(values: &BTreeMap<String, String>) -> Result<HeaderMap> {
     for (name, raw) in normalized {
         let raw = raw.trim();
         let value = match raw.split_once(':') {
-            Some((kind, variable)) if kind.eq_ignore_ascii_case("env") => env::var(variable.trim())
+            Some(("env", variable)) => env::var(variable.trim())
                 .with_context(|| format!("read header environment variable {variable}"))?
                 .trim()
                 .as_bytes()
                 .to_vec(),
-            Some((kind, path)) if kind.eq_ignore_ascii_case("file") => {
+            Some(("file", path)) => {
                 let mut bytes =
                     fs::read(path.trim()).with_context(|| format!("read header file {path}"))?;
                 let ending = if bytes.ends_with(b"\r\n") {
@@ -754,7 +766,8 @@ pub fn headers(values: &BTreeMap<String, String>) -> Result<HeaderMap> {
             _ => raw.as_bytes().to_vec(),
         };
         anyhow::ensure!(
-            !value.iter().all(u8::is_ascii_whitespace),
+            !(raw.starts_with("env:") || raw.starts_with("file:"))
+                || !value.iter().all(u8::is_ascii_whitespace),
             "resolved HTTP header {name} is empty"
         );
         headers.insert(

@@ -72,9 +72,7 @@ impl Definition {
     pub fn validate(&self) -> Result<()> {
         let mut definition = self.clone();
         for value in definition.headers.values_mut() {
-            if value.to_ascii_lowercase().starts_with("env:")
-                || value.to_ascii_lowercase().starts_with("file:")
-            {
+            if value.trim().starts_with("env:") || value.trim().starts_with("file:") {
                 *value = "x".into();
             }
         }

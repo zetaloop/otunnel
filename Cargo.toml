@@ -59,7 +59,6 @@ rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 same-file = { version = "1.0.6", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
-serde-saphyr = "1.2.0"
 serde_json = { version = "1.0.151", features = ["arbitrary_precision", "raw_value"] }
 sha2 = { version = "0.11.0" }
 shell-words = "1.1.1"
@@ -74,6 +73,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"], op
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 which = "8.0.6"
+yaml_serde = "0.10.7"
 
 [target."cfg(windows)".dependencies]
 async-io = "2.6.0"

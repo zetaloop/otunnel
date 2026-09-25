@@ -94,7 +94,7 @@ fn syntax(source: &str, value: &str) -> Result<()> {
     let Some((kind, reference)) = value.split_once(':') else {
         return Ok(());
     };
-    if kind.eq_ignore_ascii_case("env") {
+    if kind == "env" {
         let name = reference.trim();
         anyhow::ensure!(
             name.as_bytes()
@@ -105,7 +105,7 @@ fn syntax(source: &str, value: &str) -> Result<()> {
                     .all(|value| value.is_ascii_alphanumeric() || value == b'_'),
             "invalid {source} reference {value:?}: environment variable name is invalid"
         );
-    } else if kind.eq_ignore_ascii_case("file") {
+    } else if kind == "file" {
         anyhow::ensure!(
             !reference.trim().is_empty(),
             "invalid {source} reference {value:?}: file path is required"
@@ -118,7 +118,7 @@ fn header_syntax(source: &str, headers: &BTreeMap<String, String>, control: bool
     let mut normalized = BTreeMap::new();
     for (name, value) in headers {
         let original = name;
-        let normalized_name = HeaderName::try_from(name)?.to_string();
+        let normalized_name = HeaderName::try_from(name.trim())?.to_string();
         let canonical = crate::harpoon::headers::canonical(&normalized_name);
         if let Some(previous) = normalized.insert(canonical.clone(), value) {
             anyhow::ensure!(
@@ -141,7 +141,9 @@ fn header_syntax(source: &str, headers: &BTreeMap<String, String>, control: bool
                 "{source} {original:?} cannot override control-plane authentication or client metadata headers"
             );
         }
-        syntax(&format!("{source}.{canonical}"), value)?;
+        if !value.trim().is_empty() {
+            syntax(&format!("{source}.{canonical}"), value)?;
+        }
     }
     Ok(())
 }
@@ -156,7 +158,7 @@ pub(super) fn resolve_named(source: &str, value: &str) -> Result<String> {
     let Some((kind, name)) = value.split_once(':') else {
         return Ok(value.into());
     };
-    let resolved = if kind.eq_ignore_ascii_case("env") {
+    let resolved = if kind == "env" {
         let name = name.trim();
         anyhow::ensure!(
             !name.is_empty(),
@@ -172,7 +174,7 @@ pub(super) fn resolve_named(source: &str, value: &str) -> Result<String> {
             "invalid {source} reference {value:?}: environment variable {name:?} is empty"
         );
         resolved
-    } else if kind.eq_ignore_ascii_case("file") {
+    } else if kind == "file" {
         let name = name.trim();
         anyhow::ensure!(
             !name.is_empty(),
@@ -194,11 +196,11 @@ pub(super) fn resolve_named(source: &str, value: &str) -> Result<String> {
 pub fn path(value: &str) -> Result<PathBuf> {
     let value = value.trim();
     if let Some((kind, name)) = value.split_once(':') {
-        if kind.eq_ignore_ascii_case("file") {
+        if kind == "file" {
             anyhow::ensure!(!name.trim().is_empty(), "file path is required after file:");
             return Ok(PathBuf::from(name.trim()));
         }
-        if kind.eq_ignore_ascii_case("env") {
+        if kind == "env" {
             return resolve(value).map(PathBuf::from);
         }
     }
