@@ -25,8 +25,10 @@ use crate::{
     transport::Sink,
 };
 
+mod error;
 mod observation;
 mod routing;
+pub use error::StatusError;
 pub use observation::Upload;
 
 #[derive(Clone, Serialize)]
@@ -42,18 +44,6 @@ pub struct Batch {
     pub received: Instant,
     pub commands: Vec<Command>,
 }
-
-#[derive(Debug)]
-pub struct StatusError {
-    pub status: u16,
-    operation: &'static str,
-}
-impl std::fmt::Display for StatusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "tunnel {} returned HTTP {}", self.operation, self.status)
-    }
-}
-impl std::error::Error for StatusError {}
 
 #[derive(Clone, Default, Serialize)]
 pub struct Observation {
@@ -323,11 +313,7 @@ impl Control {
                         return Ok(payload);
                     }
                     if attempt == 2 || !(status == 429 || (500..600).contains(&status)) {
-                        return Err(StatusError {
-                            status,
-                            operation: "Cloudflare runtime",
-                        }
-                        .into());
+                        return Err(StatusError::new(status, "Cloudflare runtime").into());
                     }
                     response.headers
                 }
@@ -346,11 +332,7 @@ impl Control {
                 .send(Method::GET, &self.url, self.headers(), Bytes::new())
                 .await?;
             if !response.status.is_success() {
-                return Err(StatusError {
-                    status: response.status.as_u16(),
-                    operation: "metadata",
-                }
-                .into());
+                return Err(StatusError::read(response, "metadata").await.into());
             }
             Ok(serde_json::from_slice(&response.bytes().await?)?)
         })
@@ -420,25 +402,52 @@ impl Control {
                 let status = response.status.as_u16();
                 response_status = status;
                 let headers = response.headers.clone();
+                let mut status_error = StatusError::new(status, "poll");
                 let commands = if status == 204 {
                     Vec::new()
                 } else if status == 200 {
-                    serde_json::from_slice::<Poll>(&response.bytes().await?)?.commands()
+                    let mut poll =
+                        serde_json::from_slice::<Option<Poll>>(&response.bytes().await?)?
+                            .unwrap_or_default();
+                    poll.commands.truncate(limit.min(25));
+                    poll.commands()
                 } else {
                     failed_destination = matches!(status, 408 | 500..=599);
                     match response.limited(64 * 1024).await {
-                        Ok(body) if status == 409 && body.len() <= 64 * 1024 => {
-                            correction = routing::Correction::parse(&headers, &body);
+                        Ok(body) if body.len() <= 64 * 1024 => {
+                            status_error.info = crate::net::ErrorInfo::parse(&body);
+                            let parsed = if status == 409 {
+                                routing::Correction::parse(&headers, &body)
+                            } else {
+                                Ok(None)
+                            };
+                            let malformed = parsed.is_err();
+                            correction = parsed.ok().flatten();
+                            if malformed
+                                || status_error.code() == "wrong_cluster"
+                                || headers.contains_key("x-tunnel-shard-token")
+                            {
+                                status_error.info = crate::net::ErrorInfo::default();
+                                if correction.is_some() {
+                                    status_error.info.code = "wrong_cluster".into();
+                                    status_error.info.message =
+                                        "polling placement rejected; retrying after backoff".into();
+                                } else {
+                                    status_error.info.message =
+                                        "invalid polling routing correction".into();
+                                }
+                            }
                         }
                         Err(error) => {
                             failed_destination |= matches!(
                                 observation::category(&error),
                                 "network_error" | "timeout"
                             );
+                            status_error.info.message = "invalid polling error response".into();
                         }
-                        _ => {}
+                        _ => status_error.info.message = "invalid polling error response".into(),
                     }
-                    return Ok::<_, anyhow::Error>(Err((status, headers)));
+                    return Ok::<_, anyhow::Error>(Err((status_error, headers)));
                 };
                 Ok(Ok(Batch { received, commands }))
             })
@@ -511,7 +520,7 @@ impl Control {
                         };
                         *state.error_kinds.entry(kind).or_default() += 1;
                         state.http_status = match &result {
-                            Ok(Ok(Err((status, _)))) => *status,
+                            Ok(Ok(Err((error, _)))) => error.status,
                             _ => 0,
                         };
                     }
@@ -519,8 +528,8 @@ impl Control {
             });
             let retry_headers = match result {
                 Ok(Ok(Ok(batch))) => return Ok(batch),
-                Ok(Ok(Err((status, headers)))) => {
-                    tracing::warn!(status, "tunnel poll failed");
+                Ok(Ok(Err((error, headers)))) => {
+                    tracing::warn!(%error, "tunnel poll failed");
                     headers
                 }
                 Ok(Err(error)) => {
@@ -550,16 +559,23 @@ impl Control {
                 #[serde(flatten)]
                 reply: &'a Reply,
             }
+            let mut reply = reply.clone();
+            if reply.kind != "oauth_discovery_response" {
+                reply.headers = protocol::sanitize_headers(&reply.headers);
+            }
             let body = Bytes::from(serde_json::to_vec(&Payload {
                 request_id: &command.request_id,
                 channel: &command.channel,
-                reply,
+                reply: &reply,
             })?);
             let mut headers = self.headers();
             let mut shard = HeaderValue::try_from(&command.shard_token)?;
             shard.set_sensitive(true);
             headers.insert("x-tunnel-shard-token", shard);
-            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.entry("content-type").or_insert(HeaderValue::from_static("application/json"));
+            if let Some(id) = &command.client_request_id {
+                headers.entry("x-client-request-id").or_insert(HeaderValue::try_from(id)?);
+            }
             let url = self.endpoint("response")?;
             for attempt in 0..3 {
                 receipt.attempt(attempt != 0);
@@ -568,46 +584,34 @@ impl Control {
                         .http
                         .send(Method::POST, &url, headers.clone(), body.clone())
                         .await?;
-                    let status = response.status;
+                    let status = response.status.as_u16();
                     let headers = response.headers.clone();
-                    if let Err(error) = timeout(Duration::from_secs(1), response.bytes())
-                        .await
-                        .context("response body drain timed out")
-                        .and_then(|result| result)
-                    {
-                        tracing::debug!(%error, "tunnel response acknowledgement body interrupted");
+                    if let Some(id) = headers.get("x-request-id") {
+                        tracing::debug!(tunnel_service_request_id = ?id, "control-plane response received");
                     }
-                    Ok::<_, anyhow::Error>((status, headers))
+                    let error = if matches!(status, 200 | 404) {
+                        None
+                    } else {
+                        Some(StatusError::read(response, "response").await)
+                    };
+                    Ok::<_, anyhow::Error>((status, headers, error))
                 })
                 .await;
                 match &response {
-                    Ok(Ok((status, _)))
-                        if status.as_u16() != 200
-                            && !(status.as_u16() == 404 && reply.terminal()) =>
-                    {
-                        receipt.failure("http_error", status.as_u16())
-                    }
+                    Ok(Ok((status, _, _))) if !matches!(*status, 200 | 404) => receipt.failure("http_error", *status),
                     Ok(Err(error)) => receipt.failure(observation::category(error), 0),
                     Err(_) => receipt.failure("timeout", 0),
                     _ => {}
                 }
                 let retry_headers = match response {
-                    Ok(Ok((status, headers))) => {
-                        let code = status.as_u16();
-                        if code == 200 || (code == 404 && reply.terminal()) {
-                            return Ok(code);
-                        }
+                    Ok(Ok((status, headers, error))) => {
+                        let Some(error) = error else { return Ok(status); };
                         if attempt < 2
-                            && (code == 429
-                                || (reply.terminal() && matches!(code, 408 | 502 | 503 | 504)))
+                            && (status == 429 || (reply.terminal() && matches!(status, 408 | 502 | 503 | 504)))
                         {
                             headers
                         } else {
-                            return Err(StatusError {
-                                status: code,
-                                operation: "response",
-                            }
-                            .into());
+                            return Err(error.into());
                         }
                     }
                     Ok(Err(error))
@@ -659,6 +663,7 @@ struct Correlation {
     request_id: String,
     shard_token: String,
     channel: String,
+    client_request_id: Option<String>,
 }
 
 pub struct Delivery {
@@ -675,6 +680,13 @@ impl Delivery {
                 request_id: command.request_id.clone(),
                 shard_token: command.shard_token.clone(),
                 channel: command.channel.clone(),
+                client_request_id: command
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+                    .and_then(|(_, values)| values.first())
+                    .filter(|value| !value.is_empty())
+                    .cloned(),
             },
             notifications_failed: AtomicBool::new(false),
             terminal_started: AtomicBool::new(false),
@@ -694,20 +706,8 @@ impl Sink for Delivery {
             return self.control.post(&self.command, &reply).await;
         }
         if !self.notifications_failed.load(Ordering::Acquire)
-            && let Err(error) = timeout(
-                Duration::from_secs(30),
-                self.control.post(&self.command, &reply),
-            )
-            .await
-            .context("notification delivery timed out")
-            .and_then(|result| result)
+            && let Err(error) = self.control.post(&self.command, &reply).await
         {
-            if error
-                .downcast_ref::<StatusError>()
-                .is_some_and(|e| matches!(e.status, 401 | 403 | 404))
-            {
-                return Err(error);
-            }
             self.notifications_failed.store(true, Ordering::Release);
             tracing::warn!(request_id = %self.command.request_id, %error, "notification delivery interrupted");
         }

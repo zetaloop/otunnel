@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::Config,
-    control::{Batch, Channel, Control, Delivery, StatusError},
+    control::{Batch, Channel, Control, Delivery},
     process::Process,
     protocol::{self, Command, Reply, Request},
     transport::{self, HttpTransport, Pipe, Probe, Sink, Transport},
@@ -510,7 +510,6 @@ impl Tunnel {
                         });
                         match result {
                             Ok(_) => {},
-                            Err(error) if error.downcast_ref::<StatusError>().is_some_and(|error| matches!(error.status, 401 | 403)) => return Err(error),
                             Err(error) => {
                                 self.state.send_modify(|state| state.last_error = Some(format!("{error:#}")));
                                 tracing::error!(%error, "tunnel request failed");
@@ -641,17 +640,7 @@ async fn execute(
                 None => forward.await,
             };
             if let Err(error) = outcome {
-                if error
-                    .downcast_ref::<StatusError>()
-                    .is_some_and(|error| error.status == 404)
-                {
-                    return Ok(());
-                }
-                if delivery.terminal_started()
-                    || error
-                        .downcast_ref::<StatusError>()
-                        .is_some_and(|error| matches!(error.status, 401 | 403))
-                {
+                if delivery.terminal_started() {
                     return Err(error);
                 }
                 tracing::warn!(%error, "MCP forwarding failed");

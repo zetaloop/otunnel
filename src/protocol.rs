@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{
     Value,
     value::{RawValue, to_raw_value},
@@ -61,9 +61,9 @@ pub struct Command {
     pub request_id: String,
     pub shard_token: String,
     pub command_type: String,
-    #[serde(default = "crate::config::main_channel")]
+    #[serde(default = "crate::config::main_channel", deserialize_with = "nullable")]
     pub channel: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "decode_headers")]
     pub headers: Headers,
     #[serde(default)]
     pub response_timeout: Value,
@@ -71,8 +71,36 @@ pub struct Command {
     pub jsonrpc: Option<Json>,
 }
 
-#[derive(Deserialize)]
+pub(crate) fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(
+    deserializer: D,
+) -> std::result::Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn decode_headers<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Headers, D::Error> {
+    let headers =
+        Option::<BTreeMap<String, Option<Vec<Option<String>>>>>::deserialize(deserializer)?;
+    Ok(headers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, values)| {
+            (
+                name,
+                values
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Option::unwrap_or_default)
+                    .collect(),
+            )
+        })
+        .collect())
+}
+
+#[derive(Default, Deserialize)]
 pub struct Poll {
+    #[serde(default, deserialize_with = "nullable")]
     pub commands: Vec<Json>,
 }
 
@@ -252,7 +280,7 @@ pub fn wire_headers(headers: &HeaderMap, filtered: bool) -> Headers {
     let excluded: Vec<_> = headers
         .get_all("connection")
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| std::str::from_utf8(value.as_bytes()).ok())
         .flat_map(|value| value.split(','))
         .map(|value| value.trim().to_ascii_lowercase())
         .collect();
@@ -262,27 +290,63 @@ pub fn wire_headers(headers: &HeaderMap, filtered: bool) -> Headers {
             continue;
         }
         let canonical = if filtered {
-            match name.as_str() {
-                "access-control-expose-headers" => "Access-Control-Expose-Headers".into(),
-                "content-type" => "Content-Type".into(),
-                "last-event-id" => "Last-Event-Id".into(),
-                "mcp-protocol-version" => "Mcp-Protocol-Version".into(),
-                "mcp-session-id" => "Mcp-Session-Id".into(),
-                "www-authenticate" => "Www-Authenticate".into(),
-                _ => continue,
-            }
+            let Some(name) = response_header(name.as_str()) else {
+                continue;
+            };
+            name.into()
         } else {
             crate::harpoon::headers::canonical(name.as_str())
         };
         let values: Vec<_> = headers
             .get_all(name)
             .iter()
-            .filter_map(|value| value.to_str().ok())
+            .map(|value| String::from_utf8_lossy(value.as_bytes()))
             .filter(|value| !value.is_empty())
-            .map(str::to_owned)
+            .map(Cow::into_owned)
             .collect();
         if !values.is_empty() {
             result.insert(canonical, values);
+        }
+    }
+    result
+}
+
+fn response_header(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "access-control-expose-headers" => "Access-Control-Expose-Headers",
+        "content-type" => "Content-Type",
+        "last-event-id" => "Last-Event-Id",
+        "mcp-protocol-version" => "Mcp-Protocol-Version",
+        "mcp-session-id" => "Mcp-Session-Id",
+        "www-authenticate" => "Www-Authenticate",
+        _ => return None,
+    })
+}
+
+pub(crate) fn sanitize_headers(headers: &Headers) -> Headers {
+    let excluded: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, values)| values)
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim_matches([' ', '\t']).to_ascii_lowercase())
+        .collect();
+    let mut result = Headers::new();
+    for (name, values) in headers {
+        let lower = name.to_ascii_lowercase();
+        let Some(canonical) = response_header(&lower) else {
+            continue;
+        };
+        if excluded.contains(&lower) {
+            continue;
+        }
+        let values: Vec<_> = values
+            .iter()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        if !values.is_empty() {
+            result.entry(canonical.into()).or_default().extend(values);
         }
     }
     result

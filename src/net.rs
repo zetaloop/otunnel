@@ -29,7 +29,9 @@ use url::Url;
 
 use crate::config::pem;
 
+mod error;
 mod trace;
+pub(crate) use error::ErrorInfo;
 
 pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}

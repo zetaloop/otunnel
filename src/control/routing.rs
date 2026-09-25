@@ -10,15 +10,18 @@ pub(super) struct Correction {
 }
 
 impl Correction {
-    pub fn parse(headers: &HeaderMap, body: &[u8]) -> Option<Self> {
+    pub fn parse(headers: &HeaderMap, body: &[u8]) -> Result<Option<Self>, ()> {
         #[derive(Deserialize)]
         struct Envelope {
-            error: Json,
+            #[serde(default, deserialize_with = "present")]
+            error: Option<Json>,
         }
         #[derive(Deserialize)]
         struct Metadata {
-            code: String,
-            policy_revision: Json,
+            #[serde(default, deserialize_with = "present")]
+            code: Option<Json>,
+            #[serde(default, deserialize_with = "present")]
+            policy_revision: Option<Json>,
             #[serde(default, deserialize_with = "present")]
             shard_token: Option<Json>,
         }
@@ -26,13 +29,20 @@ impl Correction {
             Json::deserialize(deserializer).map(Some)
         }
 
-        let envelope: Envelope = serde_json::from_slice(body).ok()?;
-        let metadata: Metadata = serde_json::from_str(envelope.error.get()).ok()?;
-        if metadata.code != "wrong_cluster" {
-            return None;
+        let envelope: Envelope = serde_json::from_slice(body).map_err(|_| ())?;
+        let Some(error) = envelope.error else {
+            return Ok(None);
+        };
+        let metadata: Metadata = serde_json::from_str(error.get()).map_err(|_| ())?;
+        let code = metadata
+            .code
+            .as_deref()
+            .and_then(|code| serde_json::from_str::<String>(code.get()).ok());
+        if code.as_deref() != Some("wrong_cluster") {
+            return Ok(None);
         }
         let mut values = headers.get_all("x-tunnel-shard-token").iter();
-        let mut token = values.next()?.clone();
+        let mut token = values.next().ok_or(())?.clone();
         let bytes = token.as_bytes();
         if values.next().is_some()
             || !(1..=4096).contains(&bytes.len())
@@ -40,24 +50,25 @@ impl Correction {
                 .iter()
                 .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b',')
         {
-            return None;
+            return Err(());
         }
         if let Some(copy) = metadata.shard_token {
-            let copy: String = serde_json::from_str(copy.get()).ok()?;
+            let copy: String = serde_json::from_str(copy.get()).map_err(|_| ())?;
             if copy.as_bytes() != bytes {
-                return None;
+                return Err(());
             }
         }
-        let raw = metadata.policy_revision.get();
+        let revision = metadata.policy_revision.ok_or(())?;
+        let raw = revision.get();
         if raw.len() > 16 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
+            return Err(());
         }
-        let revision = raw.parse::<u64>().ok()?;
+        let revision = raw.parse::<u64>().map_err(|_| ())?;
         if revision > 9_007_199_254_740_991 {
-            return None;
+            return Err(());
         }
         token.set_sensitive(true);
-        Some(Self { revision, token })
+        Ok(Some(Self { revision, token }))
     }
 }
 
