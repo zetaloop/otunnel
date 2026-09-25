@@ -286,7 +286,8 @@ pub fn wire_headers(headers: &HeaderMap, filtered: bool) -> Headers {
         .collect();
     let mut result = Headers::new();
     for name in headers.keys() {
-        if name == "connection" || excluded.iter().any(|value| value == name.as_str()) {
+        if filtered && (name == "connection" || excluded.iter().any(|value| value == name.as_str()))
+        {
             continue;
         }
         let canonical = if filtered {
@@ -301,7 +302,7 @@ pub fn wire_headers(headers: &HeaderMap, filtered: bool) -> Headers {
             .get_all(name)
             .iter()
             .map(|value| String::from_utf8_lossy(value.as_bytes()))
-            .filter(|value| !value.is_empty())
+            .filter(|value| !filtered || !value.is_empty())
             .map(Cow::into_owned)
             .collect();
         if !values.is_empty() {

@@ -214,8 +214,10 @@ pub(super) fn read(config: &mut Config) -> Result<()> {
             *value = resolve_named(name, value)?;
         }
     }
-    config.control_plane.api_key =
-        resolve_named("control_plane.api_key", &config.control_plane.api_key)?;
+    if !config.control_plane.api_key.is_empty() {
+        config.control_plane.api_key =
+            resolve_named("control_plane.api_key", &config.control_plane.api_key)?;
+    }
 
     config.health.listen_addr = resolve_named("health.listen_addr", &config.health.listen_addr)?;
     if let Some(socket) = &mut config.health.unix_socket {

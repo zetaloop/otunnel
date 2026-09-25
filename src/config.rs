@@ -57,15 +57,19 @@ settings!(Config {
 
 impl Config {
     pub fn validate_profile(text: &str) -> Result<()> {
-        let config = Self::parse(text)?;
-        config.scope()?;
+        Self::parse(text)?.validate_source(text)
+    }
+
+    fn validate_source(&self, text: &str) -> Result<()> {
+        self.scope()?;
         let mut input = text.as_bytes();
         let raw = serde_saphyr::read::<_, Value>(&mut input)
             .next()
             .transpose()?
             .context("configuration is empty")?;
-        reference::validate_profile(&config, &raw)?;
-        for target in &config.harpoon.targets {
+        reference::validate_profile(self, &raw)?;
+        self.mcp.oauth_origins()?;
+        for target in &self.harpoon.targets {
             if let Some(definition) = &target.template {
                 definition
                     .validate()
@@ -76,11 +80,17 @@ impl Config {
     }
 
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load(path, |_| {})
+    }
+
+    /// Apply configuration overrides before resolving references and validating values.
+    pub fn load(path: impl AsRef<Path>, configure: impl FnOnce(&mut Self)) -> Result<Self> {
         let path = path.as_ref();
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let context = || format!("parse config file {}", path.display());
-        Self::validate_profile(&text).with_context(context)?;
         let mut config = Self::parse(&text).with_context(context)?;
+        configure(&mut config);
+        config.validate_source(&text).with_context(context)?;
         reference::read(&mut config).with_context(context)?;
         Ok(config)
     }
@@ -106,6 +116,30 @@ impl Config {
                     .all(|target| target.template.is_none()),
             "Harpoon templates require config_version: 2"
         );
+        for target in &config.harpoon.targets {
+            anyhow::ensure!(
+                !target.label.trim().is_empty(),
+                "harpoon.targets entry requires label"
+            );
+            if let Some(template) = &target.template {
+                anyhow::ensure!(
+                    target.url.is_empty() && target.unix_socket.is_none(),
+                    "harpoon.targets entry {:?}: template cannot be combined with url or unix_socket",
+                    target.label
+                );
+                anyhow::ensure!(
+                    template.version == 1,
+                    "harpoon.targets entry {:?}: template version must be 1",
+                    target.label
+                );
+            } else {
+                anyhow::ensure!(
+                    !target.url.trim().is_empty(),
+                    "harpoon.targets entry {:?} requires url or template",
+                    target.label
+                );
+            }
+        }
         if config.config_version == Some(2) {
             // A version-two profile is a single YAML document, including empty trailing documents.
             serde_saphyr::from_str::<Self>(text)?;
@@ -137,6 +171,7 @@ impl Config {
     ) -> Result<()> {
         self.scope()?;
         reference::validate_headers(self, true)?;
+        self.mcp.oauth_origins()?;
         if let Some(organization) = &self.control_plane.organization_id {
             anyhow::ensure!(
                 !organization.contains(['\r', '\n']),
@@ -436,6 +471,7 @@ settings!(Mcp {
     commands: Vec<Command> = Vec::new(),
     extra_headers: BTreeMap<String, String> = BTreeMap::new(),
     discovery_extra_headers: BTreeMap<String, String> = BTreeMap::new(),
+    oauth_trusted_origins: Vec<String> = Vec::new(),
     startup_wait_timeout: Span = Span(Duration::ZERO),
     stdio_send_initialized_notification: bool = false,
     connection_max_ttl: Option<Span> = Some(Span(Duration::from_secs(600))),
@@ -444,6 +480,29 @@ settings!(Mcp {
     client_cert: Option<String> = None,
     client_key: Option<String> = None,
 });
+impl Mcp {
+    pub(crate) fn oauth_origins(&self) -> Result<Vec<url::Url>> {
+        self.oauth_trusted_origins.iter().map(|value| {
+            let url = url::Url::parse(value).context("invalid OAuth origin")?;
+            let authority = value.split_once("://").map(|(_, rest)| rest.trim_end_matches('/'));
+            anyhow::ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && authority.is_some_and(|authority| !authority.is_empty()
+                        && !authority.contains(['@', '/', '?', '#', '\\', '%'])
+                        && !authority.ends_with(':'))
+                    && !value.chars().any(char::is_whitespace)
+                    && !value.ends_with("//")
+                    && url.port() != Some(0),
+                "mcp.oauth_trusted_origins: expected an HTTP(S) origin without credentials, path, query, or fragment"
+            );
+            Ok(url)
+        }).collect()
+    }
+}
 settings!(Server {
     channel: String = main_channel(),
     url: String = String::new(),

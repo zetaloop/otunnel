@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::{ArgMatches, parser::ValueSource};
 use otunnel::{
     Tunnel,
-    config::Config,
     diagnostic::{Check, Report, Status},
     health::Server,
 };
@@ -63,13 +62,6 @@ pub async fn execute(arguments: &ArgMatches) -> Result<u8> {
         match std::fs::metadata(file) {
             Ok(_) => {
                 checks.push(Check::pass("profile_load", file.display().to_string()));
-                match Config::read(file) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        checks.push(Check::fail("profile_load", format!("{error:#}")));
-                        return output(arguments, checks, BTreeMap::new(), String::new());
-                    }
-                }
             }
             Err(error) => {
                 checks.push(Check::fail(

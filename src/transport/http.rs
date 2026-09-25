@@ -30,6 +30,7 @@ pub struct HttpTransport {
     pub(crate) unix_socket: Option<String>,
     headers: HeaderMap,
     pub(crate) discovery_headers: HeaderMap,
+    pub(crate) oauth_origins: Vec<Url>,
     pub(crate) harpoon: Option<Arc<crate::harpoon::Harpoon>>,
     stateless: Arc<AtomicBool>,
 }
@@ -75,6 +76,7 @@ impl HttpTransport {
             url,
             headers: config::headers(&mcp.extra_headers)?,
             discovery_headers,
+            oauth_origins: mcp.oauth_origins()?,
             harpoon: None,
             stateless: Arc::new(AtomicBool::new(false)),
         })

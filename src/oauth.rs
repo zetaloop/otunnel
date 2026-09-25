@@ -232,6 +232,23 @@ fn timed_out(error: &anyhow::Error) -> bool {
 }
 
 async fn request_document(transport: &HttpTransport, url: &Url, retry: bool) -> Result<Fetched> {
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none_or(str::is_empty)
+            && url.port() != Some(0),
+        "oauth discovery: invalid metadata URL; require HTTP(S) without credentials or fragments"
+    );
+    anyhow::ensure!(
+        url.origin() == transport.url.origin()
+            || transport
+                .oauth_origins
+                .iter()
+                .any(|origin| origin.origin() == url.origin()),
+        "oauth discovery: destination origin is not trusted; configure --mcp.oauth-trusted-origin for additional metadata or authorization servers"
+    );
     for attempt in 0..if retry { 3 } else { 1 } {
         let deadline =
             retry.then(|| tokio::time::Instant::now() + Duration::from_secs(2 << attempt));
@@ -314,8 +331,11 @@ pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
             "prmd-source",
             "PRMD source URL",
         ));
-        if let Some(issuer_url) = issuer.as_deref().and_then(http_url) {
-            match fetch_authorization(transport, &issuer_url).await {
+        if let Some(issuer) = issuer
+            .as_deref()
+            .filter(|issuer| http_url(issuer).is_some())
+        {
+            match fetch_authorization(transport, issuer).await {
                 Ok(metadata) => {
                     records.push(
                         Record::new(
@@ -374,7 +394,7 @@ pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
     }
     Ok(Reply {
         message: Some(to_raw_value(&resource.value)?),
-        headers: protocol::wire_headers(&resource.headers, true),
+        headers: protocol::wire_headers(&resource.headers, false),
         status: resource.status,
         kind: "oauth_discovery_response",
     })
@@ -528,8 +548,8 @@ fn authorization_candidates(issuer: &Url) -> Result<Vec<Url>> {
     Ok(candidates)
 }
 
-async fn fetch_authorization(transport: &HttpTransport, issuer: &Url) -> Result<Document> {
-    let candidates = authorization_candidates(issuer)?;
+async fn fetch_authorization(transport: &HttpTransport, issuer: &str) -> Result<Document> {
+    let candidates = authorization_candidates(&Url::parse(issuer)?)?;
     for retry in [false, true] {
         let mut fallback = None;
         let mut failure = None;
@@ -584,7 +604,7 @@ async fn fetch_authorization(transport: &HttpTransport, issuer: &Url) -> Result<
             })();
             match result {
                 Ok(document) => {
-                    if document.value["issuer"] == issuer.as_str() {
+                    if document.value["issuer"] == issuer {
                         return Ok(document);
                     }
                     if fallback.is_none() {

@@ -28,6 +28,7 @@ enum Kind {
     Number,
     Boolean,
     List,
+    Origins,
     Headers,
     Servers,
     Commands,
@@ -190,6 +191,13 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "/mcp/max_concurrent_requests",
         Number,
         "Maximum active requests per MCP channel",
+    ),
+    (
+        "mcp.oauth-trusted-origin",
+        "MCP_OAUTH_TRUSTED_ORIGINS",
+        "/mcp/oauth_trusted_origins",
+        Origins,
+        "Additional HTTP(S) origin for OAuth metadata and authorization server discovery",
     ),
     (
         "mcp.startup-wait-timeout",
@@ -449,7 +457,9 @@ fn argument(name: &'static str, kind: Kind) -> Arg {
             .value_parser([
                 "1", "t", "T", "TRUE", "true", "True", "0", "f", "F", "FALSE", "false", "False",
             ]),
-        List | Headers | Servers | Commands | Targets => argument.action(ArgAction::Append),
+        List | Origins | Headers | Servers | Commands | Targets => {
+            argument.action(ArgAction::Append)
+        }
         _ => argument,
     }
 }
@@ -625,7 +635,40 @@ fn load(matches: &ArgMatches) -> Result<Config> {
         );
     }
     let source = source(matches)?;
-    let config = source.map(Config::read).transpose()?.unwrap_or_default();
+    let config = source
+        .map(|file| {
+            Config::load(file, |config| {
+                let overridden = |name| {
+                    matches.value_source(name).is_some()
+                        || ALIASES.iter().any(|(canonical, alias)| {
+                            *canonical == name && matches.value_source(alias).is_some()
+                        })
+                };
+                for (name, headers) in [
+                    (
+                        "control-plane.extra-headers",
+                        &mut config.control_plane.extra_headers,
+                    ),
+                    ("mcp.extra-headers", &mut config.mcp.extra_headers),
+                    (
+                        "mcp.discovery-extra-headers",
+                        &mut config.mcp.discovery_extra_headers,
+                    ),
+                ] {
+                    if overridden(name) {
+                        headers.clear();
+                    }
+                }
+                if overridden("mcp.oauth-trusted-origin") {
+                    config.mcp.oauth_trusted_origins.clear();
+                }
+                if overridden("harpoon.target") {
+                    config.harpoon.targets.clear();
+                }
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let mut initial_poll_timeout = config.control_plane.initial_poll_timeout;
     let mut value = serde_json::to_value(config)?;
     for (name, environment, pointer, kind, _) in SETTINGS {
@@ -680,10 +723,10 @@ fn load(matches: &ArgMatches) -> Result<Config> {
         }
         if matches.value_source(selected) == Some(clap::parser::ValueSource::EnvVariable) {
             match kind {
-                Servers | Commands | Targets => {
+                Servers | Commands | Targets | Origins => {
                     arguments = arguments
                         .iter()
-                        .flat_map(|value| value.lines())
+                        .flat_map(|value| value.split(['\r', '\n']))
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
                         .map(str::to_owned)
@@ -728,6 +771,12 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                 arguments
                     .iter()
                     .flat_map(|value| value.split(','))
+                    .collect::<Vec<_>>()
+            ),
+            Origins => json!(
+                arguments
+                    .iter()
+                    .filter(|value| !value.is_empty())
                     .collect::<Vec<_>>()
             ),
             List => json!(
