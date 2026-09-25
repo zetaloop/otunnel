@@ -2,13 +2,17 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command as Process, Stdio},
+    process::Stdio,
 };
 
 use anyhow::{Context, Result};
+use cap_std::{ambient_authority, fs::Dir};
 use clap::{Arg, ArgMatches, Command};
 use otunnel::config::{self, Config};
 use serde_json::json;
+
+mod editor;
+mod files;
 
 const SAMPLES: &[(&str, &str)] = &[
     (
@@ -204,7 +208,9 @@ pub fn execute(arguments: &ArgMatches) -> Result<u8> {
         "edit" => {
             let path = directory.join(format!("{}.yaml", config::profile_name(&name)?));
             create_directory(&directory)?;
-            let contents = match fs::read_to_string(&path) {
+            let root = Dir::open_ambient_dir(&directory, ambient_authority())?;
+            let filename = Path::new(path.file_name().context("profile filename is missing")?);
+            let contents = match files::read(&root, filename) {
                 Ok(contents) => contents,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => generate(
                     "sample_mcp_with_dcr",
@@ -218,35 +224,33 @@ pub fn execute(arguments: &ArgMatches) -> Result<u8> {
                     return Err(error).with_context(|| format!("read profile {}", path.display()));
                 }
             };
-            let temporary = tempfile::Builder::new()
-                .prefix(&format!(".{name}."))
-                .suffix(".yaml")
-                .tempfile_in(&directory)?;
-            fs::write(temporary.path(), contents)?;
-            let editor = env::var("VISUAL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| env::var("EDITOR").ok())
+            let mut temporary = files::temporary(&root, &directory)?;
+            temporary.write_all(contents.as_bytes())?;
+            let temporary = temporary.into_temp_path();
+            let editor = ["VISUAL", "EDITOR"]
+                .into_iter()
+                .filter_map(|name| env::var(name).ok())
+                .map(|value| value.trim().to_owned())
+                .find(|value| !value.is_empty())
                 .context("set VISUAL or EDITOR to edit profiles")?;
-            let mut words = editor.split_whitespace();
-            let executable = words
-                .next()
-                .context("set VISUAL or EDITOR to edit profiles")?;
-            let executable = otunnel::process::resolve_program(executable)?;
-            let result = Process::new(executable)
-                .args(words)
-                .arg(temporary.path())
+            let result = editor::command(&editor, &temporary)?
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .status()?;
             anyhow::ensure!(result.success(), "editor exited with {result}");
-            let edited = fs::read_to_string(temporary.path())?;
+            let edited = files::read(
+                &root,
+                Path::new(
+                    temporary
+                        .file_name()
+                        .context("temporary profile filename is missing")?,
+                ),
+            )?;
             validate(&edited).with_context(|| {
                 format!("profile did not validate; not saving {}", path.display())
             })?;
-            temporary
-                .persist(&path)
+            files::replace(&root, &directory, filename, edited.as_bytes())
                 .with_context(|| format!("save profile {}", path.display()))?;
             println!("Saved profile {name} at {}", path.display());
         }
@@ -431,41 +435,31 @@ fn create_directory(path: &Path) -> Result<()> {
         .create(path)
         .with_context(|| format!("create profile directory {}", path.display()))
 }
+pub(super) fn read(path: &Path) -> Result<String> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let root = Dir::open_ambient_dir(directory, ambient_authority())?;
+    Ok(files::read(
+        &root,
+        Path::new(path.file_name().context("profile filename is missing")?),
+    )?)
+}
+
 fn write(path: &Path, contents: &[u8], force: bool) -> Result<()> {
-    let directory = path.parent().context("profile directory is missing")?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     create_directory(directory)?;
-    if force && let Ok(metadata) = fs::metadata(path) {
-        anyhow::ensure!(
-            metadata.is_file(),
-            "profile {} must be a regular file",
-            path.display()
-        );
-    }
-    #[cfg(windows)]
-    if force {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
-        anyhow::ensure!(file.metadata()?.is_file(), "profile must be a regular file");
-        file.set_len(0)?;
-        file.write_all(contents)?;
-        return Ok(());
-    }
-    let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    file.write_all(contents)?;
-    let result = if force {
-        file.persist(path)
+    let root = Dir::open_ambient_dir(directory, ambient_authority())?;
+    let name = Path::new(path.file_name().context("profile filename is missing")?);
+    if force && !cfg!(windows) {
+        files::replace(&root, directory, name, contents)?;
     } else {
-        file.persist_noclobber(path)
-    };
-    result.with_context(|| {
-        format!(
-            "write profile {}; use --force to replace an existing profile",
-            path.display()
-        )
-    })?;
+        files::create(&root, name, force)?.write_all(contents)?;
+    }
     Ok(())
 }
 

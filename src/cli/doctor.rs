@@ -30,7 +30,7 @@ const LINKS: &[(&str, &str)] = &[
 pub async fn execute(arguments: &ArgMatches) -> Result<u8> {
     let mut checks = Vec::new();
     let path = match super::source(arguments) {
-        Ok(path) => path,
+        Ok(path) => path.map(|source| source.path),
         Err(error) => {
             checks.push(Check::fail("config_source", format!("{error:#}")));
             return output(arguments, checks, BTreeMap::new(), String::new());

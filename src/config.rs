@@ -80,18 +80,17 @@ impl Config {
     }
 
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
-        Self::load(path, |_| {})
+        let path = path.as_ref();
+        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        Self::load(&text, |_| {}).with_context(|| format!("parse config file {}", path.display()))
     }
 
     /// Apply configuration overrides before resolving references and validating values.
-    pub fn load(path: impl AsRef<Path>, configure: impl FnOnce(&mut Self)) -> Result<Self> {
-        let path = path.as_ref();
-        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let context = || format!("parse config file {}", path.display());
-        let mut config = Self::parse(&text).with_context(context)?;
+    pub fn load(text: &str, configure: impl FnOnce(&mut Self)) -> Result<Self> {
+        let mut config = Self::parse(text)?;
         configure(&mut config);
-        config.validate_source(&text).with_context(context)?;
-        reference::read(&mut config).with_context(context)?;
+        config.validate_source(text)?;
+        reference::read(&mut config)?;
         Ok(config)
     }
     pub fn parse(text: &str) -> Result<Self> {

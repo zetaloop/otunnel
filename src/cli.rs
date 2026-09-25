@@ -552,7 +552,12 @@ pub fn command() -> Command {
         )
 }
 
-fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
+struct Source {
+    path: PathBuf,
+    named: bool,
+}
+
+fn source(matches: &ArgMatches) -> Result<Option<Source>> {
     use clap::parser::ValueSource;
 
     for layer in [ValueSource::CommandLine, ValueSource::EnvVariable] {
@@ -574,11 +579,11 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
             continue;
         };
         anyhow::ensure!(!value.is_empty(), "--{name} requires a value");
-        return match name {
-            "profile" => Ok(Some(otunnel::config::profile_path(
+        let path = match name {
+            "profile" => otunnel::config::profile_path(
                 &value,
                 matches.get_one::<String>("profile-dir").map(String::as_str),
-            )?)),
+            )?,
             "profile-file" => {
                 let file = otunnel::config::expand_home(&value)?;
                 anyhow::ensure!(
@@ -591,10 +596,14 @@ fn source(matches: &ArgMatches) -> Result<Option<PathBuf>> {
                         .and_then(|name| name.to_str())
                         .context("invalid profile filename")?,
                 )?;
-                Ok(Some(file))
+                file
             }
-            _ => Ok(Some(PathBuf::from(value))),
+            _ => PathBuf::from(value),
         };
+        return Ok(Some(Source {
+            path,
+            named: name == "profile",
+        }));
     }
     Ok(None)
 }
@@ -637,7 +646,12 @@ fn load(matches: &ArgMatches) -> Result<Config> {
     let source = source(matches)?;
     let config = source
         .map(|file| {
-            Config::load(file, |config| {
+            let text = if file.named {
+                profiles::read(&file.path)?
+            } else {
+                std::fs::read_to_string(&file.path)?
+            };
+            Config::load(&text, |config| {
                 let overridden = |name| {
                     matches.value_source(name).is_some()
                         || ALIASES.iter().any(|(canonical, alias)| {
