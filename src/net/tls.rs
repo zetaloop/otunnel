@@ -267,8 +267,7 @@ fn certificate_error(code: i32) -> Error {
         | ffi::X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
         | ffi::X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE => CertificateError::UnknownIssuer,
         _ => {
-            let message =
-                unsafe { CStr::from_ptr(ffi::X509_verify_cert_error_string(code.into())) };
+            let message = unsafe { CStr::from_ptr(ffi::X509_verify_cert_error_string(code as _)) };
             CertificateError::Other(OtherError(Arc::new(io::Error::other(
                 message.to_string_lossy().into_owned(),
             ))))
