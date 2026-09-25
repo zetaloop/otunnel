@@ -30,6 +30,7 @@ required-features = ["cli"]
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+aws-lc-sys = "0.45.0"
 axum = { version = "0.8.9", optional = true }
 base64 = "0.23.1"
 bytes = "1.12.1"
@@ -57,6 +58,7 @@ reqwest = { version = "0.13.5", features = ["json", "query", "socks", "stream"] 
 rustls = "0.23.44"
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
+rustls-platform-verifier = "0.7.1"
 same-file = { version = "1.0.6", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision", "raw_value"] }

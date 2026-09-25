@@ -2,7 +2,7 @@ use std::{io, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+use rustls::{ClientConfig, pki_types::ServerName};
 use serde::Serialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -130,7 +130,9 @@ impl Checker {
         Ok(Self {
             targets,
             interval: config.proxy.check_interval.0,
-            tls: tls(config.ca_bundle.as_deref())?,
+            tls: Arc::new(
+                crate::net::tls::builder(config.ca_bundle.as_deref())?.with_no_client_auth(),
+            ),
             state,
         })
     }
@@ -212,25 +214,6 @@ fn host_port(url: &Url) -> String {
         Some(port) => format!("{host}:{port}"),
         None => host,
     }
-}
-
-fn tls(bundle: Option<&str>) -> Result<Arc<ClientConfig>> {
-    let mut roots = RootCertStore::empty();
-    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-    if let Some(bundle) = bundle {
-        let data = config::pem(bundle)?;
-        for certificate in rustls_pemfile::certs(&mut data.as_slice()) {
-            roots.add(certificate?)?;
-        }
-    }
-    Ok(Arc::new(
-        ClientConfig::builder_with_provider(
-            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
-        )
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth(),
-    ))
 }
 
 async fn probe(

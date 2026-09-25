@@ -20,7 +20,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use rustls::{
-    ClientConfig, RootCertStore,
+    ClientConfig,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -30,6 +30,7 @@ use url::Url;
 use crate::config::pem;
 
 mod error;
+pub(crate) mod tls;
 mod trace;
 pub(crate) use error::ErrorInfo;
 
@@ -88,68 +89,50 @@ impl Response {
 
 impl Http {
     pub fn new(origin: Url, options: Options<'_>) -> Result<Self> {
-        let certificates = options.ca_bundle.map(pem).transpose()?;
-        let proxy = Arc::new(crate::proxy::Proxy::new(options.proxy)?);
-        let builder = || -> Result<reqwest::ClientBuilder> {
-            let route = proxy.clone();
-            let mut builder = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .no_proxy()
-                .proxy(reqwest::Proxy::custom(move |url| {
-                    route.select(url).ok().flatten().cloned()
-                }));
-            if let Some(certs) = &certificates {
-                for certificate in reqwest::Certificate::from_pem_bundle(certs)? {
-                    builder = builder.add_root_certificate(certificate);
-                }
-            }
-            Ok(builder)
-        };
-        let public = builder()?.build()?;
-        let mut scoped = builder()?;
-        let identity = match (options.client_cert, options.client_key) {
-            (Some(cert), Some(key)) => Some((pem(cert)?, pem(key)?)),
-            (None, None) => None,
-            _ => bail!("client_cert and client_key must be configured together"),
-        };
-        if let Some((cert, key)) = &identity {
-            let mut combined = cert.clone();
-            combined.push(b'\n');
-            combined.extend_from_slice(key);
-            scoped = scoped.identity(reqwest::Identity::from_pem(&combined)?);
-        }
-        let client = scoped.build()?;
-        let local = if let Some(socket) = options.socket {
-            let mut roots = RootCertStore::empty();
-            let native = rustls_native_certs::load_native_certs();
-            roots.add_parsable_certificates(native.certs);
-            if let Some(certs) = &certificates {
-                for certificate in rustls_pemfile::certs(&mut certs.as_slice()) {
-                    roots.add(certificate?)?;
-                }
-            }
-            let builder = ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots);
-            let tls = if let Some((cert, key)) = identity {
+        let builder = tls::builder(options.ca_bundle)?;
+        let public_tls = builder.clone().with_no_client_auth();
+        let tls = match (options.client_cert, options.client_key) {
+            (Some(cert), Some(key)) => {
+                let cert = pem(cert)?;
+                let key = pem(key)?;
                 let certs: Vec<CertificateDer<'static>> =
                     rustls_pemfile::certs(&mut cert.as_slice()).collect::<io::Result<_>>()?;
                 let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key.as_slice())?
                     .ok_or_else(|| anyhow::anyhow!("client_key contains no private key"))?;
                 builder.with_client_auth_cert(certs, key)?
-            } else {
-                builder.with_no_client_auth()
-            };
-            let connector = Connector {
-                path: crate::config::path(socket)?,
-                tls: Arc::new(tls),
-            };
-            Some(Client::builder(TokioExecutor::new()).build(connector))
+            }
+            (None, None) => public_tls.clone(),
+            _ => bail!("client_cert and client_key must be configured together"),
+        };
+        let local = options
+            .socket
+            .map(|socket| -> Result<_> {
+                let connector = Connector {
+                    path: crate::config::path(socket)?,
+                    tls: Arc::new(tls.clone()),
+                };
+                Ok(Client::builder(TokioExecutor::new()).build(connector))
+            })
+            .transpose()?;
+        let proxy = Arc::new(crate::proxy::Proxy::new(options.proxy)?);
+        let builder = |mut tls: ClientConfig| {
+            tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let route = proxy.clone();
+            reqwest::Client::builder()
+                .tls_backend_preconfigured(tls)
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .no_proxy()
+                .proxy(reqwest::Proxy::custom(move |url| {
+                    route.select(url).ok().flatten().cloned()
+                }))
+                .build()
+        };
+        let public = builder(public_tls)?;
+        let client = if options.client_cert.is_some() {
+            builder(tls)?
         } else {
-            None
+            public.clone()
         };
         Ok(Self {
             client,
