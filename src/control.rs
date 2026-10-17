@@ -519,7 +519,7 @@ impl Control {
                     let adjusted = (elapsed - margin).max(minimum).as_millis() as u64;
                     if Duration::from_millis(adjusted) < requested {
                         self.learned_poll_ms
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                                 (current == 0 || adjusted < current).then_some(adjusted)
                             })
                             .ok();
