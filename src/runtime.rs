@@ -24,6 +24,7 @@ use crate::{
 };
 
 mod startup;
+mod trace;
 pub use startup::Startup;
 
 #[derive(Clone, Default, Serialize)]
@@ -440,6 +441,13 @@ impl Tunnel {
         let bindings = Arc::new(self.bindings.clone());
         let capacity = self.config.control_plane.max_inflight_requests;
         let concurrency = self.config.mcp.max_concurrent_requests;
+        let forward_trace_context = self.config.mcp.forward_trace_context
+            && !self
+                .config
+                .mcp
+                .extra_headers
+                .keys()
+                .any(|name| trace::owns_header(name));
         let ttl = self
             .config
             .mcp
@@ -481,10 +489,10 @@ impl Tunnel {
                         let deadline = protocol::timeout(&command.response_timeout).and_then(|duration| received.checked_add(duration));
                         let result = if deadline.is_some_and(|deadline| deadline <= Instant::now()) { Ok(false) }
                             else if let Some(deadline) = deadline {
-                                match timeout_at(deadline, execute(&control, &bindings, command, ttl, Some(deadline))).await {
+                                match timeout_at(deadline, execute(&control, &bindings, command, ttl, Some(deadline), forward_trace_context)).await {
                                     Ok(result) => result.map(|()| true), Err(_) => Ok(false),
                                 }
-                            } else { execute(&control, &bindings, command, ttl, None).await.map(|()| true) };
+                            } else { execute(&control, &bindings, command, ttl, None, forward_trace_context).await.map(|()| true) };
                         (id, result)
                     });
                 }
@@ -601,6 +609,7 @@ async fn execute(
     command: Command,
     ttl: Option<Duration>,
     deadline: Option<Instant>,
+    forward_trace_context: bool,
 ) -> Result<()> {
     if !matches!(
         command.command_type.as_str(),
@@ -656,9 +665,18 @@ async fn execute(
     };
     match command.command_type.as_str() {
         "jsonrpc" => {
+            let message = if forward_trace_context
+                && matches!(binding.kind(), Some("stdio" | "streamable_http"))
+            {
+                trace::forward(&command)
+            } else {
+                None
+            };
             let request = Request {
                 discovery: false,
-                message: command.jsonrpc.context("JSON-RPC command has no payload")?,
+                message: message
+                    .or(command.jsonrpc)
+                    .context("JSON-RPC command has no payload")?,
                 headers,
                 deadline,
             };

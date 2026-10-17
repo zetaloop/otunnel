@@ -424,6 +424,13 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         Boolean,
         "Complete downstream stdio initialization",
     ),
+    (
+        "mcp.forward-trace-context",
+        "MCP_FORWARD_TRACE_CONTEXT",
+        "/mcp/forward_trace_context",
+        Boolean,
+        "Forward tunnel trace context in MCP metadata",
+    ),
 ];
 
 const ALIASES: &[(&str, &str)] = &[

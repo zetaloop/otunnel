@@ -636,6 +636,9 @@ impl Transport for Pipe {
             .unwrap_or_else(|| "MCP connection closed".into());
         bail!(error)
     }
+    fn kind(&self) -> Option<&'static str> {
+        Some("stdio")
+    }
     fn process_affinity(&self) -> bool {
         true
     }

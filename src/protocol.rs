@@ -72,6 +72,8 @@ pub struct Command {
     #[serde(default)]
     pub response_timeout: Value,
     #[serde(default)]
+    pub trace_context: Option<Json>,
+    #[serde(default)]
     pub jsonrpc: Option<Json>,
 }
 

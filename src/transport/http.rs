@@ -182,6 +182,9 @@ impl HttpTransport {
 
 #[async_trait]
 impl Transport for HttpTransport {
+    fn kind(&self) -> Option<&'static str> {
+        Some("streamable_http")
+    }
     async fn discover(&self) -> Result<Reply> {
         crate::oauth::discover(self).await
     }

@@ -41,6 +41,9 @@ pub trait Transport: Send + Sync {
     async fn closed(&self) -> Result<()> {
         std::future::pending().await
     }
+    fn kind(&self) -> Option<&'static str> {
+        None
+    }
     fn observation(&self) -> Option<tokio::sync::watch::Receiver<Value>> {
         None
     }

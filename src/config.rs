@@ -504,6 +504,7 @@ settings!(Mcp {
     oauth_trusted_origins: Vec<String> = Vec::new(),
     startup_wait_timeout: Span = Span(Duration::ZERO),
     stdio_send_initialized_notification: bool = false,
+    forward_trace_context: bool = false,
     connection_max_ttl: Option<Span> = Some(Span(Duration::from_secs(600))),
     max_concurrent_requests: usize = 10,
     http_proxy: Option<String> = None,
