@@ -30,13 +30,13 @@ required-features = ["cli"]
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-aws-lc-sys = "0.45.0"
+aws-lc-sys = "0.46.0"
 axum = { version = "0.8.9", optional = true }
 base64 = "0.23.1"
 bytes = "1.12.1"
 cap-std = { version = "4.0.3", optional = true }
-clap = { version = "4.6.6", features = ["env"], optional = true }
-clap_complete = { version = "4.6.9", optional = true }
+clap = { version = "4.6.7", features = ["env"], optional = true }
+clap_complete = { version = "4.6.11", optional = true }
 csv = { version = "1.4.0", optional = true }
 eventsource-stream = "0.2.3"
 futures-util = "0.3.34"
@@ -45,35 +45,35 @@ http = "1.5.0"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 humantime = "2.4.0"
-hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper = { version = "1.12.0", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "tokio"] }
 indexmap = "2.14.2"
 ipnet = "2.12.2"
 mime = "0.3.17"
 percent-encoding = "2.3.2"
-process-wrap = { version = "10.0.0", features = ["tokio1"] }
-rand = "0.10.2"
+process-wrap = { version = "10.0.1", features = ["tokio1"] }
+rand = "0.10.3"
 regex = "1.13.1"
 reqwest = { version = "0.13.5", features = ["json", "query", "socks", "stream"] }
-rustls = "0.23.44"
-rustls-native-certs = "0.8.4"
+rustls = "0.23.46"
+rustls-native-certs = "0.8.5"
 rustls-pemfile = "2.2.0"
 rustls-platform-verifier = "0.7.1"
 same-file = { version = "1.0.6", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["arbitrary_precision", "raw_value"] }
-sha2 = { version = "0.11.0" }
+serde_json = { version = "1.0.154", features = ["arbitrary_precision", "raw_value"] }
+sha2 = { version = "0.11.1" }
 shell-words = "1.1.1"
 tempfile = { version = "3.27.0", optional = true }
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
-tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = "0.26.5"
-tokio-util = { version = "0.7.19", features = ["compat", "rt"] }
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = "0.26.6"
+tokio-util = { version = "0.7.20", features = ["compat", "rt"] }
 tower-service = "0.3.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"], optional = true }
 url = "2.5.8"
-uuid = { version = "1.26.1", features = ["v4", "serde"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
 which = "8.0.6"
 yaml_serde = "0.10.7"
 
@@ -83,4 +83,4 @@ socket2 = "0.6.5"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target."cfg(unix)".dependencies]
-libc = "0.2.189"
+libc = "0.2.191"
