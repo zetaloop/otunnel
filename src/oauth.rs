@@ -397,6 +397,7 @@ pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
         headers: protocol::wire_headers(&resource.headers, false),
         status: resource.status,
         kind: "oauth_discovery_response",
+        timing: None,
     })
 }
 

@@ -17,6 +17,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +50,7 @@ struct Pending {
 struct Frame {
     message: Json,
     observation: Option<Arc<Mutex<Receipt>>>,
-    written: Option<oneshot::Sender<Result<()>>>,
+    written: Option<oneshot::Sender<Result<Instant>>>,
 }
 #[derive(Default)]
 struct Lifecycle {
@@ -112,6 +113,7 @@ impl Pipe {
                     continue;
                 }
                 *output.writing.lock().expect("write mutex poisoned") = frame.observation.clone();
+                let started = Instant::now();
                 let written = async {
                     writer.write_all(frame.message.get().as_bytes()).await?;
                     writer.write_all(b"\n").await?;
@@ -141,7 +143,7 @@ impl Pipe {
                     }
                 }
                 if let Some(ack) = frame.written {
-                    let _ = ack.send(Ok(()));
+                    let _ = ack.send(Ok(started));
                 }
             }
         });
@@ -301,7 +303,7 @@ impl Pipe {
             state: self.state.clone(),
             deadline: request.deadline,
         };
-        self.state.write(request.message, observation).await?;
+        let started = self.state.write(request.message, observation).await?;
         while let Some(message) = receiver.recv().await {
             let response = view(&message)?;
             let terminal = response.method.is_none();
@@ -342,8 +344,11 @@ impl Pipe {
                     }
                 }
             }
+            let completed = Instant::now();
             let mut reply = Reply::json(message);
-            if !terminal {
+            if terminal {
+                reply = reply.timed("stdio", started, completed);
+            } else {
                 reply.kind = "jsonrpc_notify";
             }
             sink.send(reply).await?;
@@ -356,7 +361,11 @@ impl Pipe {
 }
 
 impl State {
-    async fn write(&self, message: Json, observation: Option<Arc<Mutex<Receipt>>>) -> Result<()> {
+    async fn write(
+        &self,
+        message: Json,
+        observation: Option<Arc<Mutex<Receipt>>>,
+    ) -> Result<Instant> {
         let (sender, receiver) = oneshot::channel();
         self.writer
             .send(Frame {

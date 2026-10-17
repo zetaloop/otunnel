@@ -3,6 +3,7 @@ use std::{fmt, io};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, value::to_raw_value};
+use tokio::time::Instant;
 
 use crate::protocol::{self, Reply, Request};
 
@@ -102,7 +103,11 @@ impl Failure {
         result
     }
 
-    pub async fn response(request: &Request, mut response: crate::net::Response) -> Result<Reply> {
+    pub async fn response(
+        request: &Request,
+        mut response: crate::net::Response,
+        started: Instant,
+    ) -> Result<Reply> {
         use futures_util::StreamExt;
         let status = response.status.as_u16();
         let headers = protocol::wire_headers(&response.headers, true);
@@ -146,8 +151,13 @@ impl Failure {
                     })
             })
         });
+        let completed = Instant::now();
         let mut reply = if failure.is_none() && valid {
-            let mut reply = Reply::json(parsed.expect("validated MCP error"));
+            let mut reply = Reply::json(parsed.expect("validated MCP error")).timed(
+                "streamable_http",
+                started,
+                completed,
+            );
             reply.status = status;
             reply
         } else {

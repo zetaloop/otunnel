@@ -203,6 +203,13 @@ impl Request {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ResponseTiming {
+    pub version: u8,
+    pub transport: &'static str,
+    pub target_elapsed_us: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct Reply {
     #[serde(rename = "resp_json", skip_serializing_if = "Option::is_none")]
     pub message: Option<Json>,
@@ -212,6 +219,8 @@ pub struct Reply {
     pub status: u16,
     #[serde(rename = "resp_type")]
     pub kind: &'static str,
+    #[serde(rename = "resp_timing", skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ResponseTiming>,
 }
 impl Reply {
     pub fn json(message: Json) -> Self {
@@ -220,6 +229,7 @@ impl Reply {
             headers: BTreeMap::from([("Content-Type".into(), vec!["application/json".into()])]),
             status: 200,
             kind: "jsonrpc_response",
+            timing: None,
         }
     }
     pub fn ack(status: u16, kind: &'static str) -> Self {
@@ -228,7 +238,36 @@ impl Reply {
             headers: BTreeMap::new(),
             status,
             kind,
+            timing: None,
         }
+    }
+    pub(crate) fn timed(
+        mut self,
+        transport: &'static str,
+        started: tokio::time::Instant,
+        completed: tokio::time::Instant,
+    ) -> Self {
+        let valid = self.kind == "jsonrpc_response"
+            && matches!(transport, "stdio" | "streamable_http")
+            && self.message.as_deref().is_some_and(|message| {
+                view(message).is_ok_and(|view| view.id.is_some())
+                    && field(message, "method").is_none()
+                    && field(message, "jsonrpc").is_some_and(|value| {
+                        serde_json::from_str::<String>(value.get())
+                            .is_ok_and(|value| value == "2.0")
+                    })
+            });
+        if valid
+            && let Some(elapsed) = completed.checked_duration_since(started)
+            && elapsed <= Duration::from_secs(24 * 60 * 60)
+        {
+            self.timing = Some(ResponseTiming {
+                version: 1,
+                transport,
+                target_elapsed_us: elapsed.as_micros() as u64,
+            });
+        }
+        self
     }
     pub fn terminal(&self) -> bool {
         self.kind != "jsonrpc_notify"

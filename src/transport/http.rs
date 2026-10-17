@@ -13,6 +13,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use http::{HeaderMap, Method};
 use serde_json::{json, value::RawValue};
+use tokio::time::Instant;
 use url::Url;
 
 use super::{Failure, Sink, Transport};
@@ -211,6 +212,7 @@ impl Transport for HttpTransport {
                 headers.insert("mcp-name", name.parse()?);
             }
         }
+        let started = Instant::now();
         let mut response = self
             .send(
                 Method::POST,
@@ -223,7 +225,7 @@ impl Transport for HttpTransport {
             .await?;
         if !response.status.is_success() {
             return sink
-                .send(Failure::response(&request, response).await?)
+                .send(Failure::response(&request, response, started).await?)
                 .await;
         }
         let Some(id) = id else {
@@ -263,9 +265,14 @@ impl Transport for HttpTransport {
                                 != protocol::field(message, "result").is_some())
                     })
                 });
+                let completed = Instant::now();
                 let mut reply = if valid {
                     self.observe(&request, message.as_ref().expect("validated response"))?;
-                    Reply::json(message.expect("validated response"))
+                    Reply::json(message.expect("validated response")).timed(
+                        "streamable_http",
+                        started,
+                        completed,
+                    )
                 } else {
                     Failure::protocol(0, "invalid_protocol_response").reply(&request)?
                 };
@@ -303,6 +310,7 @@ impl Transport for HttpTransport {
                 }
                 let message = RawValue::from_string(event.data)?;
                 let envelope = view(&message)?;
+                let completed = Instant::now();
                 if envelope.method.is_some() && envelope.id.is_some() {
                     let response = Request::new(
                         json!({"jsonrpc":"2.0","id":envelope.id,"error":{"code":-32601,"message":"Client capability is unavailable"}}),
@@ -335,7 +343,9 @@ impl Transport for HttpTransport {
                         .headers
                         .insert("Last-Event-ID".into(), vec![last.clone()]);
                 }
-                if !terminal {
+                if terminal {
+                    reply = reply.timed("streamable_http", started, completed);
+                } else {
                     reply.kind = "jsonrpc_notify";
                 }
                 sink.send(reply).await?;
