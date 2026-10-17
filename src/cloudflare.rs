@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::{
     config::{Cloudflared, resolve},
-    control::Control,
+    control::{Control, StatusError},
     net::{Http, Options},
     process::Process,
     runtime::Snapshot,
@@ -33,7 +33,17 @@ impl Companion {
         } else if config.managed {
             control
                 .cloudflare()
-                .await?
+                .await
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<StatusError>()
+                        .is_some_and(|error| error.status == 404)
+                    {
+                        anyhow::anyhow!("cloudflared: managed runtime credentials request returned HTTP 404; verify that this tunnel was created with managed Cloudflare provisioning, or disable --cloudflared.managed (or CLOUDFLARED_MANAGED)")
+                    } else {
+                        error
+                    }
+                })?
                 .get("runtime_token")
                 .and_then(Value::as_str)
                 .context("Cloudflare runtime response has no token")?
