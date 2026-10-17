@@ -254,14 +254,7 @@ impl Manager {
         let profile = self.remote(&options.create.remote, &previous.admin_profile)?;
         let mut remote_error = String::new();
         let tunnel = if !options.tunnel_id.trim().is_empty() {
-            let id = options.tunnel_id.trim();
-            anyhow::ensure!(
-                id.strip_prefix("tunnel_").is_some_and(|id| id.len() == 32
-                    && id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())),
-                "tunnel ID must match tunnel_<32 lowercase letters or digits>"
-            );
+            let id = crate::config::tunnel_id(&options.tunnel_id)?;
             match async { client(&profile, &key)?.get(id).await }.await {
                 Ok(tunnel) => tunnel,
                 Err(error) => {

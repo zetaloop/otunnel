@@ -115,7 +115,7 @@ impl Control {
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("control plane URL cannot contain path segments"))?
             .pop_if_empty()
-            .push(&cp.tunnel_id);
+            .push(config::tunnel_id(&cp.tunnel_id)?);
         url.set_query(None);
         url.set_fragment(None);
         let http = Http::new(

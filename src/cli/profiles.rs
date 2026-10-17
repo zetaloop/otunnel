@@ -355,16 +355,7 @@ fn generate(name: &str, mut values: Values) -> Result<String> {
         !values.browser,
         "admin_ui.open_browser must retain its default in otunnel"
     );
-    anyhow::ensure!(
-        values
-            .tunnel
-            .strip_prefix("tunnel_")
-            .is_some_and(|id| id.len() == 32
-                && id
-                    .bytes()
-                    .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit())),
-        "tunnel ID must match tunnel_<32 lowercase letters or digits>"
-    );
+    values.tunnel = config::tunnel_id(&values.tunnel)?.into();
     url::Url::parse(&values.base)?;
     anyhow::ensure!(
         values

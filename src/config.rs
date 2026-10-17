@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -239,18 +240,7 @@ impl Config {
                 .is_none_or(|version| matches!(version, 1 | 2)),
             "unsupported config_version"
         );
-        anyhow::ensure!(
-            self.control_plane
-                .tunnel_id
-                .strip_prefix("tunnel_")
-                .is_some_and(|id| {
-                    id.len() == 32
-                        && id
-                            .bytes()
-                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-                }),
-            "invalid tunnel ID: expected tunnel_<32 lowercase letters or digits>"
-        );
+        tunnel_id(&self.control_plane.tunnel_id)?;
         let api_key =
             reference::resolve_named("control_plane.api_key", &self.control_plane.api_key)?;
         anyhow::ensure!(
@@ -680,6 +670,18 @@ pub(crate) fn endpoint(base: &url::Url, prefix: &str, route: &str) -> Result<url
         .clear()
         .extend(segments);
     Ok(result)
+}
+
+pub fn tunnel_id(id: &str) -> Result<&str> {
+    static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^tunnel_([a-z0-9]{4}_)?[a-z0-9]{32}$").expect("valid tunnel ID pattern")
+    });
+    let id = id.trim();
+    anyhow::ensure!(
+        PATTERN.is_match(id),
+        "invalid tunnel ID: expected tunnel_<32 lowercase letters or digits> or tunnel_<namespace>_<32 lowercase letters or digits>, with a namespace of exactly 4 lowercase letters or digits"
+    );
+    Ok(id)
 }
 
 pub fn main_channel() -> String {

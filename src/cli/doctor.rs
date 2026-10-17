@@ -177,7 +177,7 @@ fn output(
             ),
             "tunnel_id" => (
                 "The tunnel ID identifies the control-plane connection.",
-                "Set --control-plane.tunnel-id to the ID of the configured tunnel.",
+                "Set --control-plane.tunnel-id to the complete ID returned by the service, including its namespace when present.",
             ),
             "control_plane_api_key" => (
                 "The runtime key is used to poll the tunnel and return results.",
