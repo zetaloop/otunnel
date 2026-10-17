@@ -209,15 +209,33 @@ impl Tunnel {
                 .send_initialized_notification(self.config.mcp.stdio_send_initialized_notification);
             self.bindings.insert(channel, Arc::new(pipe));
         }
-        self.state.send_modify(|state| {
-            state.evidence = self
-                .bindings
-                .iter()
-                .filter_map(|(name, binding)| {
-                    binding.observation().map(|value| (name.clone(), value))
-                })
-                .collect();
-        });
+        for (name, binding) in &self.bindings {
+            if let Some(mut observation) = binding.observation() {
+                self.state.send_modify(|state| {
+                    state
+                        .evidence
+                        .insert(name.clone(), observation.borrow_and_update().clone());
+                });
+                let name = name.clone();
+                let state = self.state.clone();
+                let stop = self.stop.clone();
+                self.observers.spawn(async move {
+                    loop {
+                        tokio::select! {
+                            changed = observation.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                state.send_modify(|state| {
+                                    state.evidence.insert(name.clone(), observation.borrow_and_update().clone());
+                                });
+                            }
+                            () = stop.cancelled() => return,
+                        }
+                    }
+                });
+            }
+        }
         if self.config.enabled("harpoon") && !self.bindings.contains_key("harpoon") {
             self.bindings.insert("harpoon".into(), self.harpoon.clone());
             if !self.harpoon.is_empty() {
@@ -463,10 +481,10 @@ impl Tunnel {
                         let deadline = protocol::timeout(&command.response_timeout).and_then(|duration| received.checked_add(duration));
                         let result = if deadline.is_some_and(|deadline| deadline <= Instant::now()) { Ok(false) }
                             else if let Some(deadline) = deadline {
-                                match timeout_at(deadline, execute(&control, &bindings, command, ttl)).await {
+                                match timeout_at(deadline, execute(&control, &bindings, command, ttl, Some(deadline))).await {
                                     Ok(result) => result.map(|()| true), Err(_) => Ok(false),
                                 }
-                            } else { execute(&control, &bindings, command, ttl).await.map(|()| true) };
+                            } else { execute(&control, &bindings, command, ttl, None).await.map(|()| true) };
                         (id, result)
                     });
                 }
@@ -503,7 +521,6 @@ impl Tunnel {
                     result = requests.join_next(), if !requests.is_empty() => {
                         let (id, result) = result.context("request worker stopped")??;
                         self.state.send_modify(|state| {
-                            state.evidence = bindings.iter().filter_map(|(name, binding)| binding.observation().map(|value| (name.clone(), value))).collect();
                             state.in_flight = requests.len() + queued.len();
                             state.activity.active.remove(&id);
                             state.activity.last_completion = crate::control::now();
@@ -583,6 +600,7 @@ async fn execute(
     bindings: &BTreeMap<String, Arc<dyn Transport>>,
     command: Command,
     ttl: Option<Duration>,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     if !matches!(
         command.command_type.as_str(),
@@ -613,6 +631,7 @@ async fn execute(
                     discovery: false,
                     message: command.jsonrpc.context("JSON-RPC command has no payload")?,
                     headers,
+                    deadline,
                 };
                 let id = protocol::view(&request.message)?.id;
                 let mut reply = Reply::json(serde_json::value::to_raw_value(&serde_json::json!({
@@ -641,6 +660,7 @@ async fn execute(
                 discovery: false,
                 message: command.jsonrpc.context("JSON-RPC command has no payload")?,
                 headers,
+                deadline,
             };
             let forward = binding.forward(request.clone(), &delivery);
             let outcome = match ttl {

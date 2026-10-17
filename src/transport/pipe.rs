@@ -15,7 +15,7 @@ use serde_json::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -26,8 +26,21 @@ use super::{
 };
 use crate::protocol::{self, Json, Reply, Request, field, replace, view};
 
+enum Event {
+    Response(Json),
+    ToolsChanged,
+    Cancelled(&'static str),
+}
+
+#[derive(Default)]
+struct Receipt {
+    token: Option<Token>,
+    written: bool,
+    events: Vec<Event>,
+}
+
 struct Pending {
-    observation: Option<Token>,
+    observation: Option<Arc<Mutex<Receipt>>>,
     scope: String,
     original: Json,
     progress: Option<Json>,
@@ -35,6 +48,7 @@ struct Pending {
 }
 struct Frame {
     message: Json,
+    observation: Option<Arc<Mutex<Receipt>>>,
     written: Option<oneshot::Sender<Result<()>>>,
 }
 #[derive(Default)]
@@ -45,7 +59,9 @@ struct Lifecycle {
 }
 struct State {
     observation: Mutex<Observation>,
+    evidence: watch::Sender<serde_json::Value>,
     pending: Mutex<BTreeMap<u64, Pending>>,
+    writing: Mutex<Option<Arc<Mutex<Receipt>>>>,
     writer: mpsc::UnboundedSender<Frame>,
     next: AtomicU64,
     error: Mutex<Option<String>>,
@@ -68,9 +84,13 @@ impl Pipe {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (sender, mut receiver) = mpsc::unbounded_channel::<Frame>();
+        let observation = Observation::new();
+        let (evidence, _) = watch::channel(observation.snapshot());
         let state = Arc::new(State {
-            observation: Mutex::new(Observation::new()),
+            observation: Mutex::new(observation),
+            evidence,
             pending: Mutex::new(BTreeMap::new()),
+            writing: Mutex::new(None),
             writer: sender,
             next: AtomicU64::new(1),
             error: Mutex::new(None),
@@ -91,6 +111,7 @@ impl Pipe {
                 {
                     continue;
                 }
+                *output.writing.lock().expect("write mutex poisoned") = frame.observation.clone();
                 let written = async {
                     writer.write_all(frame.message.get().as_bytes()).await?;
                     writer.write_all(b"\n").await?;
@@ -101,11 +122,23 @@ impl Pipe {
                     () = output.stop.cancelled() => break,
                 };
                 if let Err(error) = result {
-                    output.fail(&error);
+                    output.fail(&error, "stdio_write_failed");
                     if let Some(ack) = frame.written {
                         let _ = ack.send(Err(error.into()));
                     }
                     break;
+                }
+                {
+                    let mut writing = output.writing.lock().expect("write mutex poisoned");
+                    if let Some(receipt) = writing.take() {
+                        let mut receipt = receipt.lock().expect("receipt mutex poisoned");
+                        receipt.token =
+                            output.observe(|observation| observation.begin(&frame.message));
+                        receipt.written = true;
+                        for event in std::mem::take(&mut receipt.events) {
+                            output.event(&mut receipt, event);
+                        }
+                    }
                 }
                 if let Some(ack) = frame.written {
                     let _ = ack.send(Ok(()));
@@ -129,7 +162,7 @@ impl Pipe {
             }
             .await;
             if let Err(error) = result {
-                input.fail(&error);
+                input.fail(&error, "stdio_read_failed");
             }
             input
                 .pending
@@ -227,7 +260,7 @@ impl Pipe {
                     return sink.send(Reply::ack(202, "notify_ack")).await;
                 }
             }
-            self.state.write(request.message).await?;
+            self.state.write(request.message, None).await?;
             return sink.send(Reply::ack(202, "notify_ack")).await;
         };
         let alias = self.state.next.fetch_add(1, Ordering::Relaxed);
@@ -243,6 +276,11 @@ impl Pipe {
                 &to_raw_value(&alias)?,
             )?;
         }
+        let observation = matches!(
+            method.as_deref(),
+            Some("initialize" | "server/discover" | "tools/list")
+        )
+        .then(|| Arc::new(Mutex::new(Receipt::default())));
         let (sender, mut receiver) = mpsc::unbounded_channel();
         self.state
             .pending
@@ -251,12 +289,7 @@ impl Pipe {
             .insert(
                 alias,
                 Pending {
-                    observation: self
-                        .state
-                        .observation
-                        .lock()
-                        .expect("observation mutex poisoned")
-                        .begin(&request.message),
+                    observation: observation.clone(),
                     scope,
                     original: id,
                     progress,
@@ -266,8 +299,9 @@ impl Pipe {
         let _request = Lease {
             alias,
             state: self.state.clone(),
+            deadline: request.deadline,
         };
-        self.state.write(request.message).await?;
+        self.state.write(request.message, observation).await?;
         while let Some(message) = receiver.recv().await {
             let response = view(&message)?;
             let terminal = response.method.is_none();
@@ -281,9 +315,12 @@ impl Pipe {
                     };
                     if send_initialized {
                         self.state
-                            .write(to_raw_value(
-                                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-                            )?)
+                            .write(
+                                to_raw_value(
+                                    &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                                )?,
+                                None,
+                            )
                             .await?;
                         let mut lifecycle =
                             self.lifecycle.lock().expect("lifecycle mutex poisoned");
@@ -319,21 +356,34 @@ impl Pipe {
 }
 
 impl State {
-    async fn write(&self, message: Json) -> Result<()> {
+    async fn write(&self, message: Json, observation: Option<Arc<Mutex<Receipt>>>) -> Result<()> {
         let (sender, receiver) = oneshot::channel();
         self.writer
             .send(Frame {
                 message,
+                observation,
                 written: Some(sender),
             })
             .map_err(|_| anyhow::anyhow!("MCP stdin closed"))?;
         receiver.await.context("MCP writer stopped")?
     }
-    fn fail(&self, error: &dyn std::fmt::Display) {
-        self.observation
-            .lock()
-            .expect("observation mutex poisoned")
-            .closed();
+
+    fn observe<T>(&self, update: impl FnOnce(&mut Observation) -> T) -> T {
+        let mut observation = self.observation.lock().expect("observation mutex poisoned");
+        let result = update(&mut observation);
+        let snapshot = observation.snapshot();
+        self.evidence.send_if_modified(|evidence| {
+            if *evidence == snapshot {
+                return false;
+            }
+            *evidence = snapshot;
+            true
+        });
+        result
+    }
+
+    fn fail(&self, error: &dyn std::fmt::Display, reason: &str) {
+        self.observe(|observation| observation.closed(reason));
         *self.error.lock().expect("error mutex poisoned") = Some(error.to_string());
         self.stop.cancel();
     }
@@ -351,10 +401,19 @@ impl State {
                 self.writer
                     .send(Frame {
                         message: response,
+                        observation: None,
                         written: None,
                     })
                     .map_err(|_| anyhow::anyhow!("MCP stdin closed"))?;
                 return Ok(());
+            }
+            if method == "notifications/tools/list_changed" {
+                let writing = self.writing.lock().expect("write mutex poisoned").clone();
+                if let Some(receipt) = writing {
+                    self.record(&receipt, Event::ToolsChanged);
+                } else {
+                    self.observe(Observation::list_changed);
+                }
             }
             let pending = self.pending.lock().expect("routing mutex poisoned");
             let subscription = field(&message, "params")
@@ -397,11 +456,8 @@ impl State {
                 .expect("routing mutex poisoned")
                 .remove(&alias)
             {
-                if let Some(token) = call.observation {
-                    self.observation
-                        .lock()
-                        .expect("observation mutex poisoned")
-                        .receive(token, &message);
+                if let Some(receipt) = call.observation {
+                    self.record(&receipt, Event::Response(message.clone()));
                 }
                 let mut message = replace(&message, &["id"], &call.original)?;
                 if field(&message, "result")
@@ -422,18 +478,46 @@ impl State {
         }
         Ok(())
     }
-    fn cancel(&self, alias: u64) {
-        if self
+    fn record(&self, receipt: &Mutex<Receipt>, event: Event) {
+        let mut receipt = receipt.lock().expect("receipt mutex poisoned");
+        if receipt.written {
+            self.event(&mut receipt, event);
+        } else {
+            receipt.events.push(event);
+        }
+    }
+
+    fn event(&self, receipt: &mut Receipt, event: Event) {
+        match event {
+            Event::Response(message) => {
+                if let Some(token) = receipt.token.take() {
+                    self.observe(|observation| observation.receive(token, &message));
+                }
+            }
+            Event::ToolsChanged => self.observe(Observation::list_changed),
+            Event::Cancelled(reason) => {
+                if let Some(token) = receipt.token.take() {
+                    self.observe(|observation| observation.failed(token, reason, false));
+                }
+            }
+        }
+    }
+
+    fn cancel(&self, alias: u64, reason: &'static str) {
+        if let Some(call) = self
             .pending
             .lock()
             .expect("routing mutex poisoned")
             .remove(&alias)
-            .is_some()
         {
+            if let Some(receipt) = call.observation {
+                self.record(&receipt, Event::Cancelled(reason));
+            }
             let message = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":alias,"reason":"Request ended"}});
             if let Ok(message) = to_raw_value(&message) {
                 let _ = self.writer.send(Frame {
                     message,
+                    observation: None,
                     written: None,
                 });
             }
@@ -444,14 +528,27 @@ impl State {
 struct Lease {
     alias: u64,
     state: Arc<State>,
+    deadline: Option<tokio::time::Instant>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.state.cancel(self.alias);
+        self.state.cancel(
+            self.alias,
+            if self
+                .deadline
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+            {
+                "discovery_response_deadline"
+            } else {
+                "discovery_cancelled"
+            },
+        );
     }
 }
 impl Drop for Pipe {
     fn drop(&mut self) {
+        self.state
+            .observe(|observation| observation.closed("stdio_connection_closed"));
         self.state.stop.cancel();
     }
 }
@@ -505,11 +602,13 @@ impl Transport for Pipe {
             .map(|(alias, _)| *alias)
             .collect();
         for alias in aliases {
-            self.state.cancel(alias);
+            self.state.cancel(alias, "discovery_cancelled");
         }
         Ok(Reply::ack(204, "session_termination_response"))
     }
     async fn close(&self) -> Result<()> {
+        self.state
+            .observe(|observation| observation.closed("stdio_connection_closed"));
         self.state.stop.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock().expect("task mutex poisoned"));
         for task in tasks {
@@ -534,14 +633,8 @@ impl Transport for Pipe {
     fn stateless(&self) -> bool {
         self.stateless.load(Ordering::Acquire)
     }
-    fn observation(&self) -> Option<serde_json::Value> {
-        Some(
-            self.state
-                .observation
-                .lock()
-                .expect("observation mutex poisoned")
-                .snapshot(),
-        )
+    fn observation(&self) -> Option<watch::Receiver<serde_json::Value>> {
+        Some(self.state.evidence.subscribe())
     }
     fn startup_probe(&self) -> bool {
         false

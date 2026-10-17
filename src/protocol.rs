@@ -176,6 +176,7 @@ pub struct Request {
     pub message: Json,
     pub headers: HeaderMap,
     pub discovery: bool,
+    pub deadline: Option<tokio::time::Instant>,
 }
 impl Request {
     pub fn new(value: Value) -> Result<Self> {
@@ -183,6 +184,7 @@ impl Request {
             message: to_raw_value(&value)?,
             headers: HeaderMap::new(),
             discovery: false,
+            deadline: None,
         })
     }
     pub fn scope(&self) -> String {
@@ -412,13 +414,24 @@ pub fn version(message: &RawValue) -> Option<String> {
 }
 
 pub fn self_contained(message: &RawValue) -> bool {
-    let Some(version) = version(message) else {
-        return false;
-    };
-    valid_date(&version) && version.as_str() >= MCP_VERSION && validate_meta(message).is_ok()
+    self_contained_version(message).is_some()
 }
 
-fn valid_date(value: &str) -> bool {
+pub(crate) fn self_contained_version(message: &RawValue) -> Option<String> {
+    let version = version(message)?;
+    if !valid_date(&version) || version.as_str() < MCP_VERSION {
+        return None;
+    }
+    let capabilities = field(message, "params")
+        .and_then(|params| field(&params, "_meta"))
+        .and_then(|meta| field(&meta, "io.modelcontextprotocol/clientCapabilities"))?;
+    serde_json::from_str::<Value>(capabilities.get())
+        .ok()?
+        .as_object()?;
+    Some(version)
+}
+
+pub(crate) fn valid_date(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return false;
@@ -426,7 +439,7 @@ fn valid_date(value: &str) -> bool {
     let number = |range: std::ops::Range<usize>| {
         bytes[range].iter().try_fold(0u16, |value, byte| {
             byte.is_ascii_digit()
-                .then_some(value * 10 + u16::from(byte - b'0'))
+                .then(|| value * 10 + u16::from(byte - b'0'))
         })
     };
     let Some(year) = number(0..4) else {
