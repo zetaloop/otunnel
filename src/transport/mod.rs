@@ -32,7 +32,7 @@ pub trait Transport: Send + Sync {
     async fn terminate(&self, _headers: HeaderMap, _discovery: bool) -> Result<Reply> {
         Ok(Reply::ack(405, "session_termination_response"))
     }
-    async fn discover(&self) -> Result<Reply> {
+    async fn discover(&self, _headers: HeaderMap, _startup: bool) -> Result<Reply> {
         Ok(Reply::ack(404, "oauth_discovery_response"))
     }
     async fn close(&self) -> Result<()> {
@@ -97,7 +97,7 @@ pub(crate) async fn negotiate(transport: &dyn Transport) -> Result<(Reply, bool)
     let mut request = protocol::request("server/discover", json!({}), true)?;
     request.discovery = true;
     let reply = exchange(transport, request).await?;
-    if reply.status == 401 || reply.status == 403 {
+    if matches!(reply.status, 401 | 403 | 429 | 500..=599) {
         return Ok((reply, false));
     }
     if let Some(message) = &reply.message {
@@ -135,11 +135,9 @@ pub async fn probe(transport: &dyn Transport, list_tools: bool) -> Result<Probe>
     if probe.authentication_required {
         return Ok(probe);
     }
-    anyhow::ensure!(
-        reply.status < 400,
-        "MCP discovery returned HTTP {}",
-        reply.status
-    );
+    if reply.status >= 400 {
+        return Err(crate::control::StatusError::new(reply.status, "MCP discovery").into());
+    }
     let message = reply
         .message
         .context("MCP discovery returned an empty response")?;

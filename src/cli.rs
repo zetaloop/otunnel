@@ -193,6 +193,13 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "Maximum active requests per MCP channel",
     ),
     (
+        "mcp.oauth-discovery",
+        "MCP_OAUTH_DISCOVERY",
+        "/mcp/oauth_discovery",
+        Text,
+        "OAuth discovery: auto or disabled",
+    ),
+    (
         "mcp.oauth-trusted-origin",
         "MCP_OAUTH_TRUSTED_ORIGINS",
         "/mcp/oauth_trusted_origins",
@@ -686,6 +693,9 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                     if overridden(name) {
                         headers.clear();
                     }
+                }
+                if overridden("mcp.oauth-discovery") {
+                    config.mcp.oauth_discovery = "auto".into();
                 }
                 if overridden("mcp.oauth-trusted-origin") {
                     config.mcp.oauth_trusted_origins.clear();

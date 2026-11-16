@@ -221,17 +221,16 @@ fn components(monitor: &Monitor, state: &Snapshot) -> BTreeMap<&'static str, Val
             match oauth.state {
                 "not_advertised" => "metadata_not_advertised",
                 "failed" => "discovery_failed",
+                "disabled" if config.mcp.oauth_discovery == "disabled" => {
+                    "disabled_by_configuration"
+                }
                 _ => "",
             },
             oauth.observed_at.unwrap_or_default(),
             json!({"discovery_complete":!matches!(oauth.state,"pending"|"disabled")}),
         ),
     );
-    let catalog = match oauth.state {
-        "pending" => "pending",
-        "failed" => "failed",
-        _ => "settled",
-    };
+    let catalog = state.catalog.state;
     components.insert(
         "harpoon",
         component(
@@ -246,7 +245,7 @@ fn components(monitor: &Monitor, state: &Snapshot) -> BTreeMap<&'static str, Val
             } else {
                 ""
             },
-            oauth.observed_at.unwrap_or_default(),
+            state.catalog.observed_at.unwrap_or_default(),
             json!({"target_count":monitor.harpoon.len(),"catalog_state":catalog}),
         ),
     );

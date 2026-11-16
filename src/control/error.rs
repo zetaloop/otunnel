@@ -11,7 +11,7 @@ pub struct StatusError {
 }
 
 impl StatusError {
-    pub(super) fn new(status: u16, operation: &'static str) -> Self {
+    pub(crate) fn new(status: u16, operation: &'static str) -> Self {
         Self {
             status,
             operation,

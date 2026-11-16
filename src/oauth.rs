@@ -31,6 +31,36 @@ impl std::error::Error for DiscoveryError {
     }
 }
 
+#[derive(Default)]
+struct Failures {
+    timeout: bool,
+    response: bool,
+    permanent: bool,
+}
+impl Failures {
+    fn record(&mut self, status: u16, error: &anyhow::Error, invalid: bool) {
+        if timed_out(error) {
+            self.timeout = true;
+        } else if status == 404 {
+        } else if matches!(status, 429 | 500..=599)
+            || invalid && (200..300).contains(&status)
+            || error
+                .downcast_ref::<DiscoveryError>()
+                .is_some_and(|error| error.retry)
+        {
+            self.response = true;
+        } else {
+            self.permanent = true;
+        }
+    }
+    fn retry(&self) -> bool {
+        !self.permanent && (self.timeout || self.response)
+    }
+    fn timeout_only(&self) -> bool {
+        self.timeout && !self.permanent && !self.response
+    }
+}
+
 struct Document {
     url: Url,
     value: Value,
@@ -274,8 +304,8 @@ async fn request_document(transport: &HttpTransport, url: &Url, retry: bool) -> 
             Err(error) if retry && attempt < 2 && timed_out(&error) => continue,
             result => result?,
         };
+        let status = response.status.as_u16();
         let read = async {
-            let status = response.status.as_u16();
             let headers = response.headers.clone();
             let mut body = BytesMut::new();
             while let Some(chunk) = response.body.next().await {
@@ -295,16 +325,41 @@ async fn request_document(transport: &HttpTransport, url: &Url, retry: bool) -> 
             })
         };
         return match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, read).await?,
+            Some(deadline) => tokio::time::timeout_at(deadline, read)
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
             None => read.await,
-        };
+        }
+        .map_err(|error| {
+            let mut failures = Failures::default();
+            failures.record(status, &error, true);
+            DiscoveryError {
+                optional: false,
+                retry: failures.retry(),
+                error,
+            }
+            .into()
+        });
     }
     unreachable!()
 }
 
-pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
+pub(crate) async fn discover(
+    transport: &HttpTransport,
+    _headers: HeaderMap,
+    startup: bool,
+) -> Result<Reply> {
     let (candidates, advertised) = discovery_candidates(transport).await;
     let resource = fetch_resource(transport, candidates, advertised).await?;
+    if startup && matches!(resource.status, 429 | 500..=599) {
+        return Err(DiscoveryError {
+            optional: false,
+            retry: true,
+            error: anyhow::anyhow!("OAuth discovery returned HTTP {}", resource.status),
+        }
+        .into());
+    }
     if transport.harpoon.is_some() {
         let group = auth_group(&resource.url);
         let resource_url = resource
@@ -375,6 +430,13 @@ pub(crate) async fn discover(transport: &HttpTransport) -> Result<Reply> {
                     }
                 }
                 Err(error) => {
+                    if startup
+                        && error
+                            .downcast_ref::<DiscoveryError>()
+                            .is_some_and(|error| error.retry)
+                    {
+                        return Err(error);
+                    }
                     tracing::warn!(channel = %transport.channel, %error, "OAuth authorization server discovery failed")
                 }
             }
@@ -457,21 +519,22 @@ async fn fetch_resource(
     let count = candidates.len();
     for retry in [false, true] {
         let mut missing = count > 0 && !advertised;
-        let mut timeouts = count > 0;
+        let mut failures = Failures::default();
         let mut failure = anyhow::anyhow!("OAuth discovery has no metadata candidates");
         for (index, url) in candidates.iter().enumerate() {
             let fetched = match request_document(transport, url, retry).await {
                 Ok(fetched) => fetched,
                 Err(error) => {
                     missing = false;
-                    timeouts &= timed_out(&error);
+                    failures.record(0, &error, false);
                     failure = error.context(format!("OAuth discovery GET {url}"));
                     continue;
                 }
             };
             missing &= fetched.status == 404;
-            timeouts = false;
-            let next = matches!(fetched.status, 404 | 500..=599) && index + 1 < count;
+            let status = fetched.status;
+            let invalid = !fetched.too_large;
+            let next = matches!(status, 404 | 500..=599) && index + 1 < count;
             let result = (|| {
                 anyhow::ensure!(
                     !fetched.too_large,
@@ -514,6 +577,7 @@ async fn fetch_resource(
             match result {
                 Ok(document) => return Ok(document),
                 Err(error) => {
+                    failures.record(status, &error, invalid);
                     failure = error;
                     if !next {
                         break;
@@ -521,10 +585,10 @@ async fn fetch_resource(
                 }
             }
         }
-        if retry || !timeouts {
+        if retry || !failures.timeout_only() {
             return Err(DiscoveryError {
                 optional: missing,
-                retry: timeouts,
+                retry: failures.retry(),
                 error: failure,
             }
             .into());
@@ -554,18 +618,18 @@ async fn fetch_authorization(transport: &HttpTransport, issuer: &str) -> Result<
     for retry in [false, true] {
         let mut fallback = None;
         let mut failure = None;
-        let mut timeouts = !candidates.is_empty();
+        let mut failures = Failures::default();
         for url in &candidates {
             let fetched = match request_document(transport, url, retry).await {
                 Ok(fetched) => fetched,
                 Err(error) => {
-                    timeouts &= timed_out(&error);
+                    failures.record(0, &error, false);
                     failure =
                         Some(error.context(format!("OAuth authorization metadata GET {url}")));
                     continue;
                 }
             };
-            timeouts = false;
+            let status = fetched.status;
             let result = (|| {
                 anyhow::ensure!(
                     fetched.status == 200,
@@ -612,14 +676,22 @@ async fn fetch_authorization(transport: &HttpTransport, issuer: &str) -> Result<
                         fallback = Some(document);
                     }
                 }
-                Err(error) => failure = Some(error),
+                Err(error) => {
+                    failures.record(status, &error, true);
+                    failure = Some(error);
+                }
             }
         }
-        if fallback.is_some() || retry || !timeouts {
+        if fallback.is_some() || retry || !failures.timeout_only() {
             return fallback.ok_or_else(|| {
-                failure.unwrap_or_else(|| {
-                    anyhow::anyhow!("OAuth authorization metadata was not found")
-                })
+                DiscoveryError {
+                    optional: false,
+                    retry: failures.retry(),
+                    error: failure.unwrap_or_else(|| {
+                        anyhow::anyhow!("OAuth authorization metadata was not found")
+                    }),
+                }
+                .into()
             });
         }
     }

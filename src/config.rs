@@ -81,6 +81,10 @@ impl Config {
         let raw = serde_json::to_value(raw)?;
         reference::validate_profile(self, &raw)?;
         self.mcp.oauth_origins()?;
+        anyhow::ensure!(
+            matches!(self.mcp.oauth_discovery.as_str(), "auto" | "disabled"),
+            "mcp.oauth_discovery must be auto or disabled"
+        );
         for target in &self.harpoon.targets {
             if let Some(definition) = &target.template {
                 definition
@@ -213,6 +217,10 @@ impl Config {
         self.scope()?;
         reference::validate_headers(self, true)?;
         self.mcp.oauth_origins()?;
+        anyhow::ensure!(
+            matches!(self.mcp.oauth_discovery.as_str(), "auto" | "disabled"),
+            "mcp.oauth_discovery must be auto or disabled"
+        );
         anyhow::ensure!(
             matches!(self.mcp.stdio_failure_policy.as_str(), "restart" | "exit"),
             "mcp.stdio_failure_policy must be restart or exit"
@@ -356,7 +364,8 @@ impl Config {
                         "harpoon" => anyhow::ensure!(
                             channels.contains("harpoon")
                                 || !self.harpoon.targets.is_empty()
-                                || poll_channels.iter().any(|channel| channel == "main"),
+                                || self.mcp.oauth_discovery != "disabled"
+                                    && poll_channels.iter().any(|channel| channel == "main"),
                             "control-plane.poll-channel harpoon has no routable target"
                         ),
                         _ => anyhow::ensure!(
@@ -509,6 +518,7 @@ settings!(Mcp {
     extra_headers: BTreeMap<String, String> = BTreeMap::new(),
     discovery_extra_headers: BTreeMap<String, String> = BTreeMap::new(),
     oauth_trusted_origins: Vec<String> = Vec::new(),
+    oauth_discovery: String = "auto".into(),
     startup_wait_timeout: Span = Span(Duration::ZERO),
     stdio_failure_policy: String = "restart".into(),
     stdio_send_initialized_notification: bool = false,

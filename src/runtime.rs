@@ -32,6 +32,7 @@ pub struct Snapshot {
     pub ready: bool,
     pub mcp_probe: Startup,
     pub oauth: Startup,
+    pub catalog: Startup,
     pub metadata_error: Option<String>,
     pub connected: bool,
     pub control: crate::control::Observation,
@@ -102,7 +103,8 @@ impl Tunnel {
             } else {
                 Startup::default()
             },
-            oauth: if probe {
+            catalog: Startup::pending(),
+            oauth: if probe && config.mcp.oauth_discovery != "disabled" {
                 Startup::pending()
             } else {
                 Startup::default()
@@ -310,10 +312,20 @@ impl Tunnel {
                                     format!("{error:#}"),
                                 )),
                             }
-                            let result = timeout(Duration::from_secs(5), transport.discover())
-                                .await
-                                .context("OAuth discovery timed out")
-                                .and_then(|result| result);
+                            if self.config.mcp.oauth_discovery == "disabled" {
+                                checks.push(Check::skip(
+                                    id("oauth_metadata"),
+                                    "OAuth discovery disabled by configuration",
+                                ));
+                                continue;
+                            }
+                            let result = timeout(
+                                Duration::from_secs(5),
+                                transport.discover(Default::default(), true),
+                            )
+                            .await
+                            .context("OAuth discovery timed out")
+                            .and_then(|result| result);
                             let check = match result {
                                 Ok(reply) if reply.status == 404 && reply.message.is_none() => {
                                     Check::skip(
@@ -375,25 +387,11 @@ impl Tunnel {
                 result = self.prepare(false) => result?,
             }
             self.observe();
-            if !self.config.mcp.startup_wait_timeout.0.is_zero()
-                && self
-                    .bindings
-                    .get("main")
-                    .is_some_and(|transport| transport.startup_probe())
-            {
-                let mut status = self.state.subscribe();
-                tokio::select! {
-                    result = status.wait_for(|state| state.mcp_probe.state != "pending") => {
-                        result.context("MCP startup probe stopped")?;
-                    }
-                    () = shutdown.cancelled() => return Ok(()),
-                }
-            }
             self.state.send_modify(|state| {
                 state.lifecycle = "running";
                 state.refresh_readiness();
             });
-            tracing::info!(channels = self.bindings.len(), "tunnel connected");
+            tracing::info!(channels = self.bindings.len(), "tunnel process started");
             self.dispatch(&shutdown).await
         }
         .await;
@@ -429,6 +427,13 @@ impl Tunnel {
         let mut queued = std::collections::VecDeque::new();
         let mut requests: JoinSet<(String, Result<bool>)> = JoinSet::new();
         let mut connection = self.control.connection();
+        let mut startup = self.state.subscribe();
+        let wait = !self.config.mcp.startup_wait_timeout.0.is_zero()
+            && bindings
+                .get("main")
+                .is_some_and(|binding| binding.startup_probe());
+        let catalog = self.config.enabled("harpoon");
+        let mut started = false;
         let mut connections = JoinSet::new();
         for (name, binding) in bindings.iter() {
             let binding = binding.clone();
@@ -476,7 +481,12 @@ impl Tunnel {
                     else { state.activity.pressure_seconds += now - state.activity.pressure_started; state.activity.pressure_started = 0.0; }
                     true
                 });
-                if poll.is_none() && !pressure {
+                if !started {
+                    let state = startup.borrow_and_update();
+                    started = (!wait || state.mcp_probe.state != "pending")
+                        && (!catalog || state.catalog.state == "settled");
+                }
+                if started && poll.is_none() && !pressure {
                     self.control.set_channels(channels(&bindings))?;
                     let control = self.control.clone();
                     let limit = capacity - queued.len();
@@ -485,6 +495,7 @@ impl Tunnel {
                 }
                 tokio::select! {
                     () = shutdown.cancelled() => return Ok(()),
+                    changed = startup.changed(), if !started => { changed?; }
                     changed = connection.changed() => {
                         changed?;
                         let observation = connection.borrow_and_update().clone();
@@ -686,7 +697,7 @@ async fn execute(
             let outcome = if command.command_type == "session_termination" {
                 binding.terminate(headers, false).await
             } else {
-                binding.discover().await
+                binding.discover(headers, false).await
             };
             let reply = match outcome {
                 Ok(reply) => reply,

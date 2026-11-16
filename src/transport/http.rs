@@ -32,6 +32,7 @@ pub struct HttpTransport {
     headers: HeaderMap,
     pub(crate) discovery_headers: HeaderMap,
     pub(crate) oauth_origins: Vec<Url>,
+    oauth_enabled: bool,
     pub(crate) harpoon: Option<Arc<crate::harpoon::Harpoon>>,
     stateless: Arc<AtomicBool>,
 }
@@ -78,6 +79,7 @@ impl HttpTransport {
             headers: config::headers(&mcp.extra_headers)?,
             discovery_headers,
             oauth_origins: mcp.oauth_origins()?,
+            oauth_enabled: mcp.oauth_discovery != "disabled",
             harpoon: None,
             stateless: Arc::new(AtomicBool::new(false)),
         })
@@ -185,8 +187,18 @@ impl Transport for HttpTransport {
     fn kind(&self) -> Option<&'static str> {
         Some("streamable_http")
     }
-    async fn discover(&self) -> Result<Reply> {
-        crate::oauth::discover(self).await
+    async fn discover(&self, headers: HeaderMap, startup: bool) -> Result<Reply> {
+        if !self.oauth_enabled {
+            let mut reply = Reply::ack(404, "oauth_discovery_response");
+            reply
+                .headers
+                .insert("Content-Type".into(), vec!["application/json".into()]);
+            reply.message = Some(serde_json::value::to_raw_value(&json!({
+                "error": {"message": "OAuth discovery disabled by configuration", "type": "invalid_request_error", "code": "oauth_discovery_disabled"}
+            }))?);
+            return Ok(reply);
+        }
+        crate::oauth::discover(self, headers, startup).await
     }
     async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
         let id = view(&request.message)?.id.map(RawValue::to_owned);
