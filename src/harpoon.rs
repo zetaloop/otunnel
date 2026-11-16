@@ -65,11 +65,18 @@ pub(crate) struct Target {
     pub template: Option<Arc<crate::template::Template>>,
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct Route {
+    origin: String,
+    socket: Option<String>,
+    direct: bool,
+}
+
 pub struct Harpoon {
     config: config::Harpoon,
     ca_bundle: Option<String>,
     proxy: Option<String>,
-    clients: Mutex<BTreeMap<(String, Option<String>), Http>>,
+    clients: Mutex<BTreeMap<Route, Http>>,
     patterns: Vec<Regex>,
     targets: RwLock<IndexMap<String, Target>>,
     policy_key: [u8; 32],
@@ -133,7 +140,13 @@ impl Harpoon {
             None => config::resolve(&target.url)?,
         };
         let url = Url::parse(&original_url)?;
-        let client = self.client(&url, target.unix_socket.as_deref())?;
+        let client = self.client(
+            &url,
+            target.unix_socket.as_deref(),
+            template
+                .as_ref()
+                .is_some_and(|template| template.loopback_http),
+        )?;
         self.insert(Target {
             info: TargetInfo {
                 label: target.label.trim().into(),
@@ -162,11 +175,12 @@ impl Harpoon {
         })
     }
 
-    pub(crate) fn client(&self, url: &Url, socket: Option<&str>) -> Result<Http> {
-        let key = (
-            url.origin().ascii_serialization(),
-            socket.map(str::to_owned),
-        );
+    pub(crate) fn client(&self, url: &Url, socket: Option<&str>, direct: bool) -> Result<Http> {
+        let key = Route {
+            origin: url.origin().ascii_serialization(),
+            socket: socket.map(str::to_owned),
+            direct,
+        };
         let mut clients = self.clients.lock().expect("HTTP clients mutex poisoned");
         if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
@@ -175,6 +189,7 @@ impl Harpoon {
             url.clone(),
             Options {
                 proxy: self.proxy.as_deref(),
+                direct,
                 ca_bundle: self.ca_bundle.as_deref(),
                 socket,
                 ..Default::default()
@@ -195,7 +210,12 @@ impl Harpoon {
             "Harpoon targets must use HTTP or HTTPS"
         );
         anyhow::ensure!(
-            self.config.allow_plaintext_http || target.url.scheme() == "https",
+            self.config.allow_plaintext_http
+                || target.url.scheme() == "https"
+                || target
+                    .template
+                    .as_ref()
+                    .is_some_and(|template| template.loopback_http),
             "Harpoon target base URL must use https"
         );
         let key = url_key(&target.original_url)?;

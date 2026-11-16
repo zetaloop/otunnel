@@ -193,8 +193,20 @@ impl Checker {
                     ),
                     (source("http-proxy"), config.http_proxy.as_deref()),
                 ]),
-                target.unix_socket.is_some(),
+                target.unix_socket.is_some()
+                    || target
+                        .template
+                        .as_ref()
+                        .is_some_and(|template| template.allow_loopback_http),
             )?;
+            if target
+                .template
+                .as_ref()
+                .is_some_and(|template| template.allow_loopback_http)
+            {
+                targets.last_mut().expect("registered route").summary["proxy_source"] =
+                    json!("ignored");
+            }
         }
         targets.sort_by(|left, right| {
             (left.kind, left.name.as_str()).cmp(&(right.kind, right.name.as_str()))

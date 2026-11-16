@@ -22,6 +22,8 @@ pub use rules::{Header, HeaderRule, HeaderValidation};
 pub struct Definition {
     pub version: u8,
     pub origin: String,
+    #[serde(default)]
+    pub allow_loopback_http: bool,
     pub method: String,
     #[serde(default)]
     pub body_policy: Option<BodyPolicy>,
@@ -566,6 +568,7 @@ pub(crate) struct Template {
     body_policy: Option<CompiledBodyPolicy>,
     operation: Option<String>,
     origin: Url,
+    pub(crate) loopback_http: bool,
     path: Vec<Part>,
     query: BTreeMap<String, Part>,
     parameters: BTreeMap<String, Constraint>,
@@ -593,12 +596,11 @@ impl Template {
                 && definition.origin.len() <= 4096
                 && !definition.origin.contains(['{', '}', '\\', '%', '#'])
                 && text(&definition.origin),
-            "invalid template HTTPS origin"
+            "invalid template origin"
         );
         let origin = Url::parse(&definition.origin)?;
         anyhow::ensure!(
-            origin.scheme() == "https"
-                && origin.host_str().is_some()
+            origin.host_str().is_some()
                 && origin.path() == "/"
                 && origin.query().is_none()
                 && origin.fragment().is_none()
@@ -606,8 +608,30 @@ impl Template {
                 && origin.password().is_none()
                 && !definition.origin.trim_end_matches('/').ends_with(':')
                 && origin.port() != Some(0),
-            "template origin must contain only an HTTPS scheme, host, and optional port"
+            "template origin must contain only a scheme, host, and optional port"
         );
+        if definition.allow_loopback_http {
+            let authority = definition
+                .origin
+                .split_once("://")
+                .map(|(_, rest)| rest.trim_end_matches('/'));
+            let endpoint = authority.and_then(|authority| authority.rsplit_once(':'));
+            anyhow::ensure!(
+                origin.scheme() == "http"
+                    && endpoint.is_some_and(|(host, port)| {
+                        host.trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|address| address.is_loopback())
+                            && port.parse::<u16>().is_ok_and(|port| port != 0)
+                    }),
+                "allow_loopback_http requires an HTTP origin with a literal loopback IP and fixed port"
+            );
+        } else {
+            anyhow::ensure!(
+                origin.scheme() == "https",
+                "template origin must use HTTPS unless allow_loopback_http is enabled"
+            );
+        }
         anyhow::ensure!(
             (1..=16).contains(&definition.parameters.len()),
             "template must declare 1 to 16 parameters"
@@ -686,6 +710,7 @@ impl Template {
             body_policy,
             operation: None,
             origin,
+            loopback_http: definition.allow_loopback_http,
             path,
             query,
             parameters,
@@ -792,7 +817,7 @@ impl Template {
         };
         let mut url = self.origin.clone();
         {
-            let mut path = url.path_segments_mut().expect("HTTPS origin");
+            let mut path = url.path_segments_mut().expect("template origin");
             path.clear();
             for part in &self.path {
                 path.push(part.value(values));
@@ -932,7 +957,8 @@ impl Template {
         schema["properties"]["label"] = json!({"type":"string","const":label});
         schema["properties"]["parameters"] = self.schema();
         schema["description"] = json!(format!(
-            "Arguments for this fixed-origin HTTPS {} operation. Supply raw parameter values without URL encoding; the client renders them. The method, path structure, and query names are fixed. Redirects are disabled. GET rejects bodies; writes enforce the advertised body policy and are never automatically replayed.",
+            "Arguments for this fixed-origin {} {} operation. Supply raw parameter values without URL encoding; the client renders them. The method, path structure, and query names are fixed. Redirects are disabled. GET rejects bodies; writes enforce the advertised body policy and are never automatically replayed.",
+            self.origin.scheme().to_ascii_uppercase(),
             self.method
         ));
         match &self.body_policy {

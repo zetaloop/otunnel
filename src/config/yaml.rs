@@ -103,7 +103,7 @@ fields!(Definition {
     "version": u8, "origin": String, "method": String, "body_policy": Option<BodyPolicy>,
     "path_template": String, "query": BTreeMap<String, String>,
     "parameters": BTreeMap<String, Parameter>, "headers": BTreeMap<String, String>,
-    "follow_redirects": bool,
+    "follow_redirects": bool, "allow_loopback_http": bool,
 });
 fields!(Parameter {
     "type": String, "required": bool, "description": String, "examples": Vec<String>,

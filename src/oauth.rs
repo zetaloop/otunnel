@@ -501,7 +501,7 @@ fn register(
     let unix_socket = (url.origin() == transport.url.origin())
         .then(|| transport.unix_socket.clone())
         .flatten();
-    let client = registry.client(&url, unix_socket.as_deref())?;
+    let client = registry.client(&url, unix_socket.as_deref(), false)?;
     registry.insert(Target {
         info: TargetInfo {
             label: registry.label(&format!("oauth-{}-{}", record.role, record.index))?,

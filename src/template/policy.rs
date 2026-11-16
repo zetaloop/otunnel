@@ -27,6 +27,8 @@ impl Template {
         struct Policy {
             version: u8,
             origin: String,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            allow_loopback_http: bool,
             method: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             body_policy: Option<BodyPolicy>,
@@ -62,6 +64,7 @@ impl Template {
                 .strip_suffix('/')
                 .unwrap_or(&definition.origin)
                 .into(),
+            allow_loopback_http: self.loopback_http,
             method: self.method.to_string(),
             body_policy: self.body_policy.as_ref().map(|policy| policy.canonical()),
             path_template: definition.path_template.clone(),

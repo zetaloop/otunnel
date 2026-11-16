@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use ipnet::IpNet;
 use url::Url;
 
+#[derive(Default)]
 pub(crate) struct Proxy {
     fixed: Option<Url>,
     http: Option<Url>,

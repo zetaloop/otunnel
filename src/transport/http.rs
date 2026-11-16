@@ -68,6 +68,7 @@ impl HttpTransport {
                 ca_bundle: config.ca_bundle.as_deref(),
                 client_cert: server.client_cert.as_deref().or(mcp.client_cert.as_deref()),
                 client_key: server.client_key.as_deref().or(mcp.client_key.as_deref()),
+                ..Default::default()
             },
         )?;
         let client = client.logging(config.log.http_raw_unsafe.then_some("mcpclient"));

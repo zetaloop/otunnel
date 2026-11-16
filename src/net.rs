@@ -40,6 +40,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
 #[derive(Default)]
 pub struct Options<'a> {
     pub proxy: Option<&'a str>,
+    pub direct: bool,
     pub socket: Option<&'a str>,
     pub ca_bundle: Option<&'a str>,
     pub client_cert: Option<&'a str>,
@@ -114,7 +115,11 @@ impl Http {
                 Ok(Client::builder(TokioExecutor::new()).build(connector))
             })
             .transpose()?;
-        let proxy = Arc::new(crate::proxy::Proxy::new(options.proxy)?);
+        let proxy = Arc::new(if options.direct {
+            crate::proxy::Proxy::default()
+        } else {
+            crate::proxy::Proxy::new(options.proxy)?
+        });
         let builder = |mut tls: ClientConfig| {
             tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             let route = proxy.clone();
