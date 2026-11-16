@@ -38,6 +38,10 @@ pub struct Tunnel {
     pub organization_ids: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub request_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub residency: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub control_plane_url: String,
 }
 
 fn identifiers<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
@@ -122,16 +126,23 @@ pub struct Client {
     http: Http,
     root: Url,
     headers: HeaderMap,
+    redirects: usize,
 }
 impl Client {
-    pub fn new(base: &str, prefix: &str, key: &str, ca_bundle: Option<&str>) -> Result<Self> {
+    pub fn new(control: &config::ControlPlane, key: &str, ca_bundle: Option<&str>) -> Result<Self> {
         anyhow::ensure!(!key.is_empty(), "admin key is required");
-        let base = Url::parse(base)?;
-        let root = config::endpoint(&base, prefix, "v1/tunnels")?;
+        let base = control.base_url()?;
+        let root = config::endpoint(
+            &base,
+            control.url_path.as_deref().unwrap_or_default(),
+            "v1/tunnels",
+        )?;
         let http = Http::new(
             base,
             Options {
                 ca_bundle,
+                client_cert: control.client_cert.as_deref(),
+                client_key: control.client_key.as_deref(),
                 ..Default::default()
             },
         )?;
@@ -157,6 +168,7 @@ impl Client {
             http,
             root,
             headers,
+            redirects: if control.residency.is_some() { 0 } else { 10 },
         })
     }
     pub async fn create(&self, value: Value) -> Result<Tunnel> {
@@ -214,7 +226,7 @@ impl Client {
         tokio::time::timeout(Duration::from_secs(30), async {
             let mut response = self
                 .http
-                .follow(method.clone(), url.clone(), headers, body, 10)
+                .follow(method.clone(), url.clone(), headers, body, self.redirects)
                 .await?;
             let request_id = response
                 .headers

@@ -137,7 +137,7 @@ impl Checker {
             &mut targets,
             "control_plane",
             "control-plane",
-            Some(Url::parse(config.control_plane.base_url())?),
+            Some(config.control_plane.base_url()?),
             explicit([
                 (
                     source("control-plane.http-proxy"),

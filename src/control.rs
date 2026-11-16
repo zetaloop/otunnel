@@ -102,7 +102,7 @@ pub struct Control {
 impl Control {
     pub fn new(config: &Config) -> Result<Self> {
         let cp = &config.control_plane;
-        let mut url = Url::parse(cp.base_url()).context("invalid control-plane.base-url")?;
+        let mut url = cp.base_url()?;
         anyhow::ensure!(
             url.host_str().is_some(),
             "control-plane.base-url must include scheme and host"

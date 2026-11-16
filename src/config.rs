@@ -106,6 +106,7 @@ impl Config {
         raw.apply_merge()?;
         let raw = serde_json::to_value(raw)?;
         reference::validate_profile(self, &raw)?;
+        self.control_plane.residency()?;
         self.mcp.oauth_origins()?;
         self.harpoon.oauth_origins()?;
         anyhow::ensure!(
@@ -244,6 +245,7 @@ impl Config {
         self.scope()?;
         self.validate_request_ids()?;
         reference::validate_headers(self, true)?;
+        self.control_plane.base_url()?;
         self.mcp.oauth_origins()?;
         self.harpoon.oauth_origins()?;
         anyhow::ensure!(
@@ -525,6 +527,7 @@ impl Config {
 }
 
 settings!(ControlPlane {
+    residency: Option<String> = None,
     base_url: Option<String> = None,
     url_path: Option<String> = None,
     tunnel_id: String = String::new(),
@@ -542,19 +545,57 @@ settings!(ControlPlane {
     client_key: Option<String> = None,
 });
 impl ControlPlane {
-    pub fn base_url(&self) -> &str {
-        let url = self
-            .base_url
-            .as_deref()
-            .filter(|url| !url.is_empty())
-            .unwrap_or("https://api.openai.com");
-        if self.client_cert.is_some()
-            && url.trim().trim_end_matches('/') == "https://api.openai.com"
-        {
-            "https://mtls.api.openai.com"
+    pub fn residency(&self) -> Result<Option<String>> {
+        self.residency.as_deref().map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            anyhow::ensure!(matches!(value.as_str(), "global" | "us" | "eu" | "au" | "ca" | "gb" | "in" | "jp" | "kr" | "sg" | "ae"),
+                "invalid control-plane.residency: expected global, us, eu, au, ca, gb, in, jp, kr, sg, or ae");
+            Ok(value)
+        }).transpose()
+    }
+    pub fn base_url(&self) -> Result<url::Url> {
+        let raw = self.base_url.as_deref().unwrap_or_default();
+        let mtls = self
+            .client_cert
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let Some(residency) = self.residency()? else {
+            let raw = if raw.is_empty() {
+                "https://api.openai.com"
+            } else {
+                raw
+            };
+            return url::Url::parse(
+                if mtls && raw.trim().trim_end_matches('/') == "https://api.openai.com" {
+                    "https://mtls.api.openai.com"
+                } else {
+                    raw
+                },
+            )
+            .context("invalid control-plane.base-url");
+        };
+        let ordinary = if residency == "global" {
+            "https://api.openai.com".into()
         } else {
-            url
+            format!("https://{residency}.api.openai.com")
+        };
+        let selected = if mtls {
+            match residency.as_str() {
+                "global" => "https://mtls.api.openai.com".into(),
+                "us" | "eu" => format!("https://mtls-{residency}.api.openai.com"),
+                _ => bail!("control-plane.residency {residency:?} has no configured mTLS endpoint"),
+            }
+        } else {
+            ordinary.clone()
+        };
+        if !raw.is_empty() {
+            let normalized = raw.strip_suffix('/').unwrap_or(raw).to_ascii_lowercase();
+            anyhow::ensure!(
+                normalized == selected || mtls && normalized == ordinary,
+                "control-plane.base-url conflicts with control-plane.residency {residency:?}"
+            );
         }
+        Ok(url::Url::parse(&selected)?)
     }
 }
 settings!(Mcp {

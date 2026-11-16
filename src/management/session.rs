@@ -66,6 +66,7 @@ pub async fn start(
     previous: &Process,
     replace: bool,
     key: &str,
+    residency: Option<&str>,
 ) -> Result<Launch> {
     let alias = record.alias.as_str();
     let profile = record.profile_name.as_str();
@@ -125,6 +126,9 @@ pub async fn start(
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
+    if let Some(residency) = residency {
+        command.env("CONTROL_PLANE_RESIDENCY", residency);
+    }
     if let Some(name) = key.strip_prefix("env:")
         && let Ok(value) = crate::config::resolve(key)
     {

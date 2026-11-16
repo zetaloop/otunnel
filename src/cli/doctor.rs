@@ -99,6 +99,20 @@ pub async fn execute(arguments: &ArgMatches) -> Result<u8> {
         }
     };
     checks.push(Check::pass("tunnel_id", &config.control_plane.tunnel_id));
+    if let Some(residency) = config.control_plane.residency()? {
+        checks.push(Check::pass(
+            "control_plane_endpoint",
+            format!(
+                "residency={residency} endpoint={} mTLS={}",
+                config
+                    .control_plane
+                    .base_url()?
+                    .host_str()
+                    .unwrap_or_default(),
+                config.control_plane.client_cert.is_some()
+            ),
+        ));
+    }
     checks.push(Check::pass("control_plane_api_key", "configured"));
     let next = match (selected, path.as_ref()) {
         (Some("profile"), _) => format!(

@@ -119,6 +119,12 @@ pub fn runtimes_command() -> Command {
     Command::new("runtimes")
         .about("Manage native tunnel-client runtimes")
         .subcommand_required(true)
+        .arg(
+            Arg::new("control-plane-residency")
+                .long("control-plane-residency")
+                .env("CONTROL_PLANE_RESIDENCY")
+                .global(true),
+        )
         .args(
             [
                 "admin-profile",
@@ -178,7 +184,12 @@ pub fn runtimes_command() -> Command {
 
 pub async fn runtimes(arguments: &ArgMatches) -> Result<u8> {
     let (action, arguments) = arguments.subcommand().context("missing runtimes command")?;
-    let manager = Manager::default();
+    let manager = Manager {
+        residency: arguments
+            .get_one::<String>("control-plane-residency")
+            .cloned(),
+        ..Default::default()
+    };
     let alias = value(arguments, "alias");
     let remote = Remote {
         profile: value(arguments, "admin-profile").into(),

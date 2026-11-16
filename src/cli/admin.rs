@@ -29,8 +29,15 @@ pub fn command() -> Command {
             Arg::new("control-plane.base-url")
                 .long("control-plane.base-url")
                 .env("CONTROL_PLANE_BASE_URL")
-                .global(true)
-                .default_value("https://api.openai.com"),
+                .global(true),
+        )
+        .args(
+            [
+                ("control-plane.residency", "CONTROL_PLANE_RESIDENCY"),
+                ("control-plane.client-cert", "CONTROL_PLANE_CLIENT_CERT"),
+                ("control-plane.client-key", "CONTROL_PLANE_CLIENT_KEY"),
+            ]
+            .map(|(name, variable)| Arg::new(name).long(name).env(variable).global(true)),
         )
         .arg(
             Arg::new("control-plane.url-path")
@@ -253,10 +260,29 @@ fn client(arguments: &ArgMatches, read_only: bool) -> Result<Client> {
         );
         config::resolve(reference)?
     };
-    let base = super::value(arguments, "control-plane.base-url");
-    let prefix = super::value(arguments, "control-plane.url-path");
+    let control = config::ControlPlane {
+        base_url: arguments
+            .get_one::<String>("control-plane.base-url")
+            .map(|value| config::resolve(value))
+            .transpose()?,
+        residency: arguments
+            .get_one::<String>("control-plane.residency")
+            .cloned(),
+        url_path: arguments
+            .get_one::<String>("control-plane.url-path")
+            .cloned(),
+        client_cert: arguments
+            .get_one::<String>("control-plane.client-cert")
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+        client_key: arguments
+            .get_one::<String>("control-plane.client-key")
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+        ..Default::default()
+    };
     let ca = super::value(arguments, "ca-bundle");
-    Client::new(base, prefix, key.trim(), (!ca.is_empty()).then_some(ca))
+    Client::new(&control, key.trim(), (!ca.is_empty()).then_some(ca))
 }
 
 fn print(tunnel: &Tunnel, json: bool) -> Result<()> {

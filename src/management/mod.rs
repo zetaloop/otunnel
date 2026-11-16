@@ -13,9 +13,36 @@ use state::{AdminProfile, AdminProfiles, Root};
 #[derive(Default)]
 pub struct Manager {
     pub root: Root,
+    pub residency: Option<String>,
 }
 
 impl Manager {
+    fn control_plane(&self, base: &str, stored: &str) -> Result<crate::config::ControlPlane> {
+        let residency = self
+            .residency
+            .clone()
+            .or_else(|| std::env::var("CONTROL_PLANE_RESIDENCY").ok());
+        let stored =
+            if residency.is_some() && stored.trim_end_matches('/') == "https://api.openai.com" {
+                ""
+            } else {
+                stored
+            };
+        let base = first(&[
+            base,
+            stored,
+            &state::variable("CONTROL_PLANE_BASE_URL").unwrap_or_default(),
+        ]);
+        let control = crate::config::ControlPlane {
+            base_url: (!base.is_empty()).then_some(base),
+            residency,
+            client_cert: state::variable("CONTROL_PLANE_CLIENT_CERT"),
+            client_key: state::variable("CONTROL_PLANE_CLIENT_KEY"),
+            ..Default::default()
+        };
+        control.base_url()?;
+        Ok(control)
+    }
     pub fn profiles(&self) -> Result<Value> {
         let file = self.root.profiles()?;
         let profiles = file
@@ -41,12 +68,12 @@ impl Manager {
         let previous = file.profiles.get(&name).cloned().unwrap_or_default();
         let profile = AdminProfile {
             name: name.clone(),
-            control_plane_base_url: first(&[
-                base,
-                &previous.control_plane_base_url,
-                &state::variable("CONTROL_PLANE_BASE_URL").unwrap_or_default(),
-                "https://api.openai.com",
-            ]),
+            control_plane_base_url: self
+                .control_plane(base, &previous.control_plane_base_url)?
+                .base_url()?
+                .as_str()
+                .trim_end_matches('/')
+                .into(),
             control_plane_url_path: first(&[
                 prefix,
                 &previous.control_plane_url_path,

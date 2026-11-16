@@ -60,6 +60,13 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "Runtime key, env:NAME, or file:PATH",
     ),
     (
+        "control-plane.residency",
+        "CONTROL_PLANE_RESIDENCY",
+        "/control_plane/residency",
+        Text,
+        "Regional control-plane endpoint",
+    ),
+    (
         "control-plane.base-url",
         "CONTROL_PLANE_BASE_URL",
         "/control_plane/base_url",
@@ -707,6 +714,9 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                     if overridden(name) {
                         headers.clear();
                     }
+                }
+                if overridden("control-plane.residency") {
+                    config.control_plane.residency = None;
                 }
                 if overridden("forward-request-id") {
                     config.forward_request_id = Config::default().forward_request_id;

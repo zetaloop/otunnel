@@ -91,12 +91,12 @@ impl Manager {
         ]))?;
         let mut file = self.root.profiles()?;
         let previous = file.profiles.get(&name).cloned().unwrap_or_default();
-        let base = first(&[
-            &requested.base_url,
-            &previous.control_plane_base_url,
-            &state::variable("CONTROL_PLANE_BASE_URL").unwrap_or_default(),
-            "https://api.openai.com",
-        ]);
+        let endpoint = self.control_plane(&requested.base_url, &previous.control_plane_base_url)?;
+        let base = endpoint
+            .base_url()?
+            .as_str()
+            .trim_end_matches('/')
+            .to_owned();
         let prefix = first(&[
             &requested.url_path,
             &previous.control_plane_url_path,
@@ -134,7 +134,8 @@ impl Manager {
             && !previous.tunnel_id.is_empty()
         {
             let previous_profile = self.remote(&Remote::default(), &previous.admin_profile)?;
-            match client(&previous_profile, "")?
+            match self
+                .client(&previous_profile, "")?
                 .get(&previous.tunnel_id)
                 .await
             {
@@ -152,7 +153,7 @@ impl Manager {
                 Err(error) => return Err(error),
             }
         }
-        let client = client(profile, "")?;
+        let client = self.client(profile, "")?;
         if options.scope.present() {
             options.scope.validate(true)?;
             match client
@@ -255,7 +256,7 @@ impl Manager {
         let mut remote_error = String::new();
         let tunnel = if !options.tunnel_id.trim().is_empty() {
             let id = crate::config::tunnel_id(&options.tunnel_id)?;
-            match async { client(&profile, &key)?.get(id).await }.await {
+            match async { self.client(&profile, &key)?.get(id).await }.await {
                 Ok(tunnel) => tunnel,
                 Err(error) => {
                     remote_error = format!("{error:#}");
@@ -304,6 +305,12 @@ impl Manager {
         let log_file = self.root.path.join("logs").join(format!("{alias}.log"));
         let mut configuration = json!({"config_version":1,"control_plane":{"base_url":profile.control_plane_base_url,"tunnel_id":tunnel.id,"api_key":key},
             "health":{"listen_addr":"127.0.0.1:0","url_file":health_file},"admin_ui":{"open_browser":false},"log":{"level":"info","format":"json","file":log_file}});
+        let residency = self
+            .control_plane(&profile.control_plane_base_url, "")?
+            .residency()?;
+        if let Some(residency) = &residency {
+            configuration["control_plane"]["residency"] = json!(residency);
+        }
         if !profile.control_plane_url_path.is_empty() {
             configuration["control_plane"]["url_path"] = json!(profile.control_plane_url_path);
         }
@@ -333,7 +340,15 @@ impl Manager {
                 &format!("replacing with tunnel_id={}", tunnel.id),
             )?;
         }
-        let mut launch = session::start(&self.root, &record, &existing, replace, &key).await?;
+        let mut launch = session::start(
+            &self.root,
+            &record,
+            &existing,
+            replace,
+            &key,
+            residency.as_deref(),
+        )
+        .await?;
         let process = Process {
             alias: alias.clone(),
             tunnel_id: tunnel.id.clone(),
@@ -442,7 +457,8 @@ impl Manager {
         let aliases = self.root.aliases()?;
         let mut payload = json!({"aliases":aliases.values().map(inspect::alias).collect::<Vec<_>>(),"admin_profile":profile.name,"admin_profile_path":self.root.path.join("admin_profiles.yaml"),"state_root":self.root.path});
         if scope.present() {
-            let remote = client(&profile, "")?
+            let remote = self
+                .client(&profile, "")?
                 .list(
                     scope.organizations.first().map_or("", String::as_str),
                     scope.workspaces.first().map_or("", String::as_str),
@@ -513,7 +529,13 @@ impl Manager {
             payload["remote_lookup_auth_kind"] = json!(kind);
             payload["remote_lookup_auth_ref"] = json!(reference);
             payload["remote_skipped_reason"] = json!("");
-            match async { client(&profile, reference)?.get(&record.tunnel_id).await }.await {
+            match async {
+                self.client(&profile, reference)?
+                    .get(&record.tunnel_id)
+                    .await
+            }
+            .await
+            {
                 Ok(tunnel) => payload["remote"] = inspect::tunnel(&tunnel),
                 Err(error) => {
                     payload["stale"] = json!(not_found(&error));
@@ -769,16 +791,15 @@ impl Manager {
     }
 }
 
-fn client(profile: &AdminProfile, reference: &str) -> Result<Client> {
-    let reference = first(&[reference, &profile.admin_key]);
-    state::reference(&reference)?;
-    let key = crate::config::resolve(&reference)?;
-    Client::new(
-        &profile.control_plane_base_url,
-        &profile.control_plane_url_path,
-        key.trim(),
-        None,
-    )
+impl Manager {
+    fn client(&self, profile: &AdminProfile, reference: &str) -> Result<Client> {
+        let reference = first(&[reference, &profile.admin_key]);
+        state::reference(&reference)?;
+        let key = crate::config::resolve(&reference)?;
+        let mut control = self.control_plane(&profile.control_plane_base_url, "")?;
+        control.url_path = Some(profile.control_plane_url_path.clone());
+        Client::new(&control, key.trim(), None)
+    }
 }
 fn not_found(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
