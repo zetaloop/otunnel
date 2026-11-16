@@ -603,7 +603,11 @@ impl Transport for Harpoon {
                 let name: String = serde_json::from_str(name.get())?;
                 let empty = RawValue::from_string("{}".into())?;
                 let arguments = protocol::field(&params, "arguments").unwrap_or(empty);
-                match self.call(&name, &arguments).await {
+                let request_id = request
+                    .forward_request_id
+                    .then(|| request.headers.get("x-request-id"))
+                    .flatten();
+                match self.call(&name, &arguments, request_id).await {
                     Ok(value) => {
                         let mut text = value.clone();
                         if name == "call_target" {

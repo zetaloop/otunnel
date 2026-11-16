@@ -178,6 +178,7 @@ pub struct Request {
     pub message: Json,
     pub headers: HeaderMap,
     pub discovery: bool,
+    pub forward_request_id: bool,
     pub deadline: Option<tokio::time::Instant>,
 }
 impl Request {
@@ -186,6 +187,7 @@ impl Request {
             message: to_raw_value(&value)?,
             headers: HeaderMap::new(),
             discovery: false,
+            forward_request_id: false,
             deadline: None,
         })
     }
@@ -344,7 +346,10 @@ pub fn wire_headers(headers: &HeaderMap, filtered: bool) -> Headers {
         .collect();
     let mut result = Headers::new();
     for name in headers.keys() {
-        if filtered && (name == "connection" || excluded.iter().any(|value| value == name.as_str()))
+        if filtered
+            && (name == "connection"
+                || name == "x-tunnel-mcp-request-id"
+                || excluded.iter().any(|value| value == name.as_str()))
         {
             continue;
         }
@@ -378,6 +383,7 @@ fn response_header(name: &str) -> Option<&'static str> {
         "mcp-protocol-version" => "Mcp-Protocol-Version",
         "mcp-session-id" => "Mcp-Session-Id",
         "www-authenticate" => "Www-Authenticate",
+        "x-request-id" | "x-tunnel-mcp-request-id" => "X-Tunnel-Mcp-Request-Id",
         _ => return None,
     })
 }

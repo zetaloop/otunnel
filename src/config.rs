@@ -64,7 +64,32 @@ settings!(Config {
     proxy: Proxy = Proxy::default(),
     ca_bundle: Option<String> = None,
     http_proxy: Option<String> = None,
+    #[serde(default, deserialize_with = "request_ids")]
+    forward_request_id: Vec<String> = vec!["mcp".into()],
 });
+
+fn request_ids<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        Text(String),
+        List(Vec<String>),
+    }
+    let values = match Option::<Names>::deserialize(deserializer)? {
+        Some(Names::Text(value)) => vec![value],
+        Some(Names::List(values)) => values,
+        None => Vec::new(),
+    };
+    Ok(Some(
+        values
+            .iter()
+            .flat_map(|value| value.split(','))
+            .map(|name| name.trim().to_owned())
+            .collect(),
+    ))
+}
 
 impl Config {
     pub fn validate_profile(text: &str) -> Result<()> {
@@ -73,6 +98,7 @@ impl Config {
 
     fn validate_source(&self, text: &str) -> Result<()> {
         self.scope()?;
+        self.validate_request_ids()?;
         let document = yaml_serde::Deserializer::from_str(text)
             .next()
             .context("configuration is empty")?;
@@ -215,6 +241,7 @@ impl Config {
         additional: impl IntoIterator<Item = String>,
     ) -> Result<()> {
         self.scope()?;
+        self.validate_request_ids()?;
         reference::validate_headers(self, true)?;
         self.mcp.oauth_origins()?;
         anyhow::ensure!(
@@ -470,6 +497,22 @@ impl Config {
         self.log.level = self.log.level.trim().to_ascii_lowercase();
         self.log.format = self.log.format.trim().to_ascii_lowercase();
         Ok(())
+    }
+    fn validate_request_ids(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.forward_request_id.is_empty()
+                && self
+                    .forward_request_id
+                    .iter()
+                    .all(|name| matches!(name.as_str(), "mcp" | "harpoon" | "oauth" | "none"))
+                && (!self.forwards_request_id("none")
+                    || self.forward_request_id.iter().all(|name| name == "none")),
+            "forward_request_id must contain mcp, harpoon, oauth, or none; none must be used alone"
+        );
+        Ok(())
+    }
+    pub fn forwards_request_id(&self, surface: &str) -> bool {
+        self.forward_request_id.iter().any(|name| name == surface)
     }
     pub fn enabled(&self, channel: &str) -> bool {
         self.control_plane

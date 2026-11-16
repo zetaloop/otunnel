@@ -454,6 +454,7 @@ impl Tunnel {
                     let control = self.control.clone();
                     let bindings = bindings.clone();
                     let id = command.request_id.clone();
+                    let forward_request_id = command.channel == "harpoon" && self.config.forwards_request_id("harpoon");
                     self.state.send_modify(|state| {
                         let now = crate::control::now();
                         state.activity.queued = queued.len();
@@ -466,10 +467,10 @@ impl Tunnel {
                         let deadline = protocol::timeout(&command.response_timeout).and_then(|duration| received.checked_add(duration));
                         let result = if deadline.is_some_and(|deadline| deadline <= Instant::now()) { Ok(false) }
                             else if let Some(deadline) = deadline {
-                                match timeout_at(deadline, execute(&control, &bindings, command, ttl, Some(deadline), forward_trace_context)).await {
+                                match timeout_at(deadline, execute(&control, &bindings, command, ttl, Some(deadline), forward_trace_context, forward_request_id)).await {
                                     Ok(result) => result.map(|()| true), Err(_) => Ok(false),
                                 }
-                            } else { execute(&control, &bindings, command, ttl, None, forward_trace_context).await.map(|()| true) };
+                            } else { execute(&control, &bindings, command, ttl, None, forward_trace_context, forward_request_id).await.map(|()| true) };
                         (id, result)
                     });
                 }
@@ -593,6 +594,7 @@ async fn execute(
     ttl: Option<Duration>,
     deadline: Option<Instant>,
     forward_trace_context: bool,
+    forward_request_id: bool,
 ) -> Result<()> {
     if !matches!(
         command.command_type.as_str(),
@@ -621,6 +623,7 @@ async fn execute(
             "jsonrpc" => {
                 let request = Request {
                     discovery: false,
+                    forward_request_id,
                     message: command.jsonrpc.context("JSON-RPC command has no payload")?,
                     headers,
                     deadline,
@@ -657,6 +660,7 @@ async fn execute(
             };
             let request = Request {
                 discovery: false,
+                forward_request_id,
                 message: message
                     .or(command.jsonrpc)
                     .context("JSON-RPC command has no payload")?,

@@ -39,6 +39,13 @@ use Kind::*;
 // CLI spellings and environment names are the public tunnel-client configuration interface.
 const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
     (
+        "forward-request-id",
+        "FORWARD_REQUEST_ID",
+        "/forward_request_id",
+        Text,
+        "HTTP surfaces for the original request ID: mcp, harpoon, oauth, or none",
+    ),
+    (
         "control-plane.tunnel-id",
         "CONTROL_PLANE_TUNNEL_ID",
         "/control_plane/tunnel_id",
@@ -693,6 +700,9 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                     if overridden(name) {
                         headers.clear();
                     }
+                }
+                if overridden("forward-request-id") {
+                    config.forward_request_id = Config::default().forward_request_id;
                 }
                 if overridden("mcp.oauth-discovery") {
                     config.mcp.oauth_discovery = "auto".into();

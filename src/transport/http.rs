@@ -33,6 +33,8 @@ pub struct HttpTransport {
     pub(crate) discovery_headers: HeaderMap,
     pub(crate) oauth_origins: Vec<Url>,
     oauth_enabled: bool,
+    forward_request_id: bool,
+    oauth_request_id: bool,
     pub(crate) harpoon: Option<Arc<crate::harpoon::Harpoon>>,
     stateless: Arc<AtomicBool>,
 }
@@ -80,6 +82,8 @@ impl HttpTransport {
             discovery_headers,
             oauth_origins: mcp.oauth_origins()?,
             oauth_enabled: mcp.oauth_discovery != "disabled",
+            forward_request_id: config.forwards_request_id("mcp"),
+            oauth_request_id: config.forwards_request_id("oauth"),
             harpoon: None,
             stateless: Arc::new(AtomicBool::new(false)),
         })
@@ -198,9 +202,21 @@ impl Transport for HttpTransport {
             }))?);
             return Ok(reply);
         }
-        crate::oauth::discover(self, headers, startup).await
+        let mut incoming = HeaderMap::new();
+        if !startup
+            && self.oauth_request_id
+            && let Some(id) = headers
+                .get("x-request-id")
+                .filter(|value| !value.is_empty())
+        {
+            incoming.insert("x-request-id", id.clone());
+        }
+        crate::oauth::discover(self, incoming, startup).await
     }
-    async fn forward(&self, request: Request, sink: &dyn Sink) -> Result<()> {
+    async fn forward(&self, mut request: Request, sink: &dyn Sink) -> Result<()> {
+        if !self.forward_request_id {
+            request.headers.remove("x-request-id");
+        }
         let id = view(&request.message)?.id.map(RawValue::to_owned);
         let mut headers = HeaderMap::new();
         headers.insert("accept", "application/json, text/event-stream".parse()?);
@@ -385,7 +401,10 @@ impl Transport for HttpTransport {
                 .await?;
         }
     }
-    async fn terminate(&self, headers: HeaderMap, discovery: bool) -> Result<Reply> {
+    async fn terminate(&self, mut headers: HeaderMap, discovery: bool) -> Result<Reply> {
+        if !self.forward_request_id {
+            headers.remove("x-request-id");
+        }
         let response = self
             .send(
                 Method::DELETE,

@@ -325,7 +325,12 @@ impl Harpoon {
         self.config.max_redirects
     }
 
-    pub(super) async fn call(&self, name: &str, arguments: &RawValue) -> Result<Value> {
+    pub(super) async fn call(
+        &self,
+        name: &str,
+        arguments: &RawValue,
+        request_id: Option<&HeaderValue>,
+    ) -> Result<Value> {
         match name {
             "list_targets" => {
                 let mut filter: ListTargets = serde_json::from_str(arguments.get())
@@ -412,12 +417,12 @@ impl Harpoon {
                             || super::policy::bound(&call.label).is_some(),
                         "label unknown: invalid template arguments"
                     );
-                    let response = self.request_template(call).await?;
+                    let response = self.request_template(call, request_id).await?;
                     Ok(serde_json::to_value(response)?)
                 } else {
                     let call: CallTarget = serde_json::from_str(arguments.get())
                         .context("label unknown: invalid parameters")?;
-                    let response = self.request_exact(call).await?;
+                    let response = self.request_exact(call, request_id).await?;
                     Ok(json!({
                         "status_code":response.status_code,
                         "headers":response.headers,
@@ -452,7 +457,11 @@ impl Harpoon {
         }
     }
 
-    async fn request_template(&self, call: CallTemplate) -> Result<CallResponse> {
+    async fn request_template(
+        &self,
+        call: CallTemplate,
+        request_id: Option<&HeaderValue>,
+    ) -> Result<CallResponse> {
         let mut metrics = super::metrics::Call::new(self, true);
         let target = self
             .template_target(&call.label)
@@ -483,13 +492,14 @@ impl Harpoon {
                     })?,
                 );
             }
-            let (method, url, headers, body) = template.request(
+            let (method, url, mut headers, body) = template.request(
                 &call.parameters,
                 caller,
                 call.operation.as_deref(),
                 call.body.as_deref(),
                 call.content_type.as_deref(),
             )?;
+            headers::request_id(&mut headers, request_id, true);
             let milliseconds = call.timeout_ms.unwrap_or(30000);
             validate_timeout(milliseconds)?;
             let limit = self.response_limit_for(call.max_response_bytes)?;
@@ -510,7 +520,11 @@ impl Harpoon {
         result.map_err(|error| anyhow::anyhow!("label {}: {error}", target.info.label))
     }
 
-    async fn request_exact(&self, call: CallTarget) -> Result<CallResponse> {
+    async fn request_exact(
+        &self,
+        call: CallTarget,
+        request_id: Option<&HeaderValue>,
+    ) -> Result<CallResponse> {
         let mut metrics = super::metrics::Call::new(self, false);
         anyhow::ensure!(!call.label.trim().is_empty(), "label is required");
         let mut target = self.target(call.label.trim())?;
@@ -526,7 +540,14 @@ impl Harpoon {
         );
         let milliseconds = call.timeout_ms.unwrap_or(30000);
         validate_timeout(milliseconds)?;
+        let request_id = request_id.filter(|_| {
+            !call
+                .headers
+                .keys()
+                .any(|name| name.trim().eq_ignore_ascii_case("x-request-id"))
+        });
         let mut headers = headers::outbound(&call.headers)?;
+        let origin = target.url.origin();
         let limit = self.response_limit_for(call.max_response_bytes)?;
         let follow = call.follow_redirects.unwrap_or(true);
         let redirects = if follow {
@@ -552,9 +573,13 @@ impl Harpoon {
         metrics.outcome = "request_error";
         tokio::time::timeout(Duration::from_millis(milliseconds as u64), async {
             loop {
+                let mut outbound = headers.clone();
+                if target.url.origin() == origin {
+                    headers::request_id(&mut outbound, request_id, false);
+                }
                 let response = target
                     .client
-                    .send(method.clone(), &target.url, headers.clone(), body.clone())
+                    .send(method.clone(), &target.url, outbound, body.clone())
                     .await
                     .context("request failed")?;
                 if follow

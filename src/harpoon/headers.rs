@@ -70,6 +70,28 @@ pub(crate) fn outbound(values: &BTreeMap<String, String>) -> Result<HeaderMap> {
     Ok(headers)
 }
 
+pub(super) fn request_id(headers: &mut HeaderMap, id: Option<&HeaderValue>, template: bool) {
+    if headers.contains_key("x-request-id") {
+        return;
+    }
+    let Some(id) = id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if template {
+        let mut candidate = headers.clone();
+        candidate.insert("x-request-id", id.clone());
+        if id
+            .to_str()
+            .ok()
+            .is_none_or(|value| template_value(value).is_err())
+            || template_size(&candidate).is_err()
+        {
+            return;
+        }
+    }
+    headers.insert("x-request-id", id.clone());
+}
+
 pub(crate) fn template_name(name: &str) -> Result<HeaderName> {
     let normalized = name.to_ascii_lowercase();
     anyhow::ensure!(

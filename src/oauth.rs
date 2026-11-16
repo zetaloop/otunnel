@@ -183,11 +183,14 @@ fn resource_metadata(header: &str) -> Option<&str> {
     None
 }
 
-async fn discovery_candidates(transport: &HttpTransport) -> (Vec<Url>, bool) {
+async fn discovery_candidates(
+    transport: &HttpTransport,
+    forwarded: &HeaderMap,
+) -> (Vec<Url>, bool) {
     let probe = tokio::time::timeout(Duration::from_secs(1), async {
         let incoming = HeaderMap::new();
         for method in [Method::POST, Method::GET] {
-            let mut headers = HeaderMap::new();
+            let mut headers = forwarded.clone();
             headers.insert("accept", "application/json".parse().expect("static header"));
             let Ok(response) = transport
                 .send(
@@ -261,7 +264,12 @@ fn timed_out(error: &anyhow::Error) -> bool {
     })
 }
 
-async fn request_document(transport: &HttpTransport, url: &Url, retry: bool) -> Result<Fetched> {
+async fn request_document(
+    transport: &HttpTransport,
+    url: &Url,
+    retry: bool,
+    forwarded: &HeaderMap,
+) -> Result<Fetched> {
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
@@ -283,6 +291,9 @@ async fn request_document(transport: &HttpTransport, url: &Url, retry: bool) -> 
         let deadline =
             retry.then(|| tokio::time::Instant::now() + Duration::from_secs(2 << attempt));
         let mut headers = HeaderMap::new();
+        if url.origin() == transport.url.origin() {
+            headers.extend(forwarded.clone());
+        }
         headers.insert("accept", "application/json".parse()?);
         let incoming = HeaderMap::new();
         let request = transport.send(
@@ -347,11 +358,11 @@ async fn request_document(transport: &HttpTransport, url: &Url, retry: bool) -> 
 
 pub(crate) async fn discover(
     transport: &HttpTransport,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     startup: bool,
 ) -> Result<Reply> {
-    let (candidates, advertised) = discovery_candidates(transport).await;
-    let resource = fetch_resource(transport, candidates, advertised).await?;
+    let (candidates, advertised) = discovery_candidates(transport, &headers).await;
+    let resource = fetch_resource(transport, candidates, advertised, &headers).await?;
     if startup && matches!(resource.status, 429 | 500..=599) {
         return Err(DiscoveryError {
             optional: false,
@@ -390,7 +401,7 @@ pub(crate) async fn discover(
             .as_deref()
             .filter(|issuer| http_url(issuer).is_some())
         {
-            match fetch_authorization(transport, issuer).await {
+            match fetch_authorization(transport, issuer, &headers).await {
                 Ok(metadata) => {
                     records.push(
                         Record::new(
@@ -515,6 +526,7 @@ async fn fetch_resource(
     transport: &HttpTransport,
     candidates: Vec<Url>,
     advertised: bool,
+    forwarded: &HeaderMap,
 ) -> Result<Document> {
     let count = candidates.len();
     for retry in [false, true] {
@@ -522,7 +534,7 @@ async fn fetch_resource(
         let mut failures = Failures::default();
         let mut failure = anyhow::anyhow!("OAuth discovery has no metadata candidates");
         for (index, url) in candidates.iter().enumerate() {
-            let fetched = match request_document(transport, url, retry).await {
+            let fetched = match request_document(transport, url, retry, forwarded).await {
                 Ok(fetched) => fetched,
                 Err(error) => {
                     missing = false;
@@ -613,14 +625,18 @@ fn authorization_candidates(issuer: &Url) -> Result<Vec<Url>> {
     Ok(candidates)
 }
 
-async fn fetch_authorization(transport: &HttpTransport, issuer: &str) -> Result<Document> {
+async fn fetch_authorization(
+    transport: &HttpTransport,
+    issuer: &str,
+    forwarded: &HeaderMap,
+) -> Result<Document> {
     let candidates = authorization_candidates(&Url::parse(issuer)?)?;
     for retry in [false, true] {
         let mut fallback = None;
         let mut failure = None;
         let mut failures = Failures::default();
         for url in &candidates {
-            let fetched = match request_document(transport, url, retry).await {
+            let fetched = match request_document(transport, url, retry, forwarded).await {
                 Ok(fetched) => fetched,
                 Err(error) => {
                     failures.record(0, &error, false);
