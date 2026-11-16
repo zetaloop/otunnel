@@ -35,6 +35,8 @@ pub struct HttpTransport {
     oauth_enabled: bool,
     forward_request_id: bool,
     oauth_request_id: bool,
+    oauth_history: Arc<crate::oauth::probe::History>,
+    pub(crate) probe: Option<Arc<crate::oauth::probe::Session>>,
     pub(crate) harpoon: Option<Arc<crate::harpoon::Harpoon>>,
     stateless: Arc<AtomicBool>,
 }
@@ -85,6 +87,8 @@ impl HttpTransport {
             oauth_enabled: mcp.oauth_discovery != "disabled",
             forward_request_id: config.forwards_request_id("mcp"),
             oauth_request_id: config.forwards_request_id("oauth"),
+            oauth_history: Arc::default(),
+            probe: None,
             harpoon: None,
             stateless: Arc::new(AtomicBool::new(false)),
         })
@@ -149,15 +153,17 @@ impl HttpTransport {
     ) -> Result<crate::net::Response> {
         let origin = url.origin();
         for hop in 0..10 {
+            let outbound = self.headers(&url, &headers, incoming, discovery);
+            if let Some(probe) = &self.probe {
+                probe.begin(method.as_str());
+            }
             let response = self
                 .client
-                .send(
-                    method.clone(),
-                    &url,
-                    self.headers(&url, &headers, incoming, discovery),
-                    body.clone(),
-                )
+                .send(method.clone(), &url, outbound, body.clone())
                 .await?;
+            if let Some(probe) = &self.probe {
+                probe.response(response.status.as_u16(), &response.headers);
+            }
             if !matches!(response.status.as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
             }
@@ -181,6 +187,9 @@ impl HttpTransport {
             let _ = referer.set_username("");
             let _ = referer.set_password(None);
             headers.insert("referer", referer.as_str().parse()?);
+            if let Some(probe) = &self.probe {
+                probe.finish("redirect");
+            }
             url = next;
         }
         unreachable!()
@@ -191,6 +200,9 @@ impl HttpTransport {
 impl Transport for HttpTransport {
     fn kind(&self) -> Option<&'static str> {
         Some("streamable_http")
+    }
+    fn oauth_observation(&self) -> Option<tokio::sync::watch::Receiver<serde_json::Value>> {
+        Some(self.oauth_history.subscribe())
     }
     async fn discover(&self, headers: HeaderMap, startup: bool) -> Result<Reply> {
         if !self.oauth_enabled {
@@ -212,7 +224,35 @@ impl Transport for HttpTransport {
         {
             incoming.insert("x-request-id", id.clone());
         }
-        crate::oauth::discover(self, incoming, startup).await
+        if !startup {
+            return crate::oauth::discover(self, incoming, false).await;
+        }
+        let mut transport = self.clone();
+        transport.probe = Some(Arc::new(crate::oauth::probe::Session::new(
+            self.oauth_history.clone(),
+        )));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::oauth::discover(&transport, incoming, true),
+        )
+        .await
+        .context("OAuth discovery timed out")
+        .and_then(|result| result);
+        let disposition = match &result {
+            Ok(_) => "accepted",
+            Err(error) if error.is::<tokio::time::error::Elapsed>() => "retry",
+            Err(error) => match error.downcast_ref::<crate::oauth::DiscoveryError>() {
+                Some(error) if error.retry => "retry",
+                Some(error) if error.optional => "not_advertised",
+                _ => "terminal_failure",
+            },
+        };
+        transport
+            .probe
+            .as_ref()
+            .expect("startup observation")
+            .finish(disposition);
+        result
     }
     async fn forward(&self, mut request: Request, sink: &dyn Sink) -> Result<()> {
         if !self.forward_request_id {

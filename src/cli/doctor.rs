@@ -226,8 +226,10 @@ fn output(
                 "Inspect the reported error.",
             ),
         };
-        check.why = why.into();
-        if check.status == Status::Fail {
+        if check.why.is_empty() {
+            check.why = why.into();
+        }
+        if check.status == Status::Fail && check.next.is_empty() {
             check.next.push(action.into());
         }
     }

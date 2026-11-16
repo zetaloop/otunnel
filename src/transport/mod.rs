@@ -32,6 +32,9 @@ pub trait Transport: Send + Sync {
     async fn terminate(&self, _headers: HeaderMap, _discovery: bool) -> Result<Reply> {
         Ok(Reply::ack(405, "session_termination_response"))
     }
+    fn oauth_observation(&self) -> Option<tokio::sync::watch::Receiver<serde_json::Value>> {
+        None
+    }
     async fn discover(&self, _headers: HeaderMap, _startup: bool) -> Result<Reply> {
         Ok(Reply::ack(404, "oauth_discovery_response"))
     }

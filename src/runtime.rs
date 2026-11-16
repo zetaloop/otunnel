@@ -33,6 +33,7 @@ pub struct Snapshot {
     pub mcp_probe: Startup,
     pub oauth: Startup,
     pub catalog: Startup,
+    pub oauth_probes: serde_json::Value,
     pub metadata_error: Option<String>,
     pub connected: bool,
     pub control: crate::control::Observation,
@@ -324,7 +325,7 @@ impl Tunnel {
                             }
                             let result = timeout(
                                 Duration::from_secs(5),
-                                transport.discover(Default::default(), true),
+                                transport.discover(Default::default(), false),
                             )
                             .await
                             .context("OAuth discovery timed out")
@@ -355,7 +356,16 @@ impl Tunnel {
                                     )
                                 }
                                 Err(error) => {
-                                    Check::fail(id("oauth_metadata"), format!("{error:#}"))
+                                    let mut check =
+                                        Check::fail(id("oauth_metadata"), format!("{error:#}"));
+                                    if error
+                                        .downcast_ref::<crate::oauth::DiscoveryError>()
+                                        .is_some_and(|error| error.html)
+                                    {
+                                        check.why = "A well-known OAuth metadata URL returned an HTML page. A frontend or proxy may be serving its fallback page at that URL.".into();
+                                        check.next.push("For a static-credential MCP server, set MCP_OAUTH_DISCOVERY=disabled. For OAuth servers, configure the route to serve protected-resource metadata as JSON.".into());
+                                    }
+                                    check
                                 }
                             };
                             checks.push(check);

@@ -14,10 +14,13 @@ use crate::{
     transport::HttpTransport,
 };
 
+pub(crate) mod probe;
+
 #[derive(Debug)]
 pub(crate) struct DiscoveryError {
     pub optional: bool,
     pub retry: bool,
+    pub html: bool,
     error: anyhow::Error,
 }
 impl std::fmt::Display for DiscoveryError {
@@ -187,6 +190,9 @@ async fn discovery_candidates(
     transport: &HttpTransport,
     forwarded: &HeaderMap,
 ) -> (Vec<Url>, bool) {
+    if let Some(probe) = &transport.probe {
+        probe.kind("www_authenticate");
+    }
     let probe = tokio::time::timeout(Duration::from_secs(1), async {
         let incoming = HeaderMap::new();
         for method in [Method::POST, Method::GET] {
@@ -216,6 +222,9 @@ async fn discovery_candidates(
                 .collect::<Vec<_>>()
                 .join(", ");
             if let Some(url) = resource_metadata(&challenge).and_then(http_url) {
+                if let Some(probe) = &transport.probe {
+                    probe.finish("accepted");
+                }
                 return Some(url);
             }
         }
@@ -224,6 +233,9 @@ async fn discovery_candidates(
     .await
     .ok()
     .flatten();
+    if let Some(probe) = &transport.probe {
+        probe.finish("fallback");
+    }
 
     let advertised = probe.is_some();
     let mut candidates = Vec::new();
@@ -312,7 +324,12 @@ async fn request_document(
             None => request.await,
         };
         let mut response = match response {
-            Err(error) if retry && attempt < 2 && timed_out(&error) => continue,
+            Err(error) if retry && attempt < 2 && timed_out(&error) => {
+                if let Some(probe) = &transport.probe {
+                    probe.finish("retry");
+                }
+                continue;
+            }
             result => result?,
         };
         let status = response.status.as_u16();
@@ -347,6 +364,7 @@ async fn request_document(
             failures.record(status, &error, true);
             DiscoveryError {
                 optional: false,
+                html: false,
                 retry: failures.retry(),
                 error,
             }
@@ -366,10 +384,14 @@ pub(crate) async fn discover(
     if startup && matches!(resource.status, 429 | 500..=599) {
         return Err(DiscoveryError {
             optional: false,
+            html: false,
             retry: true,
             error: anyhow::anyhow!("OAuth discovery returned HTTP {}", resource.status),
         }
         .into());
+    }
+    if let Some(probe) = &transport.probe {
+        probe.finish("accepted");
     }
     if transport.harpoon.is_some() {
         let group = auth_group(&resource.url);
@@ -447,6 +469,9 @@ pub(crate) async fn discover(
                             .is_some_and(|error| error.retry)
                     {
                         return Err(error);
+                    }
+                    if let Some(probe) = &transport.probe {
+                        probe.finish("fallback");
                     }
                     tracing::warn!(channel = %transport.channel, %error, "OAuth authorization server discovery failed")
                 }
@@ -532,6 +557,10 @@ async fn fetch_resource(
     advertised: bool,
     forwarded: &HeaderMap,
 ) -> Result<Document> {
+    if let Some(probe) = &transport.probe {
+        probe.kind("protected_resource_metadata");
+    }
+    let mut html = false;
     let count = candidates.len();
     for retry in [false, true] {
         let mut missing = count > 0 && !advertised;
@@ -548,6 +577,8 @@ async fn fetch_resource(
                 }
             };
             missing &= fetched.status == 404;
+            html |=
+                !advertised && (200..300).contains(&fetched.status) && html_document(&fetched.body);
             let status = fetched.status;
             let invalid = !fetched.too_large;
             let next = matches!(status, 404 | 500..=599) && index + 1 < count;
@@ -604,13 +635,50 @@ async fn fetch_resource(
         if retry || !failures.timeout_only() {
             return Err(DiscoveryError {
                 optional: missing,
+                html,
                 retry: failures.retry(),
                 error: failure,
             }
             .into());
         }
+        if let Some(probe) = &transport.probe {
+            probe.finish("retry");
+        }
     }
     unreachable!()
+}
+
+fn html_document(body: &[u8]) -> bool {
+    let body = body[..body.len().min(512)].trim_ascii_start();
+    if body.starts_with(b"<!--") {
+        return true;
+    }
+    [
+        "<!DOCTYPE HTML",
+        "<HTML",
+        "<HEAD",
+        "<SCRIPT",
+        "<IFRAME",
+        "<H1",
+        "<DIV",
+        "<FONT",
+        "<TABLE",
+        "<A",
+        "<STYLE",
+        "<TITLE",
+        "<B",
+        "<BODY",
+        "<BR",
+        "<P",
+    ]
+    .iter()
+    .any(|tag| {
+        body.get(..tag.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag.as_bytes()))
+            && body
+                .get(tag.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>')
+    })
 }
 
 fn authorization_candidates(issuer: &Url) -> Result<Vec<Url>> {
@@ -634,6 +702,9 @@ async fn fetch_authorization(
     issuer: &str,
     forwarded: &HeaderMap,
 ) -> Result<Document> {
+    if let Some(probe) = &transport.probe {
+        probe.kind("authorization_server_metadata");
+    }
     let candidates = authorization_candidates(&Url::parse(issuer)?)?;
     for retry in [false, true] {
         let mut fallback = None;
@@ -690,10 +761,22 @@ async fn fetch_authorization(
             match result {
                 Ok(document) => {
                     if document.value["issuer"] == issuer {
+                        if let Some(probe) = &transport.probe {
+                            probe.finish("accepted");
+                        }
                         return Ok(document);
                     }
                     if fallback.is_none() {
                         fallback = Some(document);
+                    }
+                    if let Some(probe) = &transport.probe {
+                        probe.finish(
+                            if url == candidates.last().expect("authorization candidate") {
+                                "accepted"
+                            } else {
+                                "fallback"
+                            },
+                        );
                     }
                 }
                 Err(error) => {
@@ -703,9 +786,15 @@ async fn fetch_authorization(
             }
         }
         if fallback.is_some() || retry || !failures.timeout_only() {
+            if fallback.is_some()
+                && let Some(probe) = &transport.probe
+            {
+                probe.finish("fallback");
+            }
             return fallback.ok_or_else(|| {
                 DiscoveryError {
                     optional: false,
+                    html: false,
                     retry: failures.retry(),
                     error: failure.unwrap_or_else(|| {
                         anyhow::anyhow!("OAuth authorization metadata was not found")
@@ -713,6 +802,9 @@ async fn fetch_authorization(
                 }
                 .into()
             });
+        }
+        if let Some(probe) = &transport.probe {
+            probe.finish("retry");
         }
     }
     unreachable!()

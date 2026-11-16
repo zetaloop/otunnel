@@ -28,6 +28,9 @@ fn dates(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         for name in [
             "observed_at",
+            "started_at",
+            "response_at",
+            "completed_at",
             "timestamp",
             "last_attempt",
             "last_success",
@@ -230,6 +233,16 @@ fn components(monitor: &Monitor, state: &Snapshot) -> BTreeMap<&'static str, Val
             json!({"discovery_complete":!matches!(oauth.state,"pending"|"disabled")}),
         ),
     );
+    if let Some(probes) = state.oauth_probes.as_object() {
+        let oauth = components.get_mut("oauth").expect("OAuth component");
+        oauth["limited"] = probes.get("limited").cloned().unwrap_or(json!(false));
+        for name in ["active_probes", "recent_probes"] {
+            if let Some(value) = probes.get(name) {
+                oauth["details"][name] = value.clone();
+            }
+        }
+        dates(oauth);
+    }
     let catalog = state.catalog.state;
     components.insert(
         "harpoon",

@@ -2,7 +2,7 @@ use std::{fmt, time::Duration};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout_at};
 
 use super::{Snapshot, Tunnel};
 use crate::{
@@ -219,6 +219,21 @@ impl Tunnel {
             });
         }
         if let Some(main) = main.filter(|_| self.config.mcp.oauth_discovery != "disabled") {
+            if let Some(mut observation) = main.oauth_observation() {
+                let state = self.state.clone();
+                let stop = self.stop.clone();
+                self.observers.spawn(async move {
+                    loop {
+                        state.send_modify(|state| {
+                            state.oauth_probes = observation.borrow_and_update().clone()
+                        });
+                        tokio::select! {
+                            changed = observation.changed() => if changed.is_err() { return; },
+                            () = stop.cancelled() => return,
+                        }
+                    }
+                });
+            }
             let state = self.state.clone();
             let stop = self.stop.clone();
             let harpoon = self.harpoon.clone();
@@ -237,7 +252,7 @@ impl Tunnel {
                 let mut backoff = Duration::from_secs(1);
                 loop {
                     let discovery = tokio::select! {
-                        result = timeout(Duration::from_secs(5), main.discover(Default::default(), true)) => result.context("OAuth discovery timed out").and_then(|result| result),
+                        result = main.discover(Default::default(), true) => result,
                         () = stop.cancelled() => return,
                     };
                     let retry = discovery.as_ref().err().is_some_and(|error| {
@@ -271,6 +286,7 @@ impl Tunnel {
                     };
                     state.send_modify(|state| {
                         if let Some(probe) = state.channels.get_mut("main") { probe.oauth_error = error.clone(); }
+                        if let Some(observation) = main.oauth_observation() { state.oauth_probes = observation.borrow().clone(); }
                         state.oauth = Startup::settled(status, error);
                         state.finish_catalog(catalog);
                     });
