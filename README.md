@@ -25,7 +25,7 @@ Uses tunnel-client's [configuration files and profiles](https://github.com/opena
 
 ```toml
 [dependencies]
-otunnel = { version = "0.3", default-features = false }
+otunnel = { version = "0.4", default-features = false }
 ```
 
 Runs on the application’s Tokio runtime. See the [embedding example](examples/embedded.rs).

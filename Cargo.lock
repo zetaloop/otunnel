@@ -1782,7 +1782,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "otunnel"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-io",
