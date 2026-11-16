@@ -488,10 +488,14 @@ fn register(
     };
     let origin = url.origin().ascii_serialization();
     let trusted = trusted_origins.contains(&origin);
-    if origin != transport.url.origin().ascii_serialization() && !trusted {
-        return Ok(());
-    }
-    if !trusted && !registry.private(&url) {
+    let approved = registry
+        .oauth_origins
+        .iter()
+        .any(|origin| origin.origin() == url.origin());
+    if !approved
+        && (origin != transport.url.origin().ascii_serialization() && !trusted
+            || !trusted && !registry.private(&url))
+    {
         return Ok(());
     }
     let mut tags = role_tags(record.role);

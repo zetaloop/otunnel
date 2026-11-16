@@ -235,6 +235,13 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "Maximum lifetime of an MCP transport connection",
     ),
     (
+        "harpoon.oauth-forward-origin",
+        "HARPOON_OAUTH_FORWARD_ORIGINS",
+        "/harpoon/oauth_forward_origins",
+        Origins,
+        "HTTPS origin for forwarding to discovered OAuth endpoints",
+    ),
+    (
         "harpoon.target",
         "HARPOON_TARGETS",
         "/harpoon/targets",
@@ -706,6 +713,9 @@ fn load(matches: &ArgMatches) -> Result<Config> {
                 }
                 if overridden("mcp.oauth-discovery") {
                     config.mcp.oauth_discovery = "auto".into();
+                }
+                if overridden("harpoon.oauth-forward-origin") {
+                    config.harpoon.oauth_forward_origins.clear();
                 }
                 if overridden("mcp.oauth-trusted-origin") {
                     config.mcp.oauth_trusted_origins.clear();

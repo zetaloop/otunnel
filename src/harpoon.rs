@@ -78,6 +78,7 @@ pub struct Harpoon {
     proxy: Option<String>,
     clients: Mutex<BTreeMap<Route, Http>>,
     patterns: Vec<Regex>,
+    pub(crate) oauth_origins: Vec<Url>,
     targets: RwLock<IndexMap<String, Target>>,
     policy_key: [u8; 32],
     metrics: crate::metrics::Metrics,
@@ -96,6 +97,7 @@ impl Harpoon {
                 .http_proxy
                 .clone()
                 .or(config.http_proxy.clone()),
+            oauth_origins: config.harpoon.oauth_origins()?,
             patterns: config
                 .harpoon
                 .hosts_include_regex

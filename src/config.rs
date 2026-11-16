@@ -107,6 +107,7 @@ impl Config {
         let raw = serde_json::to_value(raw)?;
         reference::validate_profile(self, &raw)?;
         self.mcp.oauth_origins()?;
+        self.harpoon.oauth_origins()?;
         anyhow::ensure!(
             matches!(self.mcp.oauth_discovery.as_str(), "auto" | "disabled"),
             "mcp.oauth_discovery must be auto or disabled"
@@ -244,6 +245,7 @@ impl Config {
         self.validate_request_ids()?;
         reference::validate_headers(self, true)?;
         self.mcp.oauth_origins()?;
+        self.harpoon.oauth_origins()?;
         anyhow::ensure!(
             matches!(self.mcp.oauth_discovery.as_str(), "auto" | "disabled"),
             "mcp.oauth_discovery must be auto or disabled"
@@ -574,26 +576,33 @@ settings!(Mcp {
 });
 impl Mcp {
     pub(crate) fn oauth_origins(&self) -> Result<Vec<url::Url>> {
-        self.oauth_trusted_origins.iter().map(|value| {
-            let url = url::Url::parse(value).context("invalid OAuth origin")?;
-            let authority = value.split_once("://").map(|(_, rest)| rest.trim_end_matches('/'));
-            anyhow::ensure!(
-                matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some()
-                    && url.path() == "/"
-                    && url.query().is_none()
-                    && url.fragment().is_none()
-                    && authority.is_some_and(|authority| !authority.is_empty()
-                        && !authority.contains(['@', '/', '?', '#', '\\', '%'])
-                        && !authority.ends_with(':'))
-                    && !value.chars().any(char::is_whitespace)
-                    && !value.ends_with("//")
-                    && url.port() != Some(0),
-                "mcp.oauth_trusted_origins: expected an HTTP(S) origin without credentials, path, query, or fragment"
-            );
-            Ok(url)
-        }).collect()
+        self.oauth_trusted_origins
+            .iter()
+            .map(|value| origin(value).context("mcp.oauth_trusted_origins"))
+            .collect()
     }
+}
+
+fn origin(value: &str) -> Result<url::Url> {
+    let url = url::Url::parse(value).context("invalid OAuth origin")?;
+    let authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest.trim_end_matches('/'));
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && authority.is_some_and(|authority| !authority.is_empty()
+                && !authority.contains(['@', '/', '?', '#', '\\', '%'])
+                && !authority.ends_with(':'))
+            && !value.chars().any(char::is_whitespace)
+            && !value.ends_with("//")
+            && url.port() != Some(0),
+        "expected an HTTP(S) origin without credentials, path, query, or fragment"
+    );
+    Ok(url)
 }
 settings!(Server {
     channel: String = main_channel(),
@@ -647,6 +656,7 @@ pub fn command_args(value: &str) -> Result<Vec<String>> {
 }
 
 settings!(Harpoon {
+    oauth_forward_origins: Vec<String> = Vec::new(),
     targets: Vec<Target> = Vec::new(),
     http_proxy: Option<String> = None,
     max_response_bytes: Option<usize> = Some(100 * 1024),
@@ -659,6 +669,21 @@ settings!(Harpoon {
     hosts_include_suffix: Vec<String> = Vec::new(),
     hosts_include_regex: Vec<String> = Vec::new(),
 });
+impl Harpoon {
+    pub(crate) fn oauth_origins(&self) -> Result<Vec<url::Url>> {
+        self.oauth_forward_origins
+            .iter()
+            .map(|value| {
+                let url = origin(value).context("harpoon.oauth_forward_origins")?;
+                anyhow::ensure!(
+                    url.scheme() == "https",
+                    "harpoon.oauth_forward_origins must use HTTPS"
+                );
+                Ok(url)
+            })
+            .collect()
+    }
+}
 settings!(Target {
     label: String = String::new(),
     url: String = String::new(),
