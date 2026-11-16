@@ -425,6 +425,20 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "Open the admin UI after startup",
     ),
     (
+        "admin-ui.base-path",
+        "ADMIN_UI_BASE_PATH",
+        "/admin_ui/base_path",
+        Text,
+        "Admin UI path prefix",
+    ),
+    (
+        "admin-ui.public-origin",
+        "ADMIN_UI_PUBLIC_ORIGIN",
+        "/admin_ui/public_origin",
+        Text,
+        "Admin UI public origin",
+    ),
+    (
         "admin-ui.log-buffer-events",
         "ADMIN_UI_LOG_BUFFER_EVENTS",
         "/admin_ui/log_buffer_events",

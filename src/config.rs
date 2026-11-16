@@ -225,6 +225,11 @@ impl Config {
         for (name, enabled) in [
             ("admin_ui.allow_remote", self.admin_ui.allow_remote),
             ("admin_ui.open_browser", self.admin_ui.open_browser),
+            ("admin_ui.base_path", !self.admin_ui.base_path.is_empty()),
+            (
+                "admin_ui.public_origin",
+                !self.admin_ui.public_origin.is_empty(),
+            ),
             (
                 "admin_ui.log_buffer_events",
                 self.admin_ui.log_buffer_events != defaults.log_buffer_events,
@@ -767,6 +772,8 @@ settings!(Health {
     show_details: bool = false,
 });
 settings!(AdminUi {
+    base_path: String = String::new(),
+    public_origin: String = String::new(),
     allow_remote: bool = false,
     open_browser: bool = false,
     log_buffer_events: usize = 2000,
