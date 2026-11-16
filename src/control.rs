@@ -85,6 +85,7 @@ pub(crate) fn now() -> f64 {
 
 pub struct Control {
     auth: auth::Auth,
+    pub(crate) trace: Arc<crate::trace::Recorder>,
     http: Http,
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
     pub(crate) suppress_raw: Arc<AtomicBool>,
@@ -154,7 +155,11 @@ impl Control {
         headers.insert("accept", HeaderValue::from_static("application/json"));
         headers.insert(
             "x-tunnel-client-capabilities",
-            HeaderValue::from_static("wrong-cluster-v1"),
+            HeaderValue::from_static(if config.tracing.enabled {
+                "wrong-cluster-v1,trace-context-v1"
+            } else {
+                "wrong-cluster-v1"
+            }),
         );
         let auth = auth::Auth::new(cp)?;
         headers.insert(
@@ -182,6 +187,10 @@ impl Control {
         let metrics = Arc::new(crate::metrics::Metrics::default());
         Ok(Self {
             auth,
+            trace: Arc::new(crate::trace::Recorder::new(
+                &config.tracing,
+                metrics.clone(),
+            )),
             http,
             metrics: metrics.clone(),
             suppress_raw: Arc::new(AtomicBool::new(config.harpoon.targets.iter().any(
@@ -626,7 +635,12 @@ impl Control {
         }
     }
 
-    async fn post(&self, command: &Correlation, reply: &Reply) -> Result<()> {
+    async fn post(
+        &self,
+        command: &Correlation,
+        reply: &Reply,
+        trace: Option<&crate::trace::Span>,
+    ) -> Result<()> {
         let receipt = observation::Receipt::new(&self.observations);
         let result: Result<u16> = async {
             #[derive(Serialize)]
@@ -656,10 +670,21 @@ impl Control {
             let url = self.endpoint("response")?;
             for attempt in 0..3 {
                 receipt.attempt(attempt != 0);
+                let mut attempt_trace = trace.map(|span| span.attempt(attempt + 1));
                 let response = timeout(self.poll_timeout + self.guard, async {
                     let response = self
                         .request(&self.client(), Method::POST, &url, headers.clone(), body.clone())
-                        .await?;
+                        .await;
+                    if let Some(span) = &mut attempt_trace {
+                        let (status, outcome) = match &response {
+                            Ok(response) => (response.status.as_u16(), match response.status.as_u16() {
+                                200 => "accepted", 404 => "already_fulfilled_or_unknown", _ => "http_error",
+                            }),
+                            Err(error) => (0, observation::category(error)),
+                        };
+                        span.outcome(status, outcome);
+                    }
+                    let response = response?;
                     let status = response.status.as_u16();
                     let headers = response.headers.clone();
                     if let Some(id) = headers.get("x-request-id") {
@@ -673,6 +698,7 @@ impl Control {
                     Ok::<_, anyhow::Error>((status, headers, error))
                 })
                 .await;
+                if response.is_err() && let Some(span) = &mut attempt_trace { span.outcome(0, "timeout"); }
                 match &response {
                     Ok(Ok((status, _, _))) if !matches!(*status, 200 | 404) => receipt.failure("http_error", *status),
                     Ok(Err(error)) => receipt.failure(observation::category(error), 0),
@@ -748,6 +774,7 @@ struct Correlation {
 
 pub struct Delivery {
     control: Arc<Control>,
+    pub(crate) trace: Option<crate::trace::CommandTrace>,
     command: Correlation,
     notifications_failed: AtomicBool,
     terminal_started: AtomicBool,
@@ -756,6 +783,7 @@ pub struct Delivery {
 impl Delivery {
     pub fn new(control: Arc<Control>, command: &Command) -> Self {
         Self {
+            trace: control.trace.command(command),
             control,
             command: Correlation {
                 request_id: command.request_id.clone(),
@@ -796,6 +824,9 @@ impl Delivery {
         }
     }
     pub(crate) fn record_latency(&self) {
+        if let Some(trace) = &self.trace {
+            trace.complete();
+        }
         let status = self.delivered_status.load(Ordering::Acquire);
         if status == 0 {
             return;
@@ -846,16 +877,30 @@ impl Delivery {
 impl Sink for Delivery {
     async fn send(&self, reply: Reply) -> Result<()> {
         if reply.terminal() {
-            if self.terminal_started.swap(true, Ordering::AcqRel) {
-                bail!("request already has a terminal response");
-            }
-            self.control.post(&self.command, &reply).await?;
-            self.delivered_status.store(reply.status, Ordering::Release);
+            anyhow::ensure!(
+                !self.terminal_started.swap(true, Ordering::AcqRel),
+                "request already has a terminal response"
+            );
+        } else if self.notifications_failed.load(Ordering::Acquire) {
             return Ok(());
         }
-        if !self.notifications_failed.load(Ordering::Acquire)
-            && let Err(error) = self.control.post(&self.command, &reply).await
-        {
+        let span = self.trace.as_ref().map(|trace| trace.upload(&reply));
+        let result = self
+            .control
+            .post(&self.command, &reply, span.as_ref())
+            .await;
+        if result.is_err() {
+            if let Some(span) = &span {
+                span.fail();
+            }
+            if let Some(trace) = &self.trace {
+                trace.fail();
+            }
+        }
+        if reply.terminal() {
+            result?;
+            self.delivered_status.store(reply.status, Ordering::Release);
+        } else if let Err(error) = result {
             self.notifications_failed.store(true, Ordering::Release);
             tracing::warn!(request_id = %self.command.request_id, %error, "notification delivery interrupted");
         }

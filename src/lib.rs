@@ -25,6 +25,7 @@ mod proxy;
 mod proxy_health;
 pub mod runtime;
 pub mod template;
+mod trace;
 pub use anyhow::{Error, Result};
 pub use runtime::{Report, Snapshot, Tunnel};
 pub use tokio_util::sync::CancellationToken;

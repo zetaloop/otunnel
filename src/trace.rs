@@ -6,26 +6,33 @@ use serde_json::value::{RawValue, to_raw_value};
 
 use crate::protocol::{self, Command, Json};
 
-pub(super) fn owns_header(name: &str) -> bool {
+pub(crate) fn owns_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("traceparent") || name.eq_ignore_ascii_case("tracestate")
 }
 
-pub(super) fn forward(command: &Command) -> Option<Json> {
+pub(crate) fn forward(command: &Command) -> Option<Json> {
     if command.headers.keys().any(|name| owns_header(name)) {
         return None;
     }
     let (parent, state) = carrier(command.trace_context.as_deref()?)?;
-    static PARENT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-0[0-3]$").expect("traceparent regex")
-    });
-    if parent.len() != 55
-        || !PARENT.is_match(&parent)
-        || parent[3..35].bytes().all(|byte| byte == b'0')
-        || parent[36..52].bytes().all(|byte| byte == b'0')
-    {
+    if !valid_parent(&parent) {
         return None;
     }
     let state = tracestate(&state)?;
+    metadata(command, &parent, &state)
+}
+
+fn valid_parent(parent: &str) -> bool {
+    static PARENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-0[0-3]$").expect("traceparent regex")
+    });
+    parent.len() == 55
+        && PARENT.is_match(parent)
+        && !parent[3..35].bytes().all(|byte| byte == b'0')
+        && !parent[36..52].bytes().all(|byte| byte == b'0')
+}
+
+pub(crate) fn metadata(command: &Command, parent: &str, state: &str) -> Option<Json> {
     let message = command.jsonrpc.as_deref()?;
     protocol::view(message).ok()?.method?;
     let mut message = object(message)?;
@@ -50,6 +57,9 @@ pub(super) fn forward(command: &Command) -> Option<Json> {
 }
 
 fn carrier(raw: &RawValue) -> Option<(String, String)> {
+    if raw.get().len() > 1024 {
+        return None;
+    }
     struct Carrier;
     impl<'de> Visitor<'de> for Carrier {
         type Value = (String, String);
@@ -84,6 +94,7 @@ fn carrier(raw: &RawValue) -> Option<(String, String)> {
         Carrier,
     )
     .ok()
+    .filter(|(parent, state)| parent.len() == 55 && state.len() <= 512)
 }
 
 fn tracestate(raw: &str) -> Option<String> {
@@ -146,3 +157,6 @@ fn object(raw: &RawValue) -> Option<BTreeMap<String, Json>> {
     serde::Deserializer::deserialize_map(&mut serde_json::Deserializer::from_str(raw.get()), Object)
         .ok()
 }
+
+mod record;
+pub(crate) use record::{CommandTrace, Recorder, Span};

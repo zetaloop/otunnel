@@ -24,7 +24,7 @@ use crate::{
 
 mod startup;
 mod stdio;
-mod trace;
+use crate::trace;
 pub use startup::Startup;
 
 #[derive(Clone, Default, Serialize)]
@@ -156,6 +156,9 @@ impl Tunnel {
     }
 
     async fn prepare(&mut self, diagnostic: bool) -> Result<()> {
+        if !diagnostic {
+            self.control.trace.start()?;
+        }
         if !diagnostic
             && (self.config.cloudflared.managed || self.config.cloudflared.token.is_some())
         {
@@ -575,6 +578,9 @@ impl Tunnel {
                 failure.get_or_insert(error);
             }
         }
+        if let Err(error) = self.control.trace.shutdown().await {
+            failure.get_or_insert(error);
+        }
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
@@ -651,10 +657,17 @@ async fn execute(
     };
     match command.command_type.as_str() {
         "jsonrpc" => {
+            let parent = delivery.trace.as_ref().map(|trace| trace.target());
             let message = if forward_trace_context
                 && matches!(binding.kind(), Some("stdio" | "streamable_http"))
             {
-                trace::forward(&command)
+                if control.trace.enabled() {
+                    parent
+                        .as_deref()
+                        .and_then(|parent| trace::metadata(&command, parent, ""))
+                } else {
+                    trace::forward(&command)
+                }
             } else {
                 None
             };

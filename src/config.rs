@@ -59,6 +59,7 @@ settings!(Config {
     health: Health = Health::default(),
     admin_ui: AdminUi = AdminUi::default(),
     log: Log = Log::default(),
+    tracing: Tracing = Tracing::default(),
     process: Process = Process::default(),
     cloudflared: Cloudflared = Cloudflared::default(),
     proxy: Proxy = Proxy::default(),
@@ -246,6 +247,10 @@ impl Config {
         self.validate_request_ids()?;
         reference::validate_headers(self, true)?;
         self.control_plane.base_url()?;
+        anyhow::ensure!(
+            !self.tracing.enabled || !self.tracing.file.trim().is_empty(),
+            "tracing.file is required when tracing.enabled is true"
+        );
         self.mcp.oauth_origins()?;
         self.harpoon.oauth_origins()?;
         anyhow::ensure!(
@@ -765,6 +770,10 @@ settings!(AdminUi {
     allow_remote: bool = false,
     open_browser: bool = false,
     log_buffer_events: usize = 2000,
+});
+settings!(Tracing {
+    enabled: bool = false,
+    file: String = String::new(),
 });
 settings!(Log {
     level: String = "info".into(),

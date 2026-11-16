@@ -21,12 +21,21 @@ enum Metric {
 
 impl Metrics {
     pub fn increment(&self, scope: &'static str, name: &'static str, attributes: &[(&str, &str)]) {
+        self.add(scope, name, attributes, 1);
+    }
+    pub fn add(
+        &self,
+        scope: &'static str,
+        name: &'static str,
+        attributes: &[(&str, &str)],
+        value: u64,
+    ) {
         let mut metrics = self.0.lock().expect("metrics mutex poisoned");
         let metric = metrics
             .entry((name, scope, labels(attributes)))
             .or_insert(Metric::Counter(0));
         if let Metric::Counter(count) = metric {
-            *count += 1;
+            *count += value;
         }
     }
 

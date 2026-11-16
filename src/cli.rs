@@ -474,6 +474,20 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "Complete downstream stdio initialization",
     ),
     (
+        "tracing.enabled",
+        "TRACING_ENABLED",
+        "/tracing/enabled",
+        Boolean,
+        "Record local request traces",
+    ),
+    (
+        "tracing.file",
+        "TRACING_FILE",
+        "/tracing/file",
+        Text,
+        "New JSONL trace file",
+    ),
+    (
         "mcp.forward-trace-context",
         "MCP_FORWARD_TRACE_CONTEXT",
         "/mcp/forward_trace_context",
