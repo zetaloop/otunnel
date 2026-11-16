@@ -284,14 +284,7 @@ impl Config {
             "unsupported config_version"
         );
         tunnel_id(&self.control_plane.tunnel_id)?;
-        let api_key =
-            reference::resolve_named("control_plane.api_key", &self.control_plane.api_key)?;
-        anyhow::ensure!(
-            api_key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
-            "control plane API key is malformed"
-        );
+        self.control_plane.validate_auth()?;
         if self.control_plane.max_inflight_requests == 0 || self.mcp.max_concurrent_requests == 0 {
             bail!("request concurrency must be positive");
         }
@@ -532,6 +525,8 @@ settings!(ControlPlane {
     url_path: Option<String> = None,
     tunnel_id: String = String::new(),
     api_key: String = String::new(),
+    aws_identity_provider_id: String = String::new(),
+    aws_service_account_id: String = String::new(),
     organization_id: Option<String> = None,
     max_inflight_requests: usize = 20,
     poll_timeout: Span = Span(Duration::from_secs(30)),
@@ -545,6 +540,34 @@ settings!(ControlPlane {
     client_key: Option<String> = None,
 });
 impl ControlPlane {
+    pub(crate) fn workload_identity(&self) -> bool {
+        !self.aws_identity_provider_id.is_empty() || !self.aws_service_account_id.is_empty()
+    }
+    pub(crate) fn validate_auth(&self) -> Result<()> {
+        if self.workload_identity() {
+            anyhow::ensure!(
+                !self.aws_identity_provider_id.is_empty()
+                    && !self.aws_service_account_id.is_empty(),
+                "AWS workload identity requires both an identity provider ID and a service account ID"
+            );
+            anyhow::ensure!(
+                self.api_key.is_empty(),
+                "control-plane API key and AWS workload identity cannot be used together"
+            );
+            anyhow::ensure!(
+                self.base_url()?.as_str() == "https://api.openai.com/",
+                "AWS workload identity requires https://api.openai.com"
+            );
+        } else {
+            let key = reference::resolve_named("control_plane.api_key", &self.api_key)?;
+            anyhow::ensure!(
+                key.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+                "control plane API key is malformed"
+            );
+        }
+        Ok(())
+    }
     pub fn residency(&self) -> Result<Option<String>> {
         self.residency.as_deref().map(|value| {
             let value = value.trim().to_ascii_lowercase();

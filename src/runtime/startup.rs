@@ -222,7 +222,7 @@ impl Tunnel {
             let state = self.state.clone();
             let stop = self.stop.clone();
             let harpoon = self.harpoon.clone();
-            let config = self.config.control_plane.clone();
+            let control = self.control.clone();
             self.state.send_modify(|state| {
                 state.oauth = Startup::pending();
             });
@@ -267,7 +267,7 @@ impl Tunnel {
                     let catalog = if status == "failed" {
                         discovery.map(|_| ())
                     } else {
-                        harpoon.log_catalog(&config)
+                        harpoon.log_catalog(&control).await
                     };
                     state.send_modify(|state| {
                         if let Some(probe) = state.channels.get_mut("main") { probe.oauth_error = error.clone(); }
@@ -278,9 +278,16 @@ impl Tunnel {
                 }
             });
         } else {
-            let catalog = self.harpoon.log_catalog(&self.config.control_plane);
-            self.state.send_modify(|state| {
-                state.finish_catalog(catalog);
+            let harpoon = self.harpoon.clone();
+            let control = self.control.clone();
+            let state = self.state.clone();
+            let stop = self.stop.clone();
+            self.observers.spawn(async move {
+                let catalog = tokio::select! {
+                    result = harpoon.log_catalog(&control) => result,
+                    () = stop.cancelled() => return,
+                };
+                state.send_modify(|state| state.finish_catalog(catalog));
             });
         }
         let control = self.control.clone();

@@ -30,7 +30,9 @@ required-features = ["cli"]
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+aws-config = "1.13.2"
 aws-lc-sys = "0.47.0"
+aws-sdk-sts = { version = "1.126.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = { version = "0.8.9", optional = true }
 base64 = "0.23.1"
 bytes = "1.12.1"

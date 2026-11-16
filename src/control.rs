@@ -25,6 +25,7 @@ use crate::{
     transport::Sink,
 };
 
+mod auth;
 mod error;
 mod observation;
 mod routing;
@@ -83,6 +84,7 @@ pub(crate) fn now() -> f64 {
 }
 
 pub struct Control {
+    auth: auth::Auth,
     http: Http,
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
     pub(crate) suppress_raw: Arc<AtomicBool>,
@@ -154,10 +156,7 @@ impl Control {
             "x-tunnel-client-capabilities",
             HeaderValue::from_static("wrong-cluster-v1"),
         );
-        let mut authorization =
-            HeaderValue::try_from(format!("Bearer {}", config::resolve(&cp.api_key)?))?;
-        authorization.set_sensitive(true);
-        headers.insert("authorization", authorization);
+        let auth = auth::Auth::new(cp)?;
         headers.insert(
             "user-agent",
             HeaderValue::from_static(crate::harpoon::headers::USER_AGENT),
@@ -182,6 +181,7 @@ impl Control {
         let uses_proxy = http.proxied(&url)?;
         let metrics = Arc::new(crate::metrics::Metrics::default());
         Ok(Self {
+            auth,
             http,
             metrics: metrics.clone(),
             suppress_raw: Arc::new(AtomicBool::new(config.harpoon.targets.iter().any(
@@ -227,7 +227,7 @@ impl Control {
 
     fn client(&self) -> Http {
         let client = self.http.clone();
-        if self.suppress_raw.load(Ordering::Acquire) {
+        if self.suppress_raw.load(Ordering::Acquire) || self.auth.dynamic() {
             client.logging(None)
         } else {
             client
@@ -278,6 +278,25 @@ impl Control {
         Ok(())
     }
 
+    pub(crate) async fn credential(&self) -> Result<String> {
+        self.auth.token().await
+    }
+
+    async fn request(
+        &self,
+        client: &Http,
+        method: Method,
+        url: &Url,
+        mut headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<crate::net::Response> {
+        let mut authorization =
+            HeaderValue::try_from(format!("Bearer {}", self.credential().await?))?;
+        authorization.set_sensitive(true);
+        headers.insert("authorization", authorization);
+        client.send(method, url, headers, body).await
+    }
+
     fn headers(&self) -> HeaderMap {
         let mut headers = self.headers.clone();
         if let Some(value) = &*self
@@ -315,7 +334,7 @@ impl Control {
             let deadline = Instant::now() + self.poll_timeout + self.guard;
             let response = tokio::time::timeout_at(
                 deadline,
-                client.send(Method::GET, &url, self.headers(), Bytes::new()),
+                self.request(&client, Method::GET, &url, self.headers(), Bytes::new()),
             )
             .await;
             let headers = match response {
@@ -365,8 +384,13 @@ impl Control {
     async fn fetch(&self) -> Result<Value> {
         timeout(self.poll_timeout + self.guard, async {
             let response = self
-                .client()
-                .send(Method::GET, &self.url, self.headers(), Bytes::new())
+                .request(
+                    &self.client(),
+                    Method::GET,
+                    &self.url,
+                    self.headers(),
+                    Bytes::new(),
+                )
                 .await?;
             if !response.status.is_success() {
                 return Err(StatusError::read(response, "metadata").await.into());
@@ -431,8 +455,8 @@ impl Control {
                 if let Some(token) = &route.token {
                     headers.insert("x-tunnel-shard-token", token.clone());
                 }
-                let response = client
-                    .send(Method::GET, &url, headers, Bytes::new())
+                let response = self
+                    .request(&client, Method::GET, &url, headers, Bytes::new())
                     .await?;
                 received_headers = true;
                 let received = Instant::now();
@@ -634,8 +658,7 @@ impl Control {
                 receipt.attempt(attempt != 0);
                 let response = timeout(self.poll_timeout + self.guard, async {
                     let response = self
-                        .client()
-                        .send(Method::POST, &url, headers.clone(), body.clone())
+                        .request(&self.client(), Method::POST, &url, headers.clone(), body.clone())
                         .await?;
                     let status = response.status.as_u16();
                     let headers = response.headers.clone();

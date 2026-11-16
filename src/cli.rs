@@ -53,6 +53,20 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "OpenAI tunnel identifier",
     ),
     (
+        "control-plane.aws-identity-provider-id",
+        "CONTROL_PLANE_AWS_IDENTITY_PROVIDER_ID",
+        "/control_plane/aws_identity_provider_id",
+        Text,
+        "OpenAI identity provider for AWS workload identity",
+    ),
+    (
+        "control-plane.aws-service-account-id",
+        "CONTROL_PLANE_AWS_SERVICE_ACCOUNT_ID",
+        "/control_plane/aws_service_account_id",
+        Text,
+        "OpenAI service account for AWS workload identity",
+    ),
+    (
         "control-plane.api-key",
         "CONTROL_PLANE_API_KEY",
         "/control_plane/api_key",

@@ -27,7 +27,7 @@ pub(super) fn size(target: &Target, mut schema: Value) -> Result<usize> {
 }
 
 impl super::Harpoon {
-    pub(crate) fn log_catalog(&self, control: &crate::config::ControlPlane) -> Result<()> {
+    pub(crate) async fn log_catalog(&self, control: &crate::control::Control) -> Result<()> {
         use hmac::Mac;
         use serde::Serialize;
 
@@ -49,9 +49,7 @@ impl super::Harpoon {
             targets: Vec<Entry<'a>>,
         }
 
-        if control.api_key.is_empty() || control.tunnel_id.is_empty() {
-            return Ok(());
-        }
+        let credential = control.credential().await?;
         let registry = self.targets.read().expect("target registry lock poisoned");
         let mut targets = registry
             .values()
@@ -86,12 +84,11 @@ impl super::Harpoon {
             version: 1,
             targets,
         })?;
-        let key = crate::config::resolve(&control.api_key)?;
         let key = super::policy::mac(
-            key.as_bytes(),
+            credential.as_bytes(),
             &[
                 "tunnel-client/harpoon/startup-catalog-digest/key/v1",
-                &control.tunnel_id,
+                control.tunnel_id(),
             ],
         )
         .finalize()
