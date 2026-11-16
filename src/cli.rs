@@ -200,6 +200,13 @@ const SETTINGS: &[(&str, &str, &str, Kind, &str)] = &[
         "Additional HTTP(S) origin for OAuth metadata and authorization server discovery",
     ),
     (
+        "mcp.stdio-failure-policy",
+        "MCP_STDIO_FAILURE_POLICY",
+        "/mcp/stdio_failure_policy",
+        Text,
+        "Stdio child recovery: restart or exit",
+    ),
+    (
         "mcp.startup-wait-timeout",
         "MCP_STARTUP_WAIT_TIMEOUT",
         "/mcp/startup_wait_timeout",
@@ -712,6 +719,14 @@ fn load(matches: &ArgMatches) -> Result<Config> {
         };
         let mut arguments = arguments.cloned().collect::<Vec<_>>();
         let origin = matches.value_source(selected);
+        if *name == "mcp.stdio-failure-policy"
+            && origin == Some(clap::parser::ValueSource::CommandLine)
+        {
+            anyhow::ensure!(
+                !arguments[0].is_empty(),
+                "--{name} requires restart or exit"
+            );
+        }
         if name.ends_with("http-proxy") {
             proxy_sources.insert(
                 (*name).into(),

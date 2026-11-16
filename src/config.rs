@@ -213,6 +213,10 @@ impl Config {
         self.scope()?;
         reference::validate_headers(self, true)?;
         self.mcp.oauth_origins()?;
+        anyhow::ensure!(
+            matches!(self.mcp.stdio_failure_policy.as_str(), "restart" | "exit"),
+            "mcp.stdio_failure_policy must be restart or exit"
+        );
         if let Some(organization) = &self.control_plane.organization_id {
             anyhow::ensure!(
                 !organization.contains(['\r', '\n']),
@@ -366,6 +370,9 @@ impl Config {
         Ok(())
     }
     pub fn normalize(&mut self) -> Result<()> {
+        if self.mcp.stdio_failure_policy.is_empty() {
+            self.mcp.stdio_failure_policy = "restart".into();
+        }
         for name in self
             .mcp
             .commands
@@ -503,6 +510,7 @@ settings!(Mcp {
     discovery_extra_headers: BTreeMap<String, String> = BTreeMap::new(),
     oauth_trusted_origins: Vec<String> = Vec::new(),
     startup_wait_timeout: Span = Span(Duration::ZERO),
+    stdio_failure_policy: String = "restart".into(),
     stdio_send_initialized_notification: bool = false,
     forward_trace_context: bool = false,
     connection_max_ttl: Option<Span> = Some(Span(Duration::from_secs(600))),

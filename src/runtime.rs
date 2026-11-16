@@ -18,12 +18,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::Config,
     control::{Batch, Channel, Control, Delivery},
-    process::Process,
     protocol::{self, Command, Reply, Request},
-    transport::{self, HttpTransport, Pipe, Probe, Sink, Transport},
+    transport::{self, HttpTransport, Probe, Sink, Transport},
 };
 
 mod startup;
+mod stdio;
 mod trace;
 pub use startup::Startup;
 
@@ -164,26 +164,8 @@ impl Tunnel {
             self.children
                 .spawn(companion.supervise(self.stop.clone(), self.state.clone()));
         }
-        let mut pipes = Vec::new();
-        for command in &self.config.mcp.commands {
-            let enabled = self.config.enabled(&command.channel);
-            let output = if enabled {
-                std::process::Stdio::piped()
-            } else if diagnostic {
-                std::process::Stdio::from(std::io::stderr())
-            } else {
-                std::process::Stdio::inherit()
-            };
-            let mut process = Process::spawn(&command.command, output)?;
-            if let Some(pid) = process.id() {
-                self.state.send_modify(|state| {
-                    state.process_ids.insert(command.channel.clone(), pid);
-                });
-            }
-            if enabled {
-                pipes.push((command.channel.clone(), process.pipes()?));
-            }
-            self.children.spawn(process.supervise(self.stop.clone()));
+        for command in self.config.mcp.commands.clone() {
+            self.start_stdio(command, diagnostic).await?;
         }
         for server in &self.config.mcp.server_urls {
             if self.config.enabled(&server.channel) {
@@ -199,16 +181,6 @@ impl Tunnel {
                     ),
                 );
             }
-        }
-        for (channel, (reader, writer)) in pipes {
-            anyhow::ensure!(
-                !self.bindings.contains_key(&channel),
-                "duplicate channel {channel}"
-            );
-            let pipe = Pipe::new(reader, writer)
-                .await?
-                .send_initialized_notification(self.config.mcp.stdio_send_initialized_notification);
-            self.bindings.insert(channel, Arc::new(pipe));
         }
         for (name, binding) in &self.bindings {
             if let Some(mut observation) = binding.observation() {

@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Stdio};
+use std::{
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
@@ -105,18 +109,24 @@ impl Process {
             child.stdin().take().context("child stdin is unavailable")?,
         ))
     }
+    pub async fn wait(&mut self) -> Result<ExitStatus> {
+        // Tokio closes owned stdin in wait(); an unbound child may still need it.
+        let _input = self.child.stdin().take();
+        Ok(self.child.wait().await?)
+    }
     pub async fn supervise(mut self, stop: CancellationToken) -> Result<()> {
-        // Retain stdin while waiting: Tokio closes a child's owned stdin in wait().
-        let input = self.child.stdin().take();
         tokio::select! {
-            result = self.child.wait() => {
+            result = self.wait() => {
                 let status = result?;
                 if stop.is_cancelled() { return Ok(()); }
                 anyhow::bail!("child exited: {status}");
             }
             () = stop.cancelled() => {}
         }
-        drop(input);
+        self.stop(Duration::from_secs(5)).await
+    }
+    pub async fn stop(mut self, grace: Duration) -> Result<()> {
+        self.child.stdin().take();
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
@@ -126,7 +136,7 @@ impl Process {
         {
             return Err(error.into());
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+        match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(result) => {
                 result?;
             }
